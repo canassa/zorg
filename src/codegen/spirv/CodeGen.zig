@@ -1684,15 +1684,24 @@ fn constantPtr(cg: *CodeGen, ptr_val: Value) !Id {
     return cg.derivePtr(ptr_val.typeOf(zcu).ptrAddressSpace(zcu), derivation);
 }
 
+fn derivedPtrType(cg: *CodeGen, @"addrspace": std.lang.AddressSpace, derivation: Value.PointerDerivation) !Id {
+    return cg.ptrType(
+        try cg.pointeeType(@"addrspace", derivation.elem_ty, false),
+        cg.storageClass(@"addrspace"),
+    );
+}
+
 fn derivePtr(cg: *CodeGen, @"addrspace": std.lang.AddressSpace, derivation: Value.PointerDerivation) !Id {
     const gpa = cg.gpa;
     const zcu = cg.zcu;
     const target = zcu.getTarget();
 
-    const result_ty_id = try cg.ptrType(
-        try cg.pointeeType(@"addrspace", derivation.elem_ty, false),
-        cg.storageClass(@"addrspace"),
-    );
+    // A variable on Vulkan and OpenGL is used through its own pointer, so a `nav` resolves this only
+    // where it is used; a type emitted and left unused stays in the module.
+    const result_ty_id = switch (derivation.addr) {
+        .nav => undefined,
+        else => try cg.derivedPtrType(@"addrspace", derivation),
+    };
 
     switch (derivation.addr) {
         .comptime_alloc, .comptime_field => unreachable,
@@ -1727,10 +1736,10 @@ fn derivePtr(cg: *CodeGen, @"addrspace": std.lang.AddressSpace, derivation: Valu
 
             if (ip.isFunctionType(nav_ty.toIntern())) {
                 if (is_extern) return try cg.resolveExternFn(nav_index);
-                return try cg.constUndef(result_ty_id);
+                return try cg.constUndef(try cg.derivedPtrType(@"addrspace", derivation));
             }
             if (!nav_ty.hasRuntimeBits(zcu) and nav_ty.zigTypeTag(zcu) != .spirv) {
-                return cg.constUndef(result_ty_id);
+                return cg.constUndef(try cg.derivedPtrType(@"addrspace", derivation));
             }
             if (!is_extern) {
                 return cg.todo("pointer to constant '{f}'", .{nav.fqn.fmt(ip)});
@@ -1739,23 +1748,23 @@ fn derivePtr(cg: *CodeGen, @"addrspace": std.lang.AddressSpace, derivation: Valu
             const as = nav.resolved.?.@"addrspace";
             assert(as != .generic);
 
-            const storage_class = cg.storageClass(as);
             const var_id = try cg.resolveNav(nav_index);
-            const nav_ty_id = try cg.resolveType(nav_ty, .indirect);
-            const decl_ptr_ty_id = try cg.ptrType(nav_ty_id, storage_class);
             if (cg.needsLayout(as, nav_ty)) {
                 try cg.block_var_ids.put(gpa, var_id, {});
             }
-
-            if (decl_ptr_ty_id == result_ty_id) return var_id;
             switch (target.os.tag) {
                 .vulkan, .opengl => return var_id,
                 else => {},
             }
 
+            const nav_ty_id = try cg.resolveType(nav_ty, .indirect);
+            const decl_ptr_ty_id = try cg.ptrType(nav_ty_id, cg.storageClass(as));
+            const nav_result_ty_id = try cg.derivedPtrType(@"addrspace", derivation);
+            if (decl_ptr_ty_id == nav_result_ty_id) return var_id;
+
             const casted_ptr_id = cg.allocId();
             try cg.body.emit(gpa, .OpBitcast, .{
-                .id_result_type = result_ty_id,
+                .id_result_type = nav_result_ty_id,
                 .id_result = casted_ptr_id,
                 .operand = var_id,
             });

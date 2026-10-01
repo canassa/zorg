@@ -1810,7 +1810,7 @@ fn derivePtr(cg: *CodeGen, @"addrspace": std.lang.AddressSpace, derivation: Valu
                 .many => .many_ptr,
             },
             @"addrspace",
-            derived.parent.elem_ty,
+            derivation.elem_ty,
             try cg.derivePtr(@"addrspace", derived.parent.*),
             try cg.constInt(.usize, derived.elem_index),
         ),

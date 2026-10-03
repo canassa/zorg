@@ -15214,7 +15214,7 @@ fn processReplace(userdata: ?*anyopaque, options: process.ReplaceOptions) proces
         });
     };
 
-    if (is_darwin) if (t.spawnDarwin(
+    if (is_darwin and process.can_spawn) if (t.spawnDarwin(
         .replace,
         options.exe,
         argv_buf.ptr,

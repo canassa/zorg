@@ -12957,7 +12957,7 @@ pub const Instruction = packed union {
             },
             .zero => return .{ .data_processing_vector = .{ .float_compare = .{
                 .fcmp = .{
-                    .opc0 = .register,
+                    .opc0 = .zero,
                     .Rn = n.alias.encode(.{ .V = true }),
                     .Rm = @fromBackingInt(@intCast(0b00000)),
                     .ftype = .fromScalarSize(ftype),
@@ -12973,7 +12973,7 @@ pub const Instruction = packed union {
                 assert(m.format.scalar == ftype);
                 return .{ .data_processing_vector = .{ .float_compare = .{
                     .fcmpe = .{
-                        .opc0 = .zero,
+                        .opc0 = .register,
                         .Rn = n.alias.encode(.{ .V = true }),
                         .Rm = m.alias.encode(.{ .V = true }),
                         .ftype = .fromScalarSize(ftype),

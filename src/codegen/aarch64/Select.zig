@@ -979,6 +979,7 @@ pub fn finishAnalysis(isel: *Select) !void {
         assert(!invalid_gop.found_existing);
         invalid_gop.value_ptr.live = loop_live_len;
     }
+
 }
 
 /// Selects `air_body`. For the body of a `block`, `block_pred` is the
@@ -6429,7 +6430,7 @@ fn selectMinMax(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag) !voi
 fn selectBitwise(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag) !void {
     const zcu = isel.pt.zcu;
     const ip = &zcu.intern_pool;
-    if (isel.live_values.fetchRemove(inst)) |res_vi| {
+    if (isel.live_values.fetchRemove(inst)) |res_vi| unused: {
         defer res_vi.value.deref(isel);
 
         const bin_op = isel.air.instructions.items(.data)[@backingInt(inst)].bin_op;
@@ -6445,8 +6446,31 @@ fn selectBitwise(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag) !vo
                 return isel.fail("bad {t} {f}", .{ air_tag, isel.fmtType(ty) });
             if (int_info.bits > 128) return isel.fail("too big {t} {f}", .{ air_tag, isel.fmtType(ty) });
 
-            const lhs_vi = try isel.use(bin_op.lhs);
-            const rhs_vi = try isel.use(bin_op.rhs);
+            var lhs_vi = try isel.use(bin_op.lhs);
+            var rhs_vi = try isel.use(bin_op.rhs);
+            if (isel.constantImmediate(rhs_vi) == null) std.mem.swap(Value.Index, &lhs_vi, &rhs_vi);
+            if (res_vi.value.size(isel) <= 8) if (isel.constantImmediate(rhs_vi)) |imm| {
+                const size = res_vi.value.size(isel);
+                const sf: codegen.aarch64.encoding.Register.GeneralSize = if (size <= 4) .word else .doubleword;
+                if (codegen.aarch64.encoding.Instruction.DataProcessingImmediate.Bitmask.encodeImmediate(imm, sf)) |bitmask| {
+                    var res_part_it = res_vi.value.field(ty, 0, size);
+                    const res_ra = try (try res_part_it.only(isel)).?.defReg(isel) orelse break :unused;
+                    var lhs_part_it = lhs_vi.field(ty, 0, size);
+                    const lhs_part_mat = try (try lhs_part_it.only(isel)).?.matReg(isel);
+                    const res_reg, const lhs_reg = switch (sf) {
+                        .word => .{ res_ra.w(), lhs_part_mat.ra.w() },
+                        .doubleword => .{ res_ra.x(), lhs_part_mat.ra.x() },
+                    };
+                    try isel.emit(switch (air_tag) {
+                        else => unreachable,
+                        .bit_and => .@"and"(res_reg, lhs_reg, .{ .immediate = bitmask }),
+                        .bit_or => .orr(res_reg, lhs_reg, .{ .immediate = bitmask }),
+                        .xor => .eor(res_reg, lhs_reg, .{ .immediate = bitmask }),
+                    });
+                    try lhs_part_mat.finish(isel);
+                    break :unused;
+                }
+            };
             var offset = res_vi.value.size(isel);
             while (offset > 0) {
                 const size = @min(offset, 8);
@@ -6536,6 +6560,39 @@ fn selectShift(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag) !void
 
                 const lhs_vi = try isel.use(bin_op.lhs);
                 const rhs_vi = try isel.use(bin_op.rhs);
+                if (isel.constantImmediate(rhs_vi)) |amount| if (amount < bits) {
+                    const shift: u6 = @intCast(amount);
+                    const lhs_mat = try lhs_vi.matReg(isel);
+                    try isel.emit(switch (bits) {
+                        else => unreachable,
+                        1...32 => switch (air_tag) {
+                            else => unreachable,
+                            .shr, .shr_exact => switch (int_info.signedness) {
+                                .signed => .sbfm(res_ra.w(), lhs_mat.ra.w(), .{ .N = .word, .immr = shift, .imms = 31 }),
+                                .unsigned => .ubfm(res_ra.w(), lhs_mat.ra.w(), .{ .N = .word, .immr = shift, .imms = 31 }),
+                            },
+                            .shl, .shl_exact => .ubfm(res_ra.w(), lhs_mat.ra.w(), .{
+                                .N = .word,
+                                .immr = @as(u5, -%@as(u5, @intCast(shift))),
+                                .imms = 31 - shift,
+                            }),
+                        },
+                        33...64 => switch (air_tag) {
+                            else => unreachable,
+                            .shr, .shr_exact => switch (int_info.signedness) {
+                                .signed => .sbfm(res_ra.x(), lhs_mat.ra.x(), .{ .N = .doubleword, .immr = shift, .imms = 63 }),
+                                .unsigned => .ubfm(res_ra.x(), lhs_mat.ra.x(), .{ .N = .doubleword, .immr = shift, .imms = 63 }),
+                            },
+                            .shl, .shl_exact => .ubfm(res_ra.x(), lhs_mat.ra.x(), .{
+                                .N = .doubleword,
+                                .immr = -%shift,
+                                .imms = 63 - shift,
+                            }),
+                        },
+                    });
+                    try lhs_mat.finish(isel);
+                    break :unused;
+                };
                 const lhs_mat = try lhs_vi.matReg(isel);
                 const rhs_mat = try rhs_vi.matReg(isel);
                 try isel.emit(switch (air_tag) {
@@ -11988,6 +12045,38 @@ fn isErrUse(isel: *Select, res: CondUse, air_tag: Air.Inst.Tag, un_op: Air.Inst.
     try error_set_part_mat.finish(isel);
 }
 
+/// The register contents of a comptime-known scalar operand of at most 8
+/// bytes, as `Value.Materialize` would produce them: the integer sign- or
+/// zero-extended to 32 bits for sizes up to 4 bytes, else to 64 bits.
+/// Null when the value is not such a constant.
+pub fn constantImmediate(isel: *Select, vi: Value.Index) ?u64 {
+    const zcu = isel.pt.zcu;
+    const ip = &zcu.intern_pool;
+    const constant = switch (vi.parent(isel)) {
+        .constant => |constant| constant,
+        else => return null,
+    };
+    if (vi.register(isel) != null or vi.isVector(isel) or vi.get(isel).flags.is_padding) return null;
+    const size = vi.size(isel);
+    if (size > 8) return null;
+    const value: i65 = value: switch (ip.indexToKey(constant.toIntern())) {
+        else => return null,
+        .undef => return null,
+        .simple_value => |simple_value| switch (simple_value) {
+            .true => 1,
+            .false => 0,
+            else => return null,
+        },
+        .int => |int| switch (int.storage) {
+            .u64 => |imm| imm,
+            .i64 => |imm| imm,
+            .big_int => |big_int| big_int.toInt(i65) catch return null,
+        },
+        .enum_tag => |enum_tag| continue :value ip.indexToKey(enum_tag.int),
+    };
+    return if (size <= 4) @as(u32, @truncate(@as(u65, @bitCast(value)))) else @as(u64, @truncate(@as(u65, @bitCast(value))));
+}
+
 pub const AddSubtractImmediate = struct {
     op: codegen.aarch64.encoding.Instruction.AddSubtractOp,
     imm: u12,
@@ -12035,6 +12124,20 @@ pub const AddSubtractImmediate = struct {
     }
 };
 
+fn isFloatZeroConstant(isel: *Select, vi: Value.Index) bool {
+    const constant = switch (vi.parent(isel)) {
+        .constant => |constant| constant,
+        else => return false,
+    };
+    if (vi.register(isel) != null) return false;
+    return switch (isel.pt.zcu.intern_pool.indexToKey(constant.toIntern())) {
+        else => false,
+        .float => |float| switch (float.storage) {
+            inline else => |value| value == 0,
+        },
+    };
+}
+
 /// If the only instruction emitted since `label` is an unconditional
 /// branch with a final offset, returns that offset. A conditional branch to
 /// `label` can then replace it in place with the inverted condition.
@@ -12081,11 +12184,20 @@ fn cmpUse(
     res: CondUse,
     ty: ZigType,
     orig_lhs_vi: Value.Index,
-    op: std.math.CompareOperator,
+    orig_op: std.math.CompareOperator,
     orig_rhs_vi: Value.Index,
 ) !void {
     var lhs_vi = orig_lhs_vi;
+    var op = orig_op;
     var rhs_vi = orig_rhs_vi;
+    // Put a constant operand on the right, where it can be an immediate.
+    if (lhs_vi.size(isel) <= 8 and
+        (isel.constantImmediate(lhs_vi) != null or isel.isFloatZeroConstant(lhs_vi)) and
+        isel.constantImmediate(rhs_vi) == null and !isel.isFloatZeroConstant(rhs_vi))
+    {
+        std.mem.swap(Value.Index, &lhs_vi, &rhs_vi);
+        op = op.reverse();
+    }
     if (!ty.isRuntimeFloat()) {
         const int_info: std.lang.Type.Int = if (ty.toIntern() == .bool_type)
             .{ .signedness = .unsigned, .bits = 1 }
@@ -12167,6 +12279,23 @@ fn cmpUse(
             },
             .neq => .ne,
         });
+
+        if (int_info.bits <= 64) if (isel.constantImmediate(rhs_vi)) |imm| {
+            const sf: codegen.aarch64.encoding.Register.GeneralSize = if (lhs_vi.size(isel) <= 4) .word else .doubleword;
+            if (AddSubtractImmediate.encode(.sub, imm, sf)) |enc| {
+                var lhs_part_it = lhs_vi.field(ty, 0, lhs_vi.size(isel));
+                const lhs_part_mat = try (try lhs_part_it.only(isel)).?.matReg(isel);
+                try enc.emit(isel, true, switch (sf) {
+                    .word => .wzr,
+                    .doubleword => .xzr,
+                }, switch (sf) {
+                    .word => lhs_part_mat.ra.w(),
+                    .doubleword => lhs_part_mat.ra.x(),
+                });
+                try lhs_part_mat.finish(isel);
+                return;
+            }
+        };
 
         var part_offset = if (int_info.bits > 64)
             @divCeil(@as(u64, int_info.bits), 64) * 8
@@ -12260,6 +12389,17 @@ fn cmpUse(
                 .neq => .ne,
             });
 
+            if (!need_fcvt and isel.isFloatZeroConstant(rhs_vi)) {
+                const lhs_mat = try lhs_vi.matReg(isel);
+                try isel.emit(switch (bits) {
+                    else => unreachable,
+                    16 => .fcmp(lhs_mat.ra.h(), .zero),
+                    32 => .fcmp(lhs_mat.ra.s(), .zero),
+                    64 => .fcmp(lhs_mat.ra.d(), .zero),
+                });
+                try lhs_mat.finish(isel);
+                return;
+            }
             const lhs_mat = try lhs_vi.matReg(isel);
             const rhs_mat = try rhs_vi.matReg(isel);
             const lhs_ra = if (need_fcvt) try isel.allocVecReg() else lhs_mat.ra;

@@ -673,6 +673,27 @@ pub const Index = enum(u32) {
                 break :unwrapped_res_part_ra unwrapped_part_ra;
             };
             defer if (unwrapped_res_part_ra != wrapped_res_part_ra) isel.freeReg(unwrapped_res_part_ra);
+            if (int_info.bits <= 64) {
+                // A constant operand is an immediate (either operand of an addition).
+                var imm_lhs_vi = lhs_vi;
+                var imm_rhs_vi = rhs_vi;
+                if (op == .add and isel.constantImmediate(imm_rhs_vi) == null)
+                    std.mem.swap(Value.Index, &imm_lhs_vi, &imm_rhs_vi);
+                const sf: codegen.aarch64.encoding.Register.GeneralSize = if (part_size <= 4) .word else .doubleword;
+                if (isel.constantImmediate(imm_rhs_vi)) |imm| if (AddSubtractImmediate.encode(op, imm, sf)) |enc| {
+                    var lhs_part_it = imm_lhs_vi.field(ty, 0, part_size);
+                    const lhs_part_mat = try (try lhs_part_it.only(isel)).?.matReg(isel);
+                    try enc.emit(isel, need_carry, switch (sf) {
+                        .word => unwrapped_res_part_ra.w(),
+                        .doubleword => unwrapped_res_part_ra.x(),
+                    }, switch (sf) {
+                        .word => lhs_part_mat.ra.w(),
+                        .doubleword => lhs_part_mat.ra.x(),
+                    });
+                    try lhs_part_mat.finish(isel);
+                    return;
+                };
+            }
             var lhs_part_it = lhs_vi.field(ty, part_offset, part_size);
             const lhs_part_vi = try lhs_part_it.only(isel);
             const lhs_part_mat = try lhs_part_vi.?.matReg(isel);

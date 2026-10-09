@@ -19,6 +19,7 @@ loop_live: struct {
 dom_start: u32,
 dom_len: u32,
 dom: std.ArrayList(DomInt),
+promotion: Promotion = .{},
 
 // Wip Mir
 saved_registers: std.enums.EnumSet(Register.Alias),
@@ -64,7 +65,14 @@ values: std.ArrayList(Value),
 
 pub const LiveRegisters = std.enums.EnumArray(Register.Alias, Value.Index);
 
-pub const Error = codegen.Error;
+pub const Error = codegen.Error || error{
+    /// Registers reserved for promoted locals and pinned values got in the
+    /// way of selecting the function; nothing was reported. `generate` selects
+    /// it again without promotion.
+    RetryWithoutPromotion,
+};
+
+pub const Promotion = @import("Promotion.zig");
 
 pub const Block = struct {
     live_registers: LiveRegisters,
@@ -140,6 +148,7 @@ pub fn deinit(isel: *Select) void {
     isel.loop_live.set.deinit(gpa);
     isel.loop_live.list.deinit(gpa);
     isel.dom.deinit(gpa);
+    isel.promotion.deinit(gpa);
 
     isel.tail_branches.deinit(gpa);
     isel.instructions.deinit(gpa);
@@ -283,6 +292,14 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
 
             isel.stack_align = isel.stack_align.maxStrict(ty.ptrAlignment(zcu));
             try isel.def_order.putNoClobber(gpa, air_inst_index, {});
+            if (isel.promotableType(ty.childType(zcu))) |is_vector| try isel.promotion.locals.putNoClobber(gpa, air_inst_index, .{
+                .weight = 0,
+                .epoch = 0,
+                .escaped = false,
+                .in_loop = false,
+                .is_vector = is_vector,
+                .ra = .zr,
+            });
 
             air_body_index += 1;
             air_inst_index = air_body[air_body_index];
@@ -314,6 +331,8 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
         },
         .assembly => {
             const ty_pl = air_data[@backingInt(air_inst_index)].ty_pl;
+            try isel.analyzeAsmRegisters(air_inst_index);
+
             const unwrapped_asm = isel.air.unwrapAsm(air_inst_index);
             for (unwrapped_asm.inputs) |operand| try isel.analyzeUse(operand);
             for (unwrapped_asm.outputs) |operand| if (operand != .none) try isel.analyzeUse(operand);
@@ -330,7 +349,6 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
         .byte_swap,
         .bit_reverse,
         .abs,
-        .load,
         .fptrunc,
         .fpext,
         .int_cast,
@@ -375,6 +393,43 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
             air_inst_index = air_body[air_body_index];
             continue :air_tag air_tags[@backingInt(air_inst_index)];
         },
+        .load => {
+            const ty_op = air_data[@backingInt(air_inst_index)].ty_op;
+
+            if (isel.promotableLocalIndex(ty_op.operand)) |local_index| {
+                const local = &isel.promotion.locals.values()[local_index];
+                local.weight +|= Promotion.useWeight(isel.active_loops.items.len);
+                if (isel.active_loops.items.len > 0) local.in_loop = true;
+                try isel.promotion.local_loads.putNoClobber(gpa, air_inst_index, .{
+                    .local = @intCast(local_index),
+                    .epoch = local.epoch,
+                    .aliasable = true,
+                });
+                _ = try isel.analyzeLiveness(ty_op.operand);
+            } else try isel.analyzeUse(ty_op.operand);
+            try isel.def_order.putNoClobber(gpa, air_inst_index, {});
+
+            air_body_index += 1;
+            air_inst_index = air_body[air_body_index];
+            continue :air_tag air_tags[@backingInt(air_inst_index)];
+        },
+        .store, .store_safe => {
+            const bin_op = air_data[@backingInt(air_inst_index)].bin_op;
+
+            try isel.analyzeUse(bin_op.rhs);
+            if (isel.promotableLocalIndex(bin_op.lhs)) |local_index| {
+                const local = &isel.promotion.locals.values()[local_index];
+                local.weight +|= Promotion.useWeight(isel.active_loops.items.len);
+                if (isel.active_loops.items.len > 0) local.in_loop = true;
+                // Loads before this store can no longer stand for the local.
+                local.epoch += 1;
+                _ = try isel.analyzeLiveness(bin_op.lhs);
+            } else try isel.analyzeUse(bin_op.lhs);
+
+            air_body_index += 1;
+            air_inst_index = air_body[air_body_index];
+            continue :air_tag air_tags[@backingInt(air_inst_index)];
+        },
         .bit_cast,
         .ptr_cast,
         .ptr_from_int,
@@ -396,6 +451,16 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
             }
             try isel.analyzeUse(ty_op.operand);
             try isel.def_order.putNoClobber(gpa, air_inst_index, {});
+            // A bit cast between integers of the same size (`usize` to `u64`
+            // in `for` loops) is the same value: it shares its operand's.
+            if (air_tags[@backingInt(air_inst_index)] == .bit_cast) if (ty_op.operand.toIndex()) |operand_inst| {
+                const operand_ty = isel.air.typeOf(ty_op.operand, ip);
+                // Other widths are extended by signedness.
+                if (ty_op.ty.isAbiInt(zcu) and operand_ty.isAbiInt(zcu) and
+                    ty_op.ty.intInfo(zcu).bits == operand_ty.intInfo(zcu).bits and
+                    (ty_op.ty.intInfo(zcu).bits == 32 or ty_op.ty.intInfo(zcu).bits == 64))
+                    try isel.promotion.casts.putNoClobber(gpa, air_inst_index, isel.promotion.casts.get(operand_inst) orelse operand_inst);
+            };
 
             air_body_index += 1;
             air_inst_index = air_body[air_body_index];
@@ -466,6 +531,10 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
 
             air_body_index += 1;
         },
+        // The backend emits no variable locations, so `dbg_var_ptr` is not a
+        // use of the pointer: a promoted local has no memory at all
+        // (`selectStore`). Emitting locations requires treating it as an
+        // escaping use first.
         .breakpoint, .dbg_stmt, .dbg_empty_stmt, .dbg_var_ptr, .dbg_var_val, .dbg_arg_inline, .c_va_end => {
             air_body_index += 1;
             air_inst_index = air_body[air_body_index];
@@ -696,8 +765,6 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
 
             air_body_index += 1;
         },
-        .store,
-        .store_safe,
         .set_union_tag,
         .memset,
         .memset_safe,
@@ -897,8 +964,100 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
     isel.def_order.shrinkRetainingCapacity(initial_def_order_len);
 }
 
+/// Records the registers that the inline assembly `inst` names in its
+/// constraints or clobbers. Invalid ones are reported when it is selected.
+fn analyzeAsmRegisters(isel: *Select, inst: Air.Inst.Index) !void {
+    const unwrapped_asm = isel.air.unwrapAsm(inst);
+    var it = unwrapped_asm.iterateOutputs();
+    while (it.next()) |output| {
+        if (!std.mem.startsWith(u8, output.constraint, "=")) continue;
+        const reg = asmConstraintRegister(asmConstraintAlternative(output.constraint["=".len..])) orelse continue;
+        isel.promotion.asm_registers.insert((reg orelse continue).alias);
+    }
+    it = unwrapped_asm.iterateInputs();
+    while (it.next()) |input| {
+        const reg = asmConstraintRegister(asmConstraintAlternative(input.constraint)) orelse continue;
+        isel.promotion.asm_registers.insert((reg orelse continue).alias);
+    }
+    var clobbers_bigint_buf: Constant.BigIntSpace = undefined;
+    var clobber_it = isel.asmClobbers(unwrapped_asm.clobbers, &clobbers_bigint_buf);
+    while (try clobber_it.next()) |clobber| isel.promotion.asm_registers.insert(clobber.ra);
+}
+
 fn analyzeUse(isel: *Select, air_ref: Air.Inst.Ref) !void {
-    const air_inst_index = air_ref.toIndex() orelse return;
+    const use_inst = air_ref.toIndex() orelse return;
+    const crosses_loop = try isel.analyzeLiveness(air_ref);
+    // A cast that shares its operand's value is a use of the operand.
+    const air_inst_index = if (isel.air.instructions.items(.tag)[@backingInt(use_inst)] == .bit_cast)
+        isel.promotion.casts.get(use_inst) orelse use_inst
+    else
+        use_inst;
+
+    // Promoted locals
+    switch (isel.air.instructions.items(.tag)[@backingInt(air_inst_index)]) {
+        else => {},
+        // Any use other than as the pointer of a load or store escapes.
+        .alloc => if (isel.promotion.locals.getPtr(air_inst_index)) |local| {
+            local.escaped = true;
+        },
+        .load => isel.analyzePromotedLoadUse(air_inst_index, crosses_loop),
+    }
+    if (crosses_loop) try isel.analyzePinnedValue(air_inst_index);
+}
+
+/// A use of the result of `load_inst`, which may load a promoted local.
+fn analyzePromotedLoadUse(isel: *Select, load_inst: Air.Inst.Index, crosses_loop: bool) void {
+    const load = isel.promotion.local_loads.getPtr(load_inst) orelse return;
+    if (crosses_loop or load.epoch != isel.promotion.locals.values()[load.local].epoch)
+        load.aliasable = false;
+}
+
+/// Counts a use in a loop of a value defined outside it.
+fn analyzePinnedValue(isel: *Select, inst: Air.Inst.Index) !void {
+    const zcu = isel.pt.zcu;
+    const gop = try isel.promotion.pinned_values.getOrPut(zcu.gpa, inst);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{ .weight = 0, .is_vector = false, .pair = false, .ra = .zr, .ra2 = .zr };
+        const class: enum { ineligible, general, vector } = class: switch (isel.air.instructions.items(.tag)[@backingInt(inst)]) {
+            // Addresses of locals are rematerialized; these alias parts of
+            // other values; this one lives in a stack slot.
+            .alloc, .ret_ptr, .slice_len, .slice_ptr, .loop_switch_br => .ineligible,
+            else => {
+                // A constant offset from a local is a stack address too.
+                var root = inst;
+                while (isel.constantOffsetPointer(root)) |base| {
+                    root = base[0].toIndex() orelse break;
+                    switch (isel.air.instructions.items(.tag)[@backingInt(root)]) {
+                        else => {},
+                        .alloc, .ret_ptr => break :class .ineligible,
+                    }
+                }
+                const ty = isel.air.typeOfIndex(inst, &zcu.intern_pool);
+                if (ty.isSlice(zcu)) {
+                    gop.value_ptr.pair = true;
+                    break :class .general;
+                }
+                const is_vector = isel.promotableType(ty) orelse break :class .ineligible;
+                break :class if (is_vector) .vector else .general;
+            },
+        };
+        switch (class) {
+            .ineligible => {
+                gop.value_ptr.weight = std.math.maxInt(u32);
+                return;
+            },
+            .general => {},
+            .vector => gop.value_ptr.is_vector = true,
+        }
+    }
+    if (gop.value_ptr.weight == std.math.maxInt(u32)) return;
+    gop.value_ptr.weight = @min(gop.value_ptr.weight +| Promotion.useWeight(isel.active_loops.items.len), std.math.maxInt(u32) - 1);
+}
+
+/// Records loop liveness of a use; returns whether the use is in a loop
+/// that does not contain the definition.
+fn analyzeLiveness(isel: *Select, air_ref: Air.Inst.Ref) !bool {
+    const air_inst_index = air_ref.toIndex() orelse return false;
     const def_order_index = isel.def_order.getIndex(air_inst_index).?;
 
     // Loop liveness
@@ -914,11 +1073,51 @@ fn analyzeUse(isel: *Select, air_ref: Air.Inst.Ref) !void {
         const loop_live_gop =
             try isel.loop_live.set.getOrPut(isel.pt.zcu.gpa, .{ active_loop, air_inst_index });
         if (!loop_live_gop.found_existing) active_loop.get(isel).live += 1;
+        return true;
     }
+    return false;
 }
 
-/// Copies a value of `size` bytes from `src_ra` to `dst_ra`, registers of
-/// either class.
+fn promotableLocalIndex(isel: *Select, ptr_ref: Air.Inst.Ref) ?usize {
+    const ptr_inst = ptr_ref.toIndex() orelse return null;
+    if (isel.air.instructions.items(.tag)[@backingInt(ptr_inst)] != .alloc) return null;
+    return isel.promotion.locals.getIndex(ptr_inst);
+}
+
+/// The register of the promoted local that `ptr_ref` points to, if any.
+fn promotedLocalRegister(isel: *Select, ptr_ref: Air.Inst.Ref) ?Register.Alias {
+    if (!isel.promotion.enabled) return null;
+    const local = isel.promotion.locals.get(ptr_ref.toIndex() orelse return null) orelse return null;
+    return switch (local.ra) {
+        .zr => null,
+        else => |ra| ra,
+    };
+}
+
+/// Whether a local of type `ty` can be promoted to a register, and if so
+/// whether it is a vector register.
+fn promotableType(isel: *Select, ty: ZigType) ?bool {
+    const zcu = isel.pt.zcu;
+    const size = ty.abiSize(zcu);
+    if (size == 0 or size > 8) return null;
+    // The same register class `use` gives the loaded value.
+    const is_vector = Value.isVectorSize(size) and
+        CallAbiIterator.homogeneousAggregateBaseType(zcu, ty.toIntern()) != null;
+    switch (ty.zigTypeTag(zcu)) {
+        else => return null,
+        .int, .bool, .@"enum", .error_set => {},
+        .pointer => if (ty.isSlice(zcu)) return null,
+        .optional => if (!ty.optionalReprIsPayload(zcu)) return null,
+        .float => switch (ty.floatBits(isel.target)) {
+            else => return null,
+            16, 32, 64 => if (!is_vector) return null,
+        },
+    }
+    if (is_vector and ty.zigTypeTag(zcu) != .float) return null;
+    return is_vector;
+}
+
+/// Copies a promoted local between its register and another of the same class.
 pub fn pinnedMove(isel: *Select, dst_ra: Register.Alias, src_ra: Register.Alias, size: u64) !void {
     if (dst_ra == src_ra) return;
     // A value can be live in either register class.
@@ -951,8 +1150,50 @@ pub fn pinnedMove(isel: *Select, dst_ra: Register.Alias, src_ra: Register.Alias,
     });
 }
 
-/// Completes the analysis of the function.
-pub fn finishAnalysis(isel: *Select) !void {
+/// Whether the value stored by the instruction after `preceding` is defined
+/// right before it, so that defining it in a promoted local's register does
+/// not hide the local from anything in between.
+fn pinnedStoreSourceAdjacent(isel: *Select, preceding: []const Air.Inst.Index, src_ref: Air.Inst.Ref) bool {
+    const src_inst = src_ref.toIndex() orelse return false;
+    const air_tags = isel.air.instructions.items(.tag);
+    var index = preceding.len;
+    while (index > 0) {
+        index -= 1;
+        const inst = preceding[index];
+        switch (air_tags[@backingInt(inst)]) {
+            else => {},
+            .dbg_stmt, .dbg_empty_stmt, .dbg_var_ptr, .dbg_var_val, .dbg_arg_inline, .alloc => continue,
+        }
+        if (inst != src_inst) return false;
+        // A cast that shares an earlier instruction's value is defined
+        // there, not here.
+        if (isel.promotion.casts.contains(inst)) return false;
+        // A result defined by a nested body is written where that body
+        // leaves, which may be anywhere in it.
+        return switch (air_tags[@backingInt(inst)]) {
+            else => true,
+            // These share the part of the slice they read when it is one,
+            // which is then defined with the slice.
+            .slice_len, .slice_ptr => if (isel.live_values.get(inst)) |vi| vi.parent(isel) != .value else true,
+            .block,
+            .dbg_inline_block,
+            .loop,
+            .loop_switch_br,
+            .@"try",
+            .try_cold,
+            .try_ptr,
+            .try_ptr_cold,
+            => false,
+        };
+    }
+    return false;
+}
+
+/// Completes the analysis of the function. With `promote`, locals and loop
+/// invariants may be promoted to registers; naked functions, which save no
+/// registers, and the fallback after `error.RetryWithoutPromotion` select
+/// without it.
+pub fn finishAnalysis(isel: *Select, promote: bool) !void {
     const gpa = isel.pt.zcu.gpa;
 
     // Loop Liveness
@@ -981,6 +1222,30 @@ pub fn finishAnalysis(isel: *Select) !void {
         invalid_gop.value_ptr.live = loop_live_len;
     }
 
+    // Casts share their operand's value.
+    var cast_it = isel.promotion.casts.iterator();
+    while (cast_it.next()) |cast| {
+        if (isel.live_values.contains(cast.key_ptr.*)) continue;
+        const vi = try isel.use(cast.value_ptr.*.toRef());
+        try isel.live_values.putNoClobber(gpa, cast.key_ptr.*, vi.ref(isel));
+    }
+
+    if (promote) {
+        isel.promotion.enabled = true;
+        Promotion.promoteLocals(isel);
+        // A load of a promoted local whose value analysis created already
+        // prefers the local's register, as `use` makes the others.
+        var load_it = isel.promotion.local_loads.iterator();
+        while (load_it.next()) |load_entry| {
+            const load_inst = load_entry.key_ptr.*;
+            const load = load_entry.value_ptr;
+            if (!load.aliasable) continue;
+            const local = isel.promotion.locals.values()[load.local];
+            if (local.ra == .zr) continue;
+            const vi = isel.live_values.get(load_inst) orelse continue;
+            if (vi.hint(isel) == null) vi.setHint(isel, local.ra);
+        }
+    }
 }
 
 /// Selects `air_body`. For the body of a `block`, `block_pred` is the
@@ -2189,6 +2454,15 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
         },
         .load => {
             const ty_op = air.data(air.inst_index).ty_op;
+            if (isel.promotedLocalRegister(ty_op.operand)) |pin_ra| {
+                if (isel.live_values.fetchRemove(air.inst_index)) |dst_vi| unused: {
+                    defer dst_vi.value.deref(isel);
+                    const dst_ra = try dst_vi.value.defReg(isel) orelse break :unused;
+                    try isel.pinnedMove(dst_ra, pin_ra, dst_vi.value.size(isel));
+                }
+                if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
+                break :air_tag;
+            }
             const ptr_ty = isel.air.typeOf(ty_op.operand, ip);
             const ptr_info = ptr_ty.ptrInfo(zcu);
 
@@ -8499,6 +8773,7 @@ fn selectStore(
 ) !void {
     const zcu = isel.pt.zcu;
     const ip = &zcu.intern_pool;
+    if (isel.promotedLocalRegister(bin_op.lhs)) |pin_ra| return isel.storeToPromotedLocal(pin_ra, bin_op, before);
     const ptr_ty = isel.air.typeOf(bin_op.lhs, ip);
     const ptr_info = ptr_ty.ptrInfo(zcu);
     const src_ty = isel.air.typeOf(bin_op.rhs, ip);
@@ -8561,6 +8836,40 @@ fn selectStore(
     try call.paramAddress(isel, src_vi, .r1);
     try call.paramLiveOut(isel, ptr_vi, .r0);
     try call.finishParams(isel);
+}
+
+/// A store to the local promoted to `pin_ra`, preceded by `before`.
+fn storeToPromotedLocal(
+    isel: *Select,
+    pin_ra: Register.Alias,
+    bin_op: @FieldType(Air.Inst.Data, "bin_op"),
+    before: []const Air.Inst.Index,
+) !void {
+    const zcu = isel.pt.zcu;
+    const ip = &zcu.intern_pool;
+    // Only a value defined in the register for this store may
+    // occupy it here; see `pinnedStoreSourceAdjacent`.
+    if (isel.live_registers.get(pin_ra) != .free)
+        return isel.promotionBug("promoted local register {t} is live at a store", .{pin_ra});
+    if (bin_op.rhs.toInterned()) |rhs_val| if (ip.isUndef(rhs_val)) {
+        // Keep the register a valid value of the type.
+        return isel.emit(if (pin_ra.isVector())
+            .movi(pin_ra.@"8b"(), 0, .{ .lsl = 0 })
+        else
+            .orr(pin_ra.x(), .xzr, .{ .register = .xzr }));
+    };
+    const src_vi = try isel.use(bin_op.rhs);
+    // A value that is not live yet would be defined straight into
+    // the local's register, which then no longer holds the local
+    // in between: only allowed when nothing is in between.
+    if (src_vi.isMaterializedAt(isel) or (src_vi.parent(isel) == .unallocated and
+        isel.pinnedStoreSourceAdjacent(before, bin_op.rhs)))
+    {
+        return src_vi.liveOutToPromotedLocal(isel, pin_ra);
+    }
+    const src_mat = try src_vi.matReg(isel);
+    try isel.pinnedMove(pin_ra, src_mat.ra, isel.air.typeOf(bin_op.rhs, ip).abiSize(zcu));
+    try src_mat.finish(isel);
 }
 
 /// Whether `inst` is in `before`, followed only by instructions with one of
@@ -9252,6 +9561,21 @@ fn atomicRmwFloat(isel: *Select, ptr: Air.Inst.Ref, extra: Air.AtomicRmw, dst: ?
 pub fn fail(isel: *Select, comptime format: []const u8, args: anytype) codegen.Error {
     @branchHint(.cold);
     return isel.pt.zcu.codegenFail(isel.nav_index, format, args);
+}
+
+/// An invariant that the promotion analysis (`promoteLocals`,
+/// `Promotion.pinned_values`) should guarantee does not hold. With promotion,
+/// `generate` selects the function again without it, so the program still
+/// compiles; compilers with runtime safety stop here instead, since this is a
+/// bug in that analysis. Without promotion, this is an ordinary codegen
+/// failure.
+pub fn promotionBug(isel: *Select, comptime format: []const u8, args: anytype) Error {
+    @branchHint(.cold);
+    if (!isel.promotion.enabled) return isel.fail(format, args);
+    if (std.debug.runtime_safety) std.debug.panic("aarch64 promotion invariant violated in {f}: " ++ format, .{
+        isel.pt.zcu.intern_pool.getNav(isel.nav_index).fqn.fmt(&isel.pt.zcu.intern_pool),
+    } ++ args);
+    return error.RetryWithoutPromotion;
 }
 
 /// dst = src
@@ -13624,6 +13948,7 @@ pub fn tryAllocIntReg(isel: *Select) TryAllocRegResult {
     while (true) : (ra = @fromBackingInt(@intCast(@backingInt(ra) + 1))) {
         if (ra == .r18) continue; // The Platform Register
         if (ra == Register.Alias.fp) continue;
+        if (isel.promotion.pinned.contains(ra)) continue;
         const live_vi = isel.live_registers.getPtr(ra);
         switch (live_vi.*) {
             _ => switch (failed_result) {
@@ -13650,7 +13975,10 @@ pub fn allocIntReg(isel: *Select) !Register.Alias {
             isel.reserveReg(ra);
             return ra;
         },
-        .out_of_registers => return isel.fail("ran out of registers", .{}),
+        .out_of_registers => {
+            if (isel.promotion.enabled) return error.RetryWithoutPromotion;
+            return isel.fail("ran out of registers", .{});
+        },
     }
 }
 
@@ -13658,6 +13986,7 @@ pub fn tryAllocVecReg(isel: *Select) TryAllocRegResult {
     var failed_result: TryAllocRegResult = .out_of_registers;
     var ra: Register.Alias = .v0;
     while (true) : (ra = @fromBackingInt(@intCast(@backingInt(ra) + 1))) {
+        if (isel.promotion.pinned.contains(ra)) continue;
         const live_vi = isel.live_registers.getPtr(ra);
         switch (live_vi.*) {
             _ => switch (failed_result) {
@@ -13684,7 +14013,10 @@ pub fn allocVecReg(isel: *Select) !Register.Alias {
             isel.reserveReg(ra);
             return ra;
         },
-        .out_of_registers => return isel.fail("ran out of registers", .{}),
+        .out_of_registers => {
+            if (isel.promotion.enabled) return error.RetryWithoutPromotion;
+            return isel.fail("ran out of registers", .{});
+        },
     }
 }
 
@@ -13751,6 +14083,23 @@ pub fn use(isel: *Select, air_ref: Air.Inst.Ref) !Value.Index {
             @backingInt(air_inst_index),
         });
         if (stack_address) |address| vi.setParent(isel, .{ .stack_address = address });
+        // A load of a promoted local that no store separates from its uses
+        // prefers the local's register: the load is then free.
+        if (isel.promotion.enabled) {
+            if (isel.promotion.local_loads.get(air_inst_index)) |load| if (load.aliasable) {
+                const local = isel.promotion.locals.values()[load.local];
+                if (local.ra != .zr) vi.setHint(isel, local.ra);
+            };
+            if (isel.promotion.pinned_value_regs.count() > 0) if (isel.promotion.pinned_values.get(air_inst_index)) |value| {
+                if (value.ra != .zr) if (value.pair) {
+                    // Split now so that each part has its register.
+                    try isel.values.ensureUnusedCapacity(zcu.gpa, 2);
+                    vi.setParts(isel, 2);
+                    vi.addPart(isel, 0, 8).setPin(isel, value.ra);
+                    vi.addPart(isel, 8, 8).setPin(isel, value.ra2);
+                } else vi.setPin(isel, value.ra);
+            };
+        }
         live_gop.value_ptr.* = vi.ref(isel);
         break :vi_ty .{ vi, ty };
     } else vi_ty: {
@@ -14069,9 +14418,32 @@ fn merge(
     expected_live_registers: *const LiveRegisters,
     comptime opts: struct { fill_extra: bool = false },
 ) !void {
+    // A pinned value's register holds nothing else, so the value is simply
+    // live there before the merge if it is live on either side.
+    var pinned_it = isel.promotion.pinned_value_regs.iterator();
+    while (pinned_it.next()) |ra| {
+        const actual_vi = isel.live_registers.getPtr(ra);
+        const expected_vi = expected_live_registers.get(ra);
+        // The register may also be taken (`.allocating`) by an operand that
+        // is the value itself and becomes live there again.
+        const locked = actual_vi.* == .allocating or expected_vi == .allocating;
+        const vi: Value.Index = switch (actual_vi.*) {
+            _ => |vi| vi,
+            .allocating, .free => switch (expected_vi) {
+                _ => |vi| vi,
+                .allocating, .free => .free,
+            },
+        };
+        // While the operand holds the register, the value is not live in it:
+        // another use copies it out of the register (`matReg`), and the
+        // operand makes it live there again when it finishes.
+        if (vi != .free) vi.get(isel).location_payload.small.register = if (locked) .zr else ra;
+        actual_vi.* = if (locked) .allocating else vi;
+    }
     var live_reg_it = isel.live_registers.iterator();
     while (live_reg_it.next()) |live_reg_entry| {
         const ra = live_reg_entry.key;
+        if (isel.promotion.pinned_value_regs.contains(ra)) continue;
         const actual_vi = live_reg_entry.value;
         const expected_vi = expected_live_registers.get(ra);
         switch (expected_vi) {
@@ -14086,6 +14458,7 @@ fn merge(
     live_reg_it = isel.live_registers.iterator();
     while (live_reg_it.next()) |live_reg_entry| {
         const ra = live_reg_entry.key;
+        if (isel.promotion.pinned_value_regs.contains(ra)) continue;
         const actual_vi = live_reg_entry.value;
         const expected_vi = expected_live_registers.get(ra);
         switch (expected_vi) {
@@ -14110,6 +14483,7 @@ fn merge(
     live_reg_it = isel.live_registers.iterator();
     while (live_reg_it.next()) |live_reg_entry| {
         const ra = live_reg_entry.key;
+        if (isel.promotion.pinned_value_regs.contains(ra)) continue;
         const actual_vi = live_reg_entry.value;
         const expected_vi = expected_live_registers.get(ra);
         switch (expected_vi) {

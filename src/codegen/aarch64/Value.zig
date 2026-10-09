@@ -39,7 +39,10 @@ pub const Flags = packed struct(u32) {
     location_tag: Location.Tag,
     parts_len_minus_one: std.math.IntFittingRange(0, Value.max_parts - 1),
     is_padding: bool = false,
-    unused: u17 = 0,
+    /// The register reserved for this value for the whole function
+    /// (`Promotion`), as the backing integer of its alias; 0 for none.
+    pin: u7 = 0,
+    unused: u10 = 0,
 };
 
 pub const Parent = union(enum(u3)) {
@@ -177,6 +180,19 @@ pub const Index = enum(u32) {
 
     pub fn setHint(vi: Value.Index, isel: *Select, new_hint: Register.Alias) void {
         vi.get(isel).location_payload.small.hint = new_hint;
+    }
+
+    pub fn setPin(vi: Value.Index, isel: *Select, pin_ra: Register.Alias) void {
+        assert(@backingInt(pin_ra) != 0);
+        vi.get(isel).flags.pin = @backingInt(pin_ra);
+    }
+
+    /// The register this value always lives in, if it has one.
+    pub fn pin(vi: Value.Index, isel: *Select) ?Register.Alias {
+        return switch (vi.get(isel).flags.pin) {
+            0 => null,
+            else => |pin_ra| @fromBackingInt(pin_ra),
+        };
     }
 
     pub fn hint(vi: Value.Index, isel: *Select) ?Register.Alias {
@@ -957,6 +973,16 @@ pub const Index = enum(u32) {
                 live_vi.* = .allocating;
                 break :mat_ra mat_ra;
             }
+            // Taken already by another operand that is this value: the
+            // value is copied for this one (see `Materialize.finish`).
+            if (vi.pin(isel)) |pin_ra| switch (isel.live_registers.get(pin_ra)) {
+                _ => return isel.promotionBug("pinned register {t} is not free", .{pin_ra}),
+                .allocating => {},
+                .free => {
+                    isel.reserveReg(pin_ra);
+                    break :mat_ra pin_ra;
+                },
+            };
             if (vi.hint(isel)) |hint_ra| if (isel.live_registers.get(hint_ra) == .free) {
                 isel.reserveReg(hint_ra);
                 isel.saved_registers.insert(hint_ra);
@@ -1418,8 +1444,29 @@ pub const Index = enum(u32) {
         }
     }
 
+    /// Whether `Materialize.finish` produces this value where it is
+    /// called, rather than making it live in the register back to its
+    /// definition.
+    pub fn isMaterializedAt(initial_vi: Value.Index, isel: *Select) bool {
+        var vi = initial_vi;
+        while (true) {
+            if (vi.register(isel) != null) return true;
+            switch (vi.parent(isel)) {
+                .unallocated => return false,
+                .value => |parent_vi| vi = parent_vi,
+                .stack_slot, .address, .constant, .stack_address => return true,
+            }
+        }
+    }
+
     pub fn liveOut(vi: Value.Index, isel: *Select, ra: Register.Alias) !void {
         return Value.Materialize.liveOut(.{ .vi = vi, .ra = ra }, isel);
+    }
+
+    /// `liveOut` of the value that a store to the promoted local in `ra`
+    /// defines there.
+    pub fn liveOutToPromotedLocal(vi: Value.Index, isel: *Select, ra: Register.Alias) !void {
+        return Value.Materialize.liveOut(.{ .vi = vi, .ra = ra, .defines_promoted_local = true }, isel);
     }
 
     pub fn allocStackSlot(vi: Value.Index, isel: *Select) Value.Indirect {
@@ -2071,6 +2118,10 @@ pub const FieldPartIterator = struct {
 pub const Materialize = struct {
     vi: Value.Index,
     ra: Register.Alias,
+    /// `ra` is a promoted local's register and `vi` the value that a
+    /// store to the local defines there (`storeToPromotedLocal`), which
+    /// besides the local's own loads is the only value that may live in it.
+    defines_promoted_local: bool = false,
 
     pub fn emitUndefined(mat: Value.Materialize, isel: *Select, size: u64) !void {
         try isel.emit(if (mat.ra.isVector()) .movi(switch (size) {
@@ -2173,6 +2224,37 @@ pub const Materialize = struct {
             offset += vi.get(isel).offset_from_parent;
             switch (vi.parent(isel)) {
                 .unallocated => {
+                    // A value with a register of its own lives only there.
+                    if (mat.vi.pin(isel)) |pin_ra| if (pin_ra != mat.ra) {
+                        const pin_live_vi = isel.live_registers.getPtr(pin_ra);
+                        try isel.pinnedMove(mat.ra, pin_ra, size);
+                        live_vi.* = .free;
+                        switch (pin_live_vi.*) {
+                            _ => return isel.promotionBug("pinned register {t} is not free", .{pin_ra}),
+                            // Another operand that is this value holds the
+                            // register and makes the value live there.
+                            .allocating => {},
+                            .free => {
+                                mat.vi.get(isel).location_payload.small.register = pin_ra;
+                                pin_live_vi.* = mat.vi;
+                            },
+                        }
+                        return;
+                    };
+                    // A value defined later in a promoted local's register
+                    // would hide the local from here back to its definition.
+                    // Only the local's own loads, and the value a store
+                    // defines right before it, may live there.
+                    if (isel.promotion.pinned.contains(mat.ra) and mat.vi.hint(isel) != mat.ra and
+                        mat.vi.pin(isel) != mat.ra and !mat.defines_promoted_local)
+                    {
+                        const ra = if (mat.vi.isVector(isel)) try isel.allocVecReg() else try isel.allocIntReg();
+                        try isel.pinnedMove(mat.ra, ra, size);
+                        live_vi.* = .free;
+                        mat.vi.get(isel).location_payload.small.register = ra;
+                        isel.live_registers.set(ra, mat.vi);
+                        return;
+                    }
                     // A float or vector value of its own (not a part of
                     // another value) is defined in a vector register (the
                     // float field of a struct passed in general

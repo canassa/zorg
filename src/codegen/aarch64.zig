@@ -96,12 +96,39 @@ pub fn legalizeFeatures(_: *const std.Target) *const Air.Legalize.Features {
 }
 
 pub fn generate(
-    _: *link.File,
+    lf: *link.File,
     pt: Zcu.PerThread,
     func_index: InternPool.Index,
     air: *const Air,
     liveness: *const ?Air.Liveness,
 ) !Mir {
+    return generateAttempt(lf, pt, func_index, air, liveness, true) catch |err| switch (err) {
+        // Registers reserved for promoted locals and pinned values left too
+        // few for an instruction (or broke an invariant of the promotion
+        // analysis, which debug builds of the compiler report): select the
+        // function again without promotion.
+        error.RetryWithoutPromotion => {
+            promote_log.debug("{f}: selecting again without promotion", .{
+                pt.zcu.intern_pool.getNav(pt.zcu.funcInfo(func_index).owner_nav).fqn.fmt(&pt.zcu.intern_pool),
+            });
+            return generateAttempt(lf, pt, func_index, air, liveness, false) catch |retry_err| switch (retry_err) {
+                // Nothing is reserved without promotion.
+                error.RetryWithoutPromotion => unreachable,
+                else => |e| return e,
+            };
+        },
+        else => |e| return e,
+    };
+}
+
+fn generateAttempt(
+    _: *link.File,
+    pt: Zcu.PerThread,
+    func_index: InternPool.Index,
+    air: *const Air,
+    liveness: *const ?Air.Liveness,
+    promote: bool,
+) Select.Error!Mir {
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
     const ip = &zcu.intern_pool;
@@ -231,7 +258,7 @@ pub fn generate(
 
     assert(!(try isel.blocks.getOrPut(gpa, Select.Block.main)).found_existing);
     try isel.analyze(air_main_body);
-    try isel.finishAnalysis();
+    try isel.finishAnalysis(promote and !func_type.cc.eql(.naked));
     isel.verify(false);
 
     isel.blocks.values()[0] = .{
@@ -300,5 +327,8 @@ const assert = std.debug.assert;
 const InternPool = @import("../InternPool.zig");
 const link = @import("../link.zig");
 const std = @import("std");
+/// `--debug-log aarch64_promote` names each function selected again without
+/// promotion (`error.RetryWithoutPromotion`).
+const promote_log = std.log.scoped(.aarch64_promote);
 const tracking_log = std.log.scoped(.tracking);
 const Zcu = @import("../Zcu.zig");

@@ -1,5 +1,6 @@
 pt: Zcu.PerThread,
 target: *const std.Target,
+optimize_mode: std.lang.Optimize,
 air: Air,
 nav_index: InternPool.Nav.Index,
 /// The function whose code is being selected, for debug info: the inlined
@@ -1304,7 +1305,7 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
             if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
         },
         .bit_and, .bit_or, .xor => |air_tag| {
-            try isel.selectBitwise(air.inst_index, air_tag);
+            try isel.selectBitwise(air.inst_index, air_tag, air.body[0..air.body_index]);
             if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
         },
         .shl_sat => {
@@ -2112,7 +2113,9 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
             if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
         },
         .dbg_empty_stmt => {
-            try isel.emit(.nop());
+            // The `nop` only gives a debugger an instruction to stop at. Outside
+            // Debug builds emit nothing, as the LLVM backend always does.
+            if (isel.optimize_mode == .debug) try isel.emit(.nop());
             if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
         },
         .dbg_inline_block => {
@@ -2512,17 +2515,20 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
                     const dst_ra = try dst_vi.value.defReg(isel) orelse break :unused;
                     const src_vi = try isel.use(ty_op.operand);
                     const src_mat = try src_vi.matReg(isel);
-                    try isel.emit(.orr(dst_ra.w(), .wzr, .{ .register = src_mat.ra.w() }));
+                    try isel.moveInt32(dst_ra, src_mat.ra);
                     try src_mat.finish(isel);
                 } else if (dst_int_info.bits <= 64 and src_int_info.bits <= 32) {
                     const dst_ra = try dst_vi.value.defReg(isel) orelse break :unused;
                     const src_vi = try isel.use(ty_op.operand);
                     const src_mat = try src_vi.matReg(isel);
-                    try isel.emit(if (can_be_negative) .sbfm(dst_ra.x(), src_mat.ra.x(), .{
+                    if (can_be_negative) try isel.emit(.sbfm(dst_ra.x(), src_mat.ra.x(), .{
                         .N = .doubleword,
                         .immr = 0,
                         .imms = @intCast(src_int_info.bits - 1),
-                    }) else .orr(dst_ra.w(), .wzr, .{ .register = src_mat.ra.w() }));
+                    })) else if (dst_int_info.bits <= 32)
+                        try isel.moveInt32(dst_ra, src_mat.ra)
+                    else
+                        try isel.emit(.orr(dst_ra.w(), .wzr, .{ .register = src_mat.ra.w() }));
                     try src_mat.finish(isel);
                 } else if (dst_int_info.bits <= 32 and src_int_info.bits <= 128) {
                     assert(src_int_info.bits > 64);
@@ -2598,7 +2604,7 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
                         var src_part_it = src_vi.field(src_ty, 0, @min(src_vi.size(isel), 8));
                         const src_part_vi = try src_part_it.only(isel);
                         const src_part_mat = try src_part_vi.?.matReg(isel);
-                        try isel.emit(switch (dst_bits) {
+                        if (dst_bits == 32) try isel.moveInt32(dst_ra, src_part_mat.ra) else try isel.emit(switch (dst_bits) {
                             else => unreachable,
                             1...31 => |bits| switch (dst_int_info.signedness) {
                                 .signed => .sbfm(dst_ra.w(), src_part_mat.ra.w(), .{
@@ -2612,7 +2618,6 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
                                     .imms = @intCast(bits - 1),
                                 }),
                             },
-                            32 => .orr(dst_ra.w(), .wzr, .{ .register = src_part_mat.ra.w() }),
                             33...63 => |bits| switch (dst_int_info.signedness) {
                                 .signed => .sbfm(dst_ra.x(), src_part_mat.ra.x(), .{
                                     .N = .doubleword,
@@ -6463,9 +6468,10 @@ fn selectMinMax(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag) !voi
     }
 }
 
-/// `bit_and`, `bit_or` and `xor` of integers of at most 128 bits, bools and
-/// vectors.
-fn selectBitwise(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag) !void {
+/// `bit_and`, `bit_or` and `xor`, preceded by `before` in their body, of
+/// integers of at most 128 bits, bools and vectors; a rotate idiom becomes a
+/// rotate (`rotateOperands`).
+fn selectBitwise(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag, before: []const Air.Inst.Index) !void {
     const zcu = isel.pt.zcu;
     const ip = &zcu.intern_pool;
     if (isel.live_values.fetchRemove(inst)) |res_vi| unused: {
@@ -6483,6 +6489,43 @@ fn selectBitwise(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag) !vo
             else
                 return isel.fail("bad {t} {f}", .{ air_tag, isel.fmtType(ty) });
             if (int_info.bits > 128) return isel.fail("too big {t} {f}", .{ air_tag, isel.fmtType(ty) });
+
+            if (air_tag == .bit_or and (int_info.bits == 32 or int_info.bits == 64)) rotate: {
+                const rotate = isel.rotateOperands(bin_op, int_info.bits, before) orelse break :rotate;
+                const res_ra = try res_vi.value.defReg(isel) orelse break :unused;
+                const src_mat = try (try isel.use(rotate.src)).matReg(isel);
+                const res_reg, const src_reg = switch (int_info.bits) {
+                    else => unreachable,
+                    32 => .{ res_ra.w(), src_mat.ra.w() },
+                    64 => .{ res_ra.x(), src_mat.ra.x() },
+                };
+                switch (rotate.right) {
+                    .immediate => |amount| try isel.emit(.extr(res_reg, src_reg, src_reg, amount)),
+                    .by => |amount_ref| {
+                        const amount_mat = try (try isel.use(amount_ref)).matReg(isel);
+                        try isel.emit(.rorv(res_reg, src_reg, switch (int_info.bits) {
+                            else => unreachable,
+                            32 => amount_mat.ra.w(),
+                            64 => amount_mat.ra.x(),
+                        }));
+                        try amount_mat.finish(isel);
+                    },
+                    .by_negated => |amount_ref| {
+                        const amount_mat = try (try isel.use(amount_ref)).matReg(isel);
+                        const neg_ra = try isel.allocIntReg();
+                        defer isel.freeReg(neg_ra);
+                        try isel.emit(.rorv(res_reg, src_reg, switch (int_info.bits) {
+                            else => unreachable,
+                            32 => neg_ra.w(),
+                            64 => neg_ra.x(),
+                        }));
+                        try isel.emit(.sub(neg_ra.w(), .wzr, .{ .register = amount_mat.ra.w() }));
+                        try amount_mat.finish(isel);
+                    },
+                }
+                try src_mat.finish(isel);
+                break :unused;
+            }
 
             var lhs_vi = try isel.use(bin_op.lhs);
             var rhs_vi = try isel.use(bin_op.rhs);
@@ -7460,17 +7503,20 @@ fn selectIntCastSafe(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag)
             const src_active_bits = src_int_info.bits - @intFromBool(src_int_info.signedness == .signed);
             if ((dst_int_info.signedness != .unsigned or src_int_info.signedness != .signed) and dst_active_bits >= src_active_bits) {
                 const src_mat = try src_vi.matReg(isel);
-                try isel.emit(if (can_be_negative and dst_active_bits > 32 and src_active_bits <= 32)
-                    .sbfm(dst_ra.x(), src_mat.ra.x(), .{
-                        .N = .doubleword,
-                        .immr = 0,
-                        .imms = @intCast(src_int_info.bits - 1),
-                    })
-                else switch (src_int_info.bits) {
-                    else => unreachable,
-                    1...32 => .orr(dst_ra.w(), .wzr, .{ .register = src_mat.ra.w() }),
-                    33...64 => .orr(dst_ra.x(), .xzr, .{ .register = src_mat.ra.x() }),
-                });
+                if (dst_int_info.bits <= 32 and src_int_info.bits <= 32)
+                    try isel.moveInt32(dst_ra, src_mat.ra)
+                else
+                    try isel.emit(if (can_be_negative and dst_active_bits > 32 and src_active_bits <= 32)
+                        .sbfm(dst_ra.x(), src_mat.ra.x(), .{
+                            .N = .doubleword,
+                            .immr = 0,
+                            .imms = @intCast(src_int_info.bits - 1),
+                        })
+                    else switch (src_int_info.bits) {
+                        else => unreachable,
+                        1...32 => .orr(dst_ra.w(), .wzr, .{ .register = src_mat.ra.w() }),
+                        33...64 => .orr(dst_ra.x(), .xzr, .{ .register = src_mat.ra.x() }),
+                    });
                 try src_mat.finish(isel);
             } else {
                 const skip_label = isel.instructions.items.len;
@@ -7506,11 +7552,14 @@ fn selectIntCastSafe(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag)
                     try src_mat.finish(isel);
                 } else {
                     const src_mat = try src_vi.matReg(isel);
-                    try isel.emit(switch (@min(dst_int_info.bits, src_int_info.bits)) {
-                        else => unreachable,
-                        1...32 => .orr(dst_ra.w(), .wzr, .{ .register = src_mat.ra.w() }),
-                        33...64 => .orr(dst_ra.x(), .xzr, .{ .register = src_mat.ra.x() }),
-                    });
+                    if (dst_int_info.bits <= 32)
+                        try isel.moveInt32(dst_ra, src_mat.ra)
+                    else
+                        try isel.emit(switch (@min(dst_int_info.bits, src_int_info.bits)) {
+                            else => unreachable,
+                            1...32 => .orr(dst_ra.w(), .wzr, .{ .register = src_mat.ra.w() }),
+                            33...64 => .orr(dst_ra.x(), .xzr, .{ .register = src_mat.ra.x() }),
+                        });
                     const active_bits = @min(dst_active_bits, src_active_bits);
                     // With no value bits in common (`i1` on either side),
                     // only zero converts, and the mask below would be all ones.
@@ -8637,6 +8686,13 @@ pub fn emitDebug(isel: *Select, info: @FieldType(codegen.aarch64.Mir.Debug, "inf
 pub fn emit(isel: *Select, instruction: codegen.aarch64.encoding.Instruction) !void {
     wip_mir_log.debug("  | {f}", .{instruction});
     try isel.instructions.append(isel.pt.zcu.gpa, instruction);
+}
+
+/// Moves an integer of at most 32 bits. Its register's bits above 32 are not
+/// part of it, and every use that needs them extends it, so a move onto its
+/// own register is dropped.
+fn moveInt32(isel: *Select, dst_ra: Register.Alias, src_ra: Register.Alias) !void {
+    if (dst_ra != src_ra) try isel.emit(.orr(dst_ra.w(), .wzr, .{ .register = src_ra.w() }));
 }
 
 pub fn emitPanic(isel: *Select, panic_id: Zcu.SimplePanicId) !void {
@@ -12138,6 +12194,127 @@ fn isErrUse(isel: *Select, res: CondUse, air_tag: Air.Inst.Tag, un_op: Air.Inst.
         .imms = @intCast(8 * error_set_size - 1),
     } }));
     try error_set_part_mat.finish(isel);
+}
+
+const RotateOperands = struct {
+    src: Air.Inst.Ref,
+    right: union(enum) {
+        immediate: u6,
+        /// The `shr` amount.
+        by: Air.Inst.Ref,
+        /// The `shl` amount, negated.
+        by_negated: Air.Inst.Ref,
+    },
+};
+
+/// `x << a | x >> b` (either order) with `a + b` equal to the width, as
+/// `std.math.rotl`/`rotr` write a rotate, where nothing else uses the shifts:
+/// a rotate right of `x` by `b`. `x` may also be two loads of the same pointer
+/// among the instructions just before the `or` (`before`), as `v = v << 13 |
+/// v >> 51` reads a local twice.
+///
+/// AIR has no rotate instruction, so this shape is all that is left of one by
+/// the time it reaches a backend; the match only accepts exact rotates and
+/// anything it does not recognize is selected as written.
+fn rotateOperands(
+    isel: *Select,
+    bin_op: @FieldType(Air.Inst.Data, "bin_op"),
+    bits: u16,
+    before: []const Air.Inst.Index,
+) ?RotateOperands {
+    const tags = isel.air.instructions.items(.tag);
+    const data = isel.air.instructions.items(.data);
+    const shl_inst, const shr_inst = for ([2][2]Air.Inst.Ref{
+        .{ bin_op.lhs, bin_op.rhs },
+        .{ bin_op.rhs, bin_op.lhs },
+    }) |operands| {
+        const shl_inst = operands[0].toIndex() orelse continue;
+        const shr_inst = operands[1].toIndex() orelse continue;
+        if (tags[@backingInt(shl_inst)] == .shl and tags[@backingInt(shr_inst)] == .shr) break .{ shl_inst, shr_inst };
+    } else return null;
+    // Later uses were already selected; an earlier one just keeps that shift.
+    if (isel.live_values.contains(shl_inst) or isel.live_values.contains(shr_inst)) return null;
+    const shl = data[@backingInt(shl_inst)].bin_op;
+    const shr = data[@backingInt(shr_inst)].bin_op;
+    if (shl.lhs != shr.lhs and !isel.isSameLoad(shl.lhs, shr.lhs, before)) return null;
+    if (isel.constantShiftAmount(shl.rhs)) |shl_amount| {
+        const shr_amount = isel.constantShiftAmount(shr.rhs) orelse return null;
+        if (shl_amount == 0 or shl_amount >= bits or shl_amount + shr_amount != bits) return null;
+        return .{ .src = shl.lhs, .right = .{ .immediate = @intCast(shr_amount) } };
+    }
+    if (isel.isNegatedShiftAmount(shl.rhs, shr.rhs)) return .{ .src = shl.lhs, .right = .{ .by = shr.rhs } };
+    if (isel.isNegatedShiftAmount(shr.rhs, shl.rhs)) return .{ .src = shl.lhs, .right = .{ .by_negated = shl.rhs } };
+    return null;
+}
+
+/// Whether `a` and `b` are loads through the same pointer that both appear in the
+/// last 8 instructions of `before`, with only shifts, `not`, wrapping add and
+/// subtract (the other halves of a rotate) and debug statements between them,
+/// none of which writes memory, so they load the same value.
+fn isSameLoad(isel: *Select, a: Air.Inst.Ref, b: Air.Inst.Ref, before: []const Air.Inst.Index) bool {
+    const tags = isel.air.instructions.items(.tag);
+    const data = isel.air.instructions.items(.data);
+    const a_inst = a.toIndex() orelse return false;
+    const b_inst = b.toIndex() orelse return false;
+    if (tags[@backingInt(a_inst)] != .load or tags[@backingInt(b_inst)] != .load) return false;
+    const ptr = data[@backingInt(a_inst)].ty_op.operand;
+    if (data[@backingInt(b_inst)].ty_op.operand != ptr) return false;
+    if (isel.air.typeOf(ptr, &isel.pt.zcu.intern_pool).isVolatilePtr(isel.pt.zcu)) return false;
+    var found: u2 = 0;
+    var index = before.len;
+    while (index > 0 and before.len - index < 8) {
+        index -= 1;
+        const inst = before[index];
+        if (inst == a_inst or inst == b_inst) {
+            found += 1;
+            if (found == 2) return true;
+            continue;
+        }
+        switch (tags[@backingInt(inst)]) {
+            .shl, .shr, .not, .add_wrap, .sub_wrap, .dbg_stmt => {},
+            else => return false,
+        }
+    }
+    return false;
+}
+
+fn constantShiftAmount(isel: *Select, ref: Air.Inst.Ref) ?u64 {
+    const ip = &isel.pt.zcu.intern_pool;
+    return switch (ip.indexToKey(ref.toInterned() orelse return null)) {
+        else => null,
+        .int => |int| switch (int.storage) {
+            .u64 => |amount| amount,
+            .i64 => |amount| std.math.cast(u64, amount),
+            .big_int => |big_int| big_int.toInt(u64) catch null,
+        },
+    };
+}
+
+/// Whether the shift amount `neg` is `1 +% ~amount` or `0 -% amount`, the amount
+/// in the opposite direction that completes a rotate by `amount`.
+fn isNegatedShiftAmount(isel: *Select, neg: Air.Inst.Ref, amount: Air.Inst.Ref) bool {
+    const tags = isel.air.instructions.items(.tag);
+    const data = isel.air.instructions.items(.data);
+    const neg_inst = neg.toIndex() orelse return false;
+    switch (tags[@backingInt(neg_inst)]) {
+        else => return false,
+        .add_wrap => {
+            const neg_op = data[@backingInt(neg_inst)].bin_op;
+            for ([2][2]Air.Inst.Ref{
+                .{ neg_op.lhs, neg_op.rhs },
+                .{ neg_op.rhs, neg_op.lhs },
+            }) |operands| {
+                if (isel.constantShiftAmount(operands[1]) != 1) continue;
+                const not_inst = operands[0].toIndex() orelse continue;
+                if (tags[@backingInt(not_inst)] == .not and data[@backingInt(not_inst)].ty_op.operand == amount) return true;
+            }
+            return false;
+        },
+        .sub_wrap => {
+            const neg_op = data[@backingInt(neg_inst)].bin_op;
+            return isel.constantShiftAmount(neg_op.lhs) == 0 and neg_op.rhs == amount;
+        },
+    }
 }
 
 /// The register contents of a comptime-known scalar operand of at most 8

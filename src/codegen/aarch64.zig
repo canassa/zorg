@@ -116,6 +116,7 @@ pub fn generate(
     var isel: Select = .{
         .pt = pt,
         .target = &mod.resolved_target.result,
+        .optimize_mode = mod.optimize_mode,
         .air = air.*,
         .nav_index = zcu.funcInfo(func_index).owner_nav,
         .debug_func = func_index,

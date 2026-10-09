@@ -36,6 +36,10 @@ literal_relocs: std.ArrayList(codegen.aarch64.Mir.Reloc.Literal),
 // Stack Frame
 returns: bool,
 tail_branches: std.ArrayList(u32) = .empty,
+/// The label of the newest unconditional branch that is a placeholder: a
+/// loop repeat until the loop is finished (`Loop.branch`), or a tail call's
+/// branch to the epilogue until `layout`.
+branch_placeholder: ?u32 = null,
 /// Where the stack arguments passed to this function start, once known.
 incoming_stack_args: ?Value.Indirect = null,
 incoming_stack_size: u24 = 0,
@@ -107,6 +111,7 @@ pub const Loop = struct {
         try isel.instructions.ensureUnusedCapacity(isel.pt.zcu.gpa, 1);
         const repeat_list_tail = target_loop.repeat_list;
         target_loop.repeat_list = @intCast(isel.instructions.items.len);
+        isel.branch_placeholder = target_loop.repeat_list;
         isel.instructions.appendAssumeCapacity(@bitCast(repeat_list_tail));
         try isel.merge(&target_loop.live_registers, .{});
     }
@@ -976,8 +981,10 @@ pub fn finishAnalysis(isel: *Select) !void {
     }
 }
 
-/// Selects `air_body`.
-pub fn body(isel: *Select, air_body: []const Air.Inst.Index) Error!void {
+/// Selects `air_body`. For the body of a `block`, `block_pred` is the
+/// instruction before the block (debug statements skipped): a safety check is
+/// a comparison followed by a block whose body is the conditional branch on it.
+pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.Inst.Index) Error!void {
     const zcu = isel.pt.zcu;
     const ip = &zcu.intern_pool;
     const gpa = zcu.gpa;
@@ -1377,7 +1384,18 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) Error!void {
         },
         .block => {
             const unwrapped_block = isel.air.unwrapBlock(air.inst_index);
-            try isel.block(air.inst_index, unwrapped_block.ty, unwrapped_block.body);
+            try isel.block(air.inst_index, unwrapped_block.ty, unwrapped_block.body, pred: {
+                var body_index = air.body_index;
+                while (body_index > 0) {
+                    body_index -= 1;
+                    const body_inst = air.body[body_index];
+                    switch (air.tag(body_inst)) {
+                        else => break :pred body_inst,
+                        .dbg_stmt, .dbg_empty_stmt => {},
+                    }
+                }
+                break :pred null;
+            });
             if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
         },
         .loop => {
@@ -1415,7 +1433,7 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) Error!void {
 
             loop.live_registers = isel.live_registers;
             loop.repeat_list = Loop.empty_list;
-            try isel.body(unwrapped_block.body);
+            try isel.body(unwrapped_block.body, null);
             try isel.merge(&loop.live_registers, .{ .fill_extra = true });
 
             assert(loop.repeat_list != Loop.empty_list);
@@ -2072,7 +2090,7 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) Error!void {
             if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
         },
         .cond_br => {
-            try isel.selectCondBr(air.inst_index);
+            try isel.selectCondBr(air.inst_index, air.body[0..air.body_index], block_pred);
             if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
         },
         .switch_br, .loop_switch_br => |air_tag| {
@@ -2101,7 +2119,7 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) Error!void {
             const parent_func = isel.debug_func;
             try isel.emitDebug(.{ .leave_inline_func = parent_func });
             isel.debug_func = dbg_block.func;
-            try isel.block(air.inst_index, dbg_block.ty, dbg_block.body);
+            try isel.block(air.inst_index, dbg_block.ty, dbg_block.body, null);
             isel.debug_func = parent_func;
             try isel.emitDebug(.{ .enter_inline_func = dbg_block.func });
             if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
@@ -4581,6 +4599,7 @@ fn block(
     air_inst_index: Air.Inst.Index,
     res_ty: ZigType,
     air_body: []const Air.Inst.Index,
+    pred: ?Air.Inst.Index,
 ) !void {
     if (res_ty.toIntern() != .noreturn_type) {
         isel.blocks.putAssumeCapacityNoClobber(air_inst_index, .{
@@ -4588,7 +4607,7 @@ fn block(
             .target_label = @intCast(isel.instructions.items.len),
         });
     }
-    try isel.body(air_body);
+    try isel.body(air_body, pred);
     if (res_ty.toIntern() != .noreturn_type) {
         const block_entry = isel.blocks.pop().?;
         assert(block_entry.key == air_inst_index);
@@ -4634,7 +4653,7 @@ fn selectTry(isel: *Select, inst: Air.Inst.Index) !void {
 
     const cont_label = isel.instructions.items.len;
     const cont_live_registers = isel.live_registers;
-    try isel.body(unwrapped_try.else_body);
+    try isel.body(unwrapped_try.else_body, null);
     // Error-path materializations must not become prerequisites of
     // the test which selects that path.
     try isel.merge(&cont_live_registers, .{ .fill_extra = true });
@@ -4677,7 +4696,7 @@ fn selectTryPtr(isel: *Select, inst: Air.Inst.Index) !void {
 
     const cont_label = isel.instructions.items.len;
     const cont_live_registers = isel.live_registers;
-    try isel.body(unwrapped_try.else_body);
+    try isel.body(unwrapped_try.else_body, null);
     // Error-path materializations must not become prerequisites of
     // the test which selects that path.
     try isel.merge(&cont_live_registers, .{ .fill_extra = true });
@@ -8224,10 +8243,17 @@ fn selectVaArg(isel: *Select, inst: Air.Inst.Index) !void {
     try va_list_ptr_mat.finish(isel);
 }
 
-/// `cond_br`: a branch on the materialized condition.
-fn selectCondBr(isel: *Select, inst: Air.Inst.Index) !void {
+/// `cond_br`, preceded by `before` in its body; `block_pred` is as for `body`.
+fn selectCondBr(
+    isel: *Select,
+    inst: Air.Inst.Index,
+    before: []const Air.Inst.Index,
+    block_pred: ?Air.Inst.Index,
+) !void {
     const cond_br = isel.air.unwrapCondBr(inst);
-    try isel.body(cond_br.then_body);
+    try isel.body(cond_br.then_body, null);
+    if (cond_br.condition.toIndex()) |cond_inst| if (isel.canFuseCondition(cond_inst, before, block_pred))
+        return isel.condBrFused(cond_inst, cond_br.else_body);
     // Take the condition's register at the start of the then body:
     // a live value it displaces is reloaded on the taken path here,
     // and on the fallthrough path by the merge below. Displacing it
@@ -8236,10 +8262,88 @@ fn selectCondBr(isel: *Select, inst: Air.Inst.Index) !void {
     const cond_mat = try cond_vi.matReg(isel);
     const else_label = isel.instructions.items.len;
     const else_live_registers = isel.live_registers;
-    try isel.body(cond_br.else_body);
+    try isel.body(cond_br.else_body, null);
     try isel.merge(&else_live_registers, .{});
     try isel.emitBranch(.{ .bit0_set = cond_mat.ra.x() }, else_label);
     try cond_mat.finish(isel);
+}
+
+/// Whether the condition `cond_inst` of a `cond_br` preceded by `before` (in
+/// the body of a block that `block_pred` precedes, if any) can set the flags
+/// at the branch instead of materializing a bool to test: a comparison that
+/// only feeds this branch, in the same body or just before the block, so that
+/// no loop boundary is crossed.
+fn canFuseCondition(
+    isel: *Select,
+    cond_inst: Air.Inst.Index,
+    before: []const Air.Inst.Index,
+    block_pred: ?Air.Inst.Index,
+) bool {
+    const zcu = isel.pt.zcu;
+    const ip = &zcu.intern_pool;
+    if (isel.live_values.contains(cond_inst)) return false;
+    const tags = isel.air.instructions.items(.tag);
+    switch (tags[@backingInt(cond_inst)]) {
+        else => return false,
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => {
+            const cmp_ty = isel.air.typeOf(isel.air.instructions.items(.data)[@backingInt(cond_inst)].bin_op.lhs, ip);
+            if (!isel.cmpCanBranch(cmp_ty)) return false;
+            if (ip.indexToKey(cmp_ty.toIntern()) == .opt_type and !cmp_ty.optionalReprIsPayload(zcu)) return false;
+        },
+        .is_null, .is_non_null, .is_err, .is_non_err => {},
+    }
+    var index = before.len;
+    while (index > 0) {
+        index -= 1;
+        if (before[index] == cond_inst) return true;
+        switch (tags[@backingInt(before[index])]) {
+            else => return false,
+            .dbg_stmt, .dbg_empty_stmt => {},
+        }
+    }
+    return block_pred == cond_inst;
+}
+
+/// The rest of a `cond_br` whose condition `cond_inst` sets the flags at the
+/// branch (`canFuseCondition`); the then body is selected. The comparison's
+/// operands are taken after the merge with the else body's registers, so a
+/// live value they displace is reloaded between the comparison and the
+/// branch, with loads and moves that keep the flags. A later use of the
+/// condition in the else body selects the comparison again.
+fn condBrFused(isel: *Select, cond_inst: Air.Inst.Index, else_body: []const Air.Inst.Index) !void {
+    const ip = &isel.pt.zcu.intern_pool;
+    const cond_tag = isel.air.instructions.items(.tag)[@backingInt(cond_inst)];
+    const cond_data = isel.air.instructions.items(.data)[@backingInt(cond_inst)];
+    // A test against zero branches with cbz/cbnz on the register, which
+    // must then be taken before the else body, as for a bool condition.
+    if (try isel.zeroTestOperand(cond_inst)) |zero_test| {
+        const operand_vi, const operand_ty, const offset, const size, const branch_if_zero = zero_test;
+        var operand_part_it = operand_vi.field(operand_ty, offset, size);
+        const operand_mat = try (try operand_part_it.only(isel)).?.matReg(isel);
+        const operand_reg = if (size <= 4) operand_mat.ra.w() else operand_mat.ra.x();
+        const then_label = isel.instructions.items.len;
+        const else_live_registers = isel.live_registers;
+        try isel.body(else_body, null);
+        try isel.merge(&else_live_registers, .{});
+        try isel.emitBranch(if (branch_if_zero) .{ .zero = operand_reg } else .{ .nonzero = operand_reg }, then_label);
+        return operand_mat.finish(isel);
+    }
+    const then_label = isel.instructions.items.len;
+    const else_live_registers = isel.live_registers;
+    try isel.body(else_body, null);
+    try isel.merge(&else_live_registers, .{});
+    switch (cond_tag) {
+        else => unreachable,
+        .cmp_lt, .cmp_lte, .cmp_eq, .cmp_gte, .cmp_gt, .cmp_neq => try isel.cmpUse(
+            .{ .branch = then_label },
+            isel.air.typeOf(cond_data.bin_op.lhs, ip),
+            try isel.use(cond_data.bin_op.lhs),
+            cond_tag.toCmpOp().?,
+            try isel.use(cond_data.bin_op.rhs),
+        ),
+        .is_null, .is_non_null => try isel.isNullUse(.{ .branch = then_label }, cond_tag, cond_data.un_op),
+        .is_err, .is_non_err => try isel.isErrUse(.{ .branch = then_label }, cond_tag, cond_data.un_op),
+    }
 }
 
 /// `store` and `store_safe`, preceded by `before` in their body.
@@ -10727,6 +10831,7 @@ fn tailCall(isel: *Select, inst: Air.Inst.Index) !void {
     // Variadic calls are excluded above, so their stack argument spans match.
     assert(param_it.stackSize() == isel.incoming_stack_size);
     try isel.tail_branches.append(zcu.gpa, @intCast(isel.instructions.items.len));
+    isel.branch_placeholder = @intCast(isel.instructions.items.len);
     try isel.emit(.b(0));
     try call.prepareReturn(isel);
     try call.finishReturn(isel);
@@ -11195,7 +11300,7 @@ fn switchChain(isel: *Select, inst: Air.Inst.Index, loop: ?*Loop, cond_int_info:
     if (switch_br.else_body_len > 0) {
         var cases_it = switch_br.iterateCases();
         while (cases_it.next()) |_| {}
-        try isel.body(cases_it.elseBody());
+        try isel.body(cases_it.elseBody(), null);
         final_case = false;
     }
     const zero_reg: Register = switch (cond_int_info.bits) {
@@ -11209,7 +11314,7 @@ fn switchChain(isel: *Select, inst: Air.Inst.Index, loop: ?*Loop, cond_int_info:
     while (cases_it.next()) |case| {
         const next_label = isel.instructions.items.len;
         const next_live_registers = isel.live_registers;
-        try isel.body(case.body);
+        try isel.body(case.body, null);
         if (final_case) {
             final_case = false;
             continue;
@@ -11281,14 +11386,14 @@ fn switchWide(isel: *Select, inst: Air.Inst.Index, loop: ?*Loop, int_info: std.l
     if (switch_br.else_body_len > 0) {
         var cases_it = switch_br.iterateCases();
         while (cases_it.next()) |_| {}
-        try isel.body(cases_it.elseBody());
+        try isel.body(cases_it.elseBody(), null);
         final_case = false;
     }
     var cases_it = switch_br.iterateCases();
     while (cases_it.next()) |case| {
         const next_label = isel.instructions.items.len;
         const next_live_registers = isel.live_registers;
-        try isel.body(case.body);
+        try isel.body(case.body, null);
         if (final_case) {
             final_case = false;
             continue;
@@ -11409,14 +11514,14 @@ fn switchTable(
     var cases_it = switch_br.iterateCases();
     if (switch_br.else_body_len > 0) {
         while (cases_it.next()) |_| {}
-        try isel.body(cases_it.elseBody());
+        try isel.body(cases_it.elseBody(), null);
         default_label = @intCast(isel.instructions.items.len);
         cases_it = switch_br.iterateCases();
     } else {
         // Without an else prong, the first prong also takes the values that
         // cannot occur, as in the compare chain.
         const case = cases_it.next().?;
-        try isel.body(case.body);
+        try isel.body(case.body, null);
         default_label = @intCast(isel.instructions.items.len);
         case_labels[case.idx] = default_label;
     }
@@ -11425,7 +11530,7 @@ fn switchTable(
     // with every prong's entry.
     while (cases_it.next()) |case| {
         const prev_live_registers = isel.live_registers;
-        try isel.body(case.body);
+        try isel.body(case.body, null);
         try isel.merge(&prev_live_registers, .{});
         case_labels[case.idx] = @intCast(isel.instructions.items.len);
     }
@@ -11710,6 +11815,10 @@ const CondUse = union(enum) {
     /// Like `reg`, also storing the label of the instruction that sets the
     /// register, which a branch can skip to.
     reg_labeled: struct { ra: Register.Alias, label: *usize },
+    /// Branch to this label when the condition holds. Instructions are
+    /// emitted backwards, so everything emitted after the branch is placed
+    /// before it and executes on both paths.
+    branch: usize,
 
     fn emit(cond_use: CondUse, isel: *Select, cond: codegen.aarch64.encoding.ConditionCode) !void {
         switch (cond_use) {
@@ -11718,6 +11827,7 @@ const CondUse = union(enum) {
                 try isel.emit(.csinc(reg.ra.w(), .wzr, .wzr, cond.invert()));
                 reg.label.* = isel.instructions.items.len;
             },
+            .branch => |label| try isel.emitBranch(.{ .flags = cond }, label),
         }
     }
 };
@@ -11757,15 +11867,67 @@ const BranchCondition = union(enum) {
     }
 };
 
-/// Emits a branch to `label` taken when `condition` holds. When `label` is
-/// out of range, the inverse branch skips a `b label`.
+/// Emits a branch to `label` taken when `condition` holds. When the only
+/// instruction since `label` is a `b`, it becomes the inverse branch to that
+/// `b`'s target instead. When `label` is out of range, the inverse branch
+/// skips a `b label`.
 fn emitBranch(isel: *Select, condition: BranchCondition, label: usize) !void {
+    if (isel.soleBranchOffset(label)) |offset| if (condition.invert().encode(offset)) |branch| {
+        isel.instructions.items[label] = branch;
+        return;
+    };
     const offset = std.math.cast(i28, (isel.instructions.items.len + 1 - label) << 2) orelse
         return isel.fail("conditional branch exceeds unconditional branch range", .{});
     if (condition.encode(offset)) |branch| return isel.emit(branch);
     // Instructions are emitted backwards: the inverse branch skips the `b`.
     try isel.emit(.b(offset));
     try isel.emit(condition.invert().encode(8).?);
+}
+
+/// For a condition that tests one register-sized part against zero (an
+/// integer or pointer `==`/`!=` against a comptime zero, or a null check),
+/// returns the tested value and its type, the part's offset and size, and whether the
+/// condition holds when the part is zero.
+fn zeroTestOperand(isel: *Select, cond_inst: Air.Inst.Index) !?struct { Value.Index, ZigType, u64, u64, bool } {
+    const zcu = isel.pt.zcu;
+    const ip = &zcu.intern_pool;
+    const air_tag = isel.air.instructions.items(.tag)[@backingInt(cond_inst)];
+    const air_data = isel.air.instructions.items(.data)[@backingInt(cond_inst)];
+    switch (air_tag) {
+        else => return null,
+        .cmp_eq, .cmp_neq => {
+            const bin_op = air_data.bin_op;
+            const ty = isel.air.typeOf(bin_op.lhs, ip);
+            if (ty.isRuntimeFloat()) return null;
+            const size = ty.abiSize(zcu);
+            if (size == 0 or size > 8) return null;
+            if (!(ty.toIntern() == .bool_type or ty.isAbiInt(zcu) or ty.isPtrAtRuntime(zcu))) return null;
+            const operand, const constant = if (bin_op.rhs.toInterned()) |rhs|
+                .{ bin_op.lhs, rhs }
+            else if (bin_op.lhs.toInterned()) |lhs|
+                .{ bin_op.rhs, lhs }
+            else
+                return null;
+            if (operand.toInterned() != null) return null;
+            const constant_val: Constant = .fromInterned(constant);
+            if (constant_val.isUndef(zcu)) return null;
+            if ((constant_val.getUnsignedInt(zcu) orelse return null) != 0) return null;
+            return .{ try isel.use(operand), ty, 0, size, air_tag == .cmp_eq };
+        },
+        .is_null, .is_non_null => {
+            const opt_ty = isel.air.typeOf(air_data.un_op, ip);
+            const payload_ty = opt_ty.optionalChild(zcu);
+            const payload_size = payload_ty.abiSize(zcu);
+            const offset: u64, const size: u64 = if (!opt_ty.optionalReprIsPayload(zcu))
+                .{ payload_size, 1 }
+            else if (payload_ty.isSlice(zcu))
+                .{ 0, 8 }
+            else
+                .{ 0, payload_size };
+            if (size == 0 or size > 8) return null;
+            return .{ try isel.use(air_data.un_op), opt_ty, offset, size, air_tag == .is_null };
+        },
+    }
 }
 
 /// `is_null` or `is_non_null` of an optional value, consumed by `res`.
@@ -11873,6 +12035,24 @@ pub const AddSubtractImmediate = struct {
     }
 };
 
+/// If the only instruction emitted since `label` is an unconditional
+/// branch with a final offset, returns that offset. A conditional branch to
+/// `label` can then replace it in place with the inverted condition.
+fn soleBranchOffset(isel: *Select, label: usize) ?i28 {
+    if (isel.instructions.items.len != label + 1) return null;
+    if (isel.branch_placeholder) |placeholder| if (placeholder == label) return null;
+    switch (isel.instructions.items[label].decode()) {
+        else => return null,
+        .branch_exception_generating_system => |branch| switch (branch.decode()) {
+            else => return null,
+            .unconditional_branch_immediate => |unconditional| switch (unconditional.decode()) {
+                .b => |b| return @as(i28, b.imm26) << 2,
+                .bl => return null,
+            },
+        },
+    }
+}
+
 fn cmp(
     isel: *Select,
     res_ra: Register.Alias,
@@ -11882,6 +12062,18 @@ fn cmp(
     rhs_vi: Value.Index,
 ) !void {
     return isel.cmpUse(.{ .reg = res_ra }, ty, lhs_vi, op, rhs_vi);
+}
+
+/// Whether `cmpUse` can branch on a comparison of `ty` directly: the
+/// soft-float comparisons prepare a call before consuming the flags.
+fn cmpCanBranch(isel: *Select, ty: ZigType) bool {
+    const zcu = isel.pt.zcu;
+    if (ty.isRuntimeFloat()) return switch (ty.floatBits(isel.target)) {
+        else => false,
+        16, 32, 64 => true,
+    };
+    if (ty.toIntern() == .bool_type or ty.isPtrAtRuntime(zcu)) return true;
+    return ty.isAbiInt(zcu) and ty.intInfo(zcu).bits <= Value.max_parts * 64;
 }
 
 fn cmpUse(
@@ -12099,6 +12291,7 @@ fn cmpUse(
             const res_lock: RegLock = switch (res) {
                 .reg => |ra| isel.tryLockReg(ra),
                 .reg_labeled => |reg| isel.tryLockReg(reg.ra),
+                .branch => .empty,
             };
             try call.returnFill(isel, .r0);
             try res.emit(isel, cond: switch (op) {

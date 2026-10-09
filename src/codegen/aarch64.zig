@@ -237,7 +237,7 @@ pub fn generate(
         .live_registers = isel.live_registers,
         .target_label = @intCast(isel.instructions.items.len),
     };
-    try isel.body(air_main_body);
+    try isel.body(air_main_body, null);
     if (isel.live_values.fetchRemove(Select.Block.main)) |ret_vi| {
         switch (ret_vi.value.parent(&isel)) {
             .unallocated, .stack_slot => {},

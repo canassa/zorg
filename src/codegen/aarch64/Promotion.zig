@@ -1,4 +1,5 @@
-//! Promotion of values to callee-saved registers.
+//! Promotion of values to callee-saved registers, and sharing of the values
+//! of locals that are stored once.
 //!
 //! An `alloc` of a scalar whose pointer is only the operand of whole-value
 //! loads and stores (its address never escapes) can live in a register for
@@ -18,6 +19,18 @@ locals: std.array_hash_map.Auto(Air.Inst.Index, Local) = .empty,
 local_loads: std.AutoHashMapUnmanaged(Air.Inst.Index, LocalLoad) = .empty,
 /// Values defined outside a loop and used in it.
 pinned_values: std.array_hash_map.Auto(Air.Inst.Index, PinnedValue) = .empty,
+/// Locals stored exactly once, before anything else uses them, and
+/// otherwise only read (parameters copied to the stack, `const`s whose
+/// address is taken): their loads share the stored value.
+stored_once: std.array_hash_map.Auto(Air.Inst.Index, StoredOnce) = .empty,
+/// Pointers into such a local: the local itself and constant offsets of it.
+stored_once_ptrs: std.AutoHashMapUnmanaged(Air.Inst.Index, StoredOncePtr) = .empty,
+/// Loads through those pointers.
+stored_once_loads: std.AutoArrayHashMapUnmanaged(Air.Inst.Index, StoredOncePtr) = .empty,
+/// Those loads that share the stored value: nothing to select.
+shared_loads: std.AutoHashMapUnmanaged(Air.Inst.Index, void) = .empty,
+/// `slice_len`/`slice_ptr` of such loads, with the field offset.
+slice_fields: std.ArrayList(struct { Air.Inst.Index, u64 }) = .empty,
 /// Same-size integer bit casts and the instruction whose value each one
 /// shares.
 casts: std.AutoHashMapUnmanaged(Air.Inst.Index, Air.Inst.Index) = .empty,
@@ -64,6 +77,16 @@ pub const PinnedValue = struct {
     ra: Register.Alias,
     ra2: Register.Alias,
 };
+pub const StoredOnce = struct {
+    /// The stored value, once the store is seen.
+    value: ?Air.Inst.Index,
+    /// Nothing seen so far stores to it again or lets a pointer to it escape.
+    valid: bool,
+};
+pub const StoredOncePtr = struct {
+    local: u32,
+    offset: u64,
+};
 
 /// The callee-saved registers that promotion takes, highest first so
 /// that the low ones stay available to the allocator: x21-x28, leaving
@@ -87,6 +110,11 @@ pub fn deinit(promotion: *Promotion, gpa: std.mem.Allocator) void {
     promotion.locals.deinit(gpa);
     promotion.local_loads.deinit(gpa);
     promotion.pinned_values.deinit(gpa);
+    promotion.stored_once.deinit(gpa);
+    promotion.stored_once_ptrs.deinit(gpa);
+    promotion.stored_once_loads.deinit(gpa);
+    promotion.shared_loads.deinit(gpa);
+    promotion.slice_fields.deinit(gpa);
     promotion.casts.deinit(gpa);
 }
 
@@ -110,6 +138,7 @@ pub fn promoteLocals(isel: *Select) void {
         const weight = if (index < locals.len) weight: {
             const local = locals[index];
             if (local.escaped or !local.in_loop) continue;
+            if (promotion.stored_once.get(promotion.locals.keys()[index])) |stored_once| if (stored_once.valid) continue;
             break :weight local.weight;
         } else weight: {
             const pinned_value = pinned_values[index - locals.len];

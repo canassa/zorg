@@ -257,7 +257,7 @@ fn generateAttempt(
     }
 
     assert(!(try isel.blocks.getOrPut(gpa, Select.Block.main)).found_existing);
-    try isel.analyze(air_main_body);
+    try isel.analyze(air_main_body, true);
     try isel.finishAnalysis(promote and !func_type.cc.eql(.naked));
     isel.verify(false);
 

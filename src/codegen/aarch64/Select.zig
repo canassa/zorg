@@ -166,7 +166,9 @@ pub fn deinit(isel: *Select) void {
     isel.* = undefined;
 }
 
-pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
+/// Analyzes `air_body`, the function's body when `outermost`, else a body
+/// nested in it.
+pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index, outermost: bool) !void {
     const zcu = isel.pt.zcu;
     const ip = &zcu.intern_pool;
     const gpa = zcu.gpa;
@@ -292,6 +294,10 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
 
             isel.stack_align = isel.stack_align.maxStrict(ty.ptrAlignment(zcu));
             try isel.def_order.putNoClobber(gpa, air_inst_index, {});
+            if (ty.childType(zcu).abiSize(zcu) <= 16) {
+                try isel.promotion.stored_once.putNoClobber(gpa, air_inst_index, .{ .value = null, .valid = true });
+                try isel.promotion.stored_once_ptrs.putNoClobber(gpa, air_inst_index, .{ .local = @intCast(isel.promotion.stored_once.count() - 1), .offset = 0 });
+            }
             if (isel.promotableType(ty.childType(zcu))) |is_vector| try isel.promotion.locals.putNoClobber(gpa, air_inst_index, .{
                 .weight = 0,
                 .epoch = 0,
@@ -386,7 +392,7 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
         => {
             const ty_op = air_data[@backingInt(air_inst_index)].ty_op;
 
-            try isel.analyzeUse(ty_op.operand);
+            try isel.analyzeDerivedUse(air_inst_index, ty_op.operand);
             try isel.def_order.putNoClobber(gpa, air_inst_index, {});
 
             air_body_index += 1;
@@ -396,6 +402,7 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
         .load => {
             const ty_op = air_data[@backingInt(air_inst_index)].ty_op;
 
+            const stored_once_load = try isel.analyzeStoredOnceLoad(air_inst_index, ty_op.operand);
             if (isel.promotableLocalIndex(ty_op.operand)) |local_index| {
                 const local = &isel.promotion.locals.values()[local_index];
                 local.weight +|= Promotion.useWeight(isel.active_loops.items.len);
@@ -405,6 +412,8 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
                     .epoch = local.epoch,
                     .aliasable = true,
                 });
+                _ = try isel.analyzeLiveness(ty_op.operand);
+            } else if (stored_once_load) {
                 _ = try isel.analyzeLiveness(ty_op.operand);
             } else try isel.analyzeUse(ty_op.operand);
             try isel.def_order.putNoClobber(gpa, air_inst_index, {});
@@ -417,12 +426,15 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
             const bin_op = air_data[@backingInt(air_inst_index)].bin_op;
 
             try isel.analyzeUse(bin_op.rhs);
+            const stored_once_store = isel.analyzeStoredOnceStore(bin_op.lhs, bin_op.rhs, outermost);
             if (isel.promotableLocalIndex(bin_op.lhs)) |local_index| {
                 const local = &isel.promotion.locals.values()[local_index];
                 local.weight +|= Promotion.useWeight(isel.active_loops.items.len);
                 if (isel.active_loops.items.len > 0) local.in_loop = true;
                 // Loads before this store can no longer stand for the local.
                 local.epoch += 1;
+                _ = try isel.analyzeLiveness(bin_op.lhs);
+            } else if (stored_once_store) {
                 _ = try isel.analyzeLiveness(bin_op.lhs);
             } else try isel.analyzeUse(bin_op.lhs);
 
@@ -449,7 +461,7 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
                     }
                 }
             }
-            try isel.analyzeUse(ty_op.operand);
+            try isel.analyzeDerivedUse(air_inst_index, ty_op.operand);
             try isel.def_order.putNoClobber(gpa, air_inst_index, {});
             // A bit cast between integers of the same size (`usize` to `u64`
             // in `for` loops) is the same value: it shares its operand's.
@@ -477,14 +489,14 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
             const result_ty = air_body_block.ty.toIntern();
 
             if (result_ty == .noreturn_type) {
-                try isel.analyze(air_body_block.body);
+                try isel.analyze(air_body_block.body, false);
 
                 air_body_index += 1;
                 break :air_tag;
             }
 
             assert(!(try isel.blocks.getOrPut(gpa, air_inst_index)).found_existing);
-            try isel.analyze(air_body_block.body);
+            try isel.analyze(air_body_block.body, false);
             const block_entry = isel.blocks.pop().?;
             assert(block_entry.key == air_inst_index);
 
@@ -511,7 +523,7 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
                 .repeat_list = undefined,
             });
             try isel.dom.appendNTimes(gpa, 0, @divCeil(isel.dom_len, @bitSizeOf(DomInt)));
-            try isel.analyze(air_body_block.body);
+            try isel.analyze(air_body_block.body, false);
             for (
                 isel.dom.items[initial_dom_start..].ptr,
                 isel.dom.items[isel.dom_start..][0..@divCeil(initial_dom_len, @bitSizeOf(DomInt))],
@@ -532,9 +544,9 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
             air_body_index += 1;
         },
         // The backend emits no variable locations, so `dbg_var_ptr` is not a
-        // use of the pointer: a promoted local has no memory at all
-        // (`selectStore`). Emitting locations requires treating it as an
-        // escaping use first.
+        // use of the pointer: a stored-once local's store is dropped and a
+        // promoted local has no memory at all (`selectStore`). Emitting
+        // locations requires treating it as an escaping use first.
         .breakpoint, .dbg_stmt, .dbg_empty_stmt, .dbg_var_ptr, .dbg_var_val, .dbg_arg_inline, .c_va_end => {
             air_body_index += 1;
             air_inst_index = air_body[air_body_index];
@@ -668,8 +680,8 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
 
             try isel.analyzeUse(cond_br.condition);
 
-            try isel.analyze(cond_br.then_body);
-            try isel.analyze(cond_br.else_body);
+            try isel.analyze(cond_br.then_body, false);
+            try isel.analyze(cond_br.else_body, false);
 
             air_body_index += 1;
         },
@@ -679,8 +691,8 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
             try isel.analyzeUse(switch_br.operand);
 
             var cases_it = switch_br.iterateCases();
-            while (cases_it.next()) |case| try isel.analyze(case.body);
-            if (switch_br.else_body_len > 0) try isel.analyze(cases_it.elseBody());
+            while (cases_it.next()) |case| try isel.analyze(case.body, false);
+            if (switch_br.else_body_len > 0) try isel.analyze(cases_it.elseBody(), false);
 
             air_body_index += 1;
         },
@@ -705,8 +717,8 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
             try isel.dom.appendNTimes(gpa, 0, @divCeil(isel.dom_len, @bitSizeOf(DomInt)));
 
             var cases_it = switch_br.iterateCases();
-            while (cases_it.next()) |case| try isel.analyze(case.body);
-            if (switch_br.else_body_len > 0) try isel.analyze(cases_it.elseBody());
+            while (cases_it.next()) |case| try isel.analyze(case.body, false);
+            if (switch_br.else_body_len > 0) try isel.analyze(cases_it.elseBody(), false);
 
             for (
                 isel.dom.items[initial_dom_start..].ptr,
@@ -729,7 +741,7 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
             const unwrapped_try = isel.air.unwrapTry(air_inst_index);
 
             try isel.analyzeUse(unwrapped_try.error_union);
-            try isel.analyze(unwrapped_try.else_body);
+            try isel.analyze(unwrapped_try.else_body, false);
             try isel.def_order.putNoClobber(gpa, air_inst_index, {});
 
             air_body_index += 1;
@@ -740,7 +752,7 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
             const unwrapped_try = isel.air.unwrapTryPtr(air_inst_index);
 
             try isel.analyzeUse(unwrapped_try.error_union_ptr);
-            try isel.analyze(unwrapped_try.else_body);
+            try isel.analyze(unwrapped_try.else_body, false);
             try isel.def_order.putNoClobber(gpa, air_inst_index, {});
 
             air_body_index += 1;
@@ -788,7 +800,7 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
             const ty_pl = air_data[@backingInt(air_inst_index)].ty_pl;
             const extra = isel.air.extraData(Air.StructField, ty_pl.payload).data;
 
-            try isel.analyzeUse(extra.struct_operand);
+            try isel.analyzeDerivedUse(air_inst_index, extra.struct_operand);
             try isel.def_order.putNoClobber(gpa, air_inst_index, {});
 
             air_body_index += 1;
@@ -801,12 +813,15 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
             try isel.analyzeUse(ty_op.operand);
             try isel.def_order.putNoClobber(gpa, air_inst_index, {});
 
-            if (ty_op.operand.toIndex() != null) {
+            if (ty_op.operand.toIndex()) |operand_inst| if (isel.promotion.stored_once_loads.contains(operand_inst)) {
+                // The operand's value is decided at the end of analysis.
+                try isel.promotion.slice_fields.append(gpa, .{ air_inst_index, 8 });
+            } else {
                 const slice_vi = try isel.use(ty_op.operand);
                 var len_part_it = slice_vi.field(isel.air.typeOf(ty_op.operand, ip), 8, 8);
                 if (try len_part_it.only(isel)) |len_part_vi|
                     try isel.live_values.putNoClobber(gpa, air_inst_index, len_part_vi.ref(isel));
-            }
+            };
 
             air_body_index += 1;
             air_inst_index = air_body[air_body_index];
@@ -818,12 +833,14 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index) !void {
             try isel.analyzeUse(ty_op.operand);
             try isel.def_order.putNoClobber(gpa, air_inst_index, {});
 
-            if (ty_op.operand.toIndex() != null) {
+            if (ty_op.operand.toIndex()) |operand_inst| if (isel.promotion.stored_once_loads.contains(operand_inst)) {
+                try isel.promotion.slice_fields.append(gpa, .{ air_inst_index, 0 });
+            } else {
                 const slice_vi = try isel.use(ty_op.operand);
                 var ptr_part_it = slice_vi.field(isel.air.typeOf(ty_op.operand, ip), 0, 8);
                 if (try ptr_part_it.only(isel)) |ptr_part_vi|
                     try isel.live_values.putNoClobber(gpa, air_inst_index, ptr_part_vi.ref(isel));
-            }
+            };
 
             air_body_index += 1;
             air_inst_index = air_body[air_body_index];
@@ -986,12 +1003,27 @@ fn analyzeAsmRegisters(isel: *Select, inst: Air.Inst.Index) !void {
 
 fn analyzeUse(isel: *Select, air_ref: Air.Inst.Ref) !void {
     const use_inst = air_ref.toIndex() orelse return;
-    const crosses_loop = try isel.analyzeLiveness(air_ref);
-    // A cast that shares its operand's value is a use of the operand.
-    const air_inst_index = if (isel.air.instructions.items(.tag)[@backingInt(use_inst)] == .bit_cast)
-        isel.promotion.casts.get(use_inst) orelse use_inst
-    else
-        use_inst;
+    // A pointer into a stored-once local escapes, unless it is used by a
+    // load (`analyzeStoredOnceLoad`) or derives another such pointer
+    // (`analyzeDerivedUse`).
+    if (isel.promotion.stored_once_ptrs.get(use_inst)) |ptr| isel.promotion.stored_once.values()[ptr.local].valid = false;
+    return isel.analyzeNonEscapingUse(use_inst);
+}
+
+/// A use of `use_inst` that does not make it escape if it is a pointer into
+/// a stored-once local.
+fn analyzeNonEscapingUse(isel: *Select, use_inst: Air.Inst.Index) !void {
+    const crosses_loop = try isel.analyzeLiveness(use_inst.toRef());
+    // A cast that shares its operand's value is a use of the operand, and so
+    // is a load of a stored-once local a use of the stored value.
+    const air_inst_index = switch (isel.air.instructions.items(.tag)[@backingInt(use_inst)]) {
+        else => use_inst,
+        .bit_cast => isel.promotion.casts.get(use_inst) orelse use_inst,
+        .load => if (isel.promotion.stored_once_loads.get(use_inst)) |ptr|
+            isel.promotion.stored_once.values()[ptr.local].value.?
+        else
+            use_inst,
+    };
 
     // Promoted locals
     switch (isel.air.instructions.items(.tag)[@backingInt(air_inst_index)]) {
@@ -1002,6 +1034,10 @@ fn analyzeUse(isel: *Select, air_ref: Air.Inst.Ref) !void {
         },
         .load => isel.analyzePromotedLoadUse(air_inst_index, crosses_loop),
     }
+    // A later store can still show that the local is not stored once, and
+    // then this load is selected as a load whose result is used here.
+    if (air_inst_index != use_inst and isel.air.instructions.items(.tag)[@backingInt(use_inst)] == .load)
+        isel.analyzePromotedLoadUse(use_inst, crosses_loop);
     if (crosses_loop) try isel.analyzePinnedValue(air_inst_index);
 }
 
@@ -1076,6 +1112,127 @@ fn analyzeLiveness(isel: *Select, air_ref: Air.Inst.Ref) !bool {
         return true;
     }
     return false;
+}
+
+/// The use of `operand` by `inst`, which may derive a constant offset
+/// pointer into a stored-once local.
+fn analyzeDerivedUse(isel: *Select, inst: Air.Inst.Index, operand: Air.Inst.Ref) !void {
+    const operand_inst = operand.toIndex() orelse return;
+    const ptr = isel.promotion.stored_once_ptrs.get(operand_inst) orelse return isel.analyzeUse(operand);
+    derive: {
+        if (!isel.promotion.stored_once.values()[ptr.local].valid) break :derive;
+        if (isel.promotion.stored_once.values()[ptr.local].value == null) break :derive;
+        switch (isel.air.instructions.items(.tag)[@backingInt(inst)]) {
+            else => break :derive,
+            .bit_cast,
+            .ptr_cast,
+            .struct_field_ptr,
+            .struct_field_ptr_index_0,
+            .struct_field_ptr_index_1,
+            .struct_field_ptr_index_2,
+            .struct_field_ptr_index_3,
+            .ptr_slice_len_ptr,
+            .ptr_slice_ptr_ptr,
+            => {},
+        }
+        const base, const offset = isel.constantOffsetPointer(inst) orelse break :derive;
+        assert(base.toIndex() == operand_inst);
+        try isel.promotion.stored_once_ptrs.putNoClobber(isel.pt.zcu.gpa, inst, .{ .local = ptr.local, .offset = ptr.offset + offset });
+        return isel.analyzeNonEscapingUse(operand_inst);
+    }
+    return isel.analyzeUse(operand);
+}
+
+/// Records a load through a pointer into a stored-once local; returns whether
+/// it is one, so that the pointer does not escape.
+fn analyzeStoredOnceLoad(isel: *Select, inst: Air.Inst.Index, ptr_ref: Air.Inst.Ref) !bool {
+    const zcu = isel.pt.zcu;
+    const ptr_inst = ptr_ref.toIndex() orelse return false;
+    const ptr = isel.promotion.stored_once_ptrs.get(ptr_inst) orelse return false;
+    const local = &isel.promotion.stored_once.values()[ptr.local];
+    const ptr_info = isel.air.typeOf(ptr_ref, &zcu.intern_pool).ptrInfo(zcu);
+    if (!local.valid or local.value == null or ptr_info.flags.is_volatile or
+        ptr_info.flags.vector_index != .none or ptr_info.packed_offset.host_size > 0)
+    {
+        local.valid = false;
+        return false;
+    }
+    try isel.promotion.stored_once_loads.putNoClobber(zcu.gpa, inst, ptr);
+    // The load is a use of the stored value here.
+    if (try isel.analyzeLiveness(local.value.?.toRef())) try isel.analyzePinnedValue(local.value.?);
+    return true;
+}
+
+/// Records a store to a stored-once local, in the function's outermost body
+/// if `outermost`; returns whether it is the store that makes it one, so that
+/// the pointer does not escape.
+fn analyzeStoredOnceStore(isel: *Select, ptr_ref: Air.Inst.Ref, src_ref: Air.Inst.Ref, outermost: bool) bool {
+    const ptr_inst = ptr_ref.toIndex() orelse return false;
+    const local_index = isel.promotion.stored_once.getIndex(ptr_inst) orelse return false;
+    const local = &isel.promotion.stored_once.values()[local_index];
+    // The store must come first and dominate every load: the function's
+    // outermost body.
+    if (local.valid and local.value == null and outermost) {
+        if (src_ref.toIndex()) |src_inst| {
+            local.value = src_inst;
+            return true;
+        }
+    }
+    local.valid = false;
+    return false;
+}
+
+/// The value of `inst` after analysis: shared with another instruction's if
+/// it is a load of a stored-once local, a cast or a field of a slice.
+fn sharedValue(isel: *Select, inst: Air.Inst.Index) !Value.Index {
+    const zcu = isel.pt.zcu;
+    const ip = &zcu.intern_pool;
+    const gpa = zcu.gpa;
+    if (isel.live_values.get(inst)) |vi| return vi;
+    const air_data = isel.air.instructions.items(.data)[@backingInt(inst)];
+    const shared_vi: Value.Index = shared: switch (isel.air.instructions.items(.tag)[@backingInt(inst)]) {
+        else => return isel.use(inst.toRef()),
+        .bit_cast => if (isel.promotion.casts.get(inst)) |operand_inst|
+            break :shared try isel.sharedValue(operand_inst)
+        else
+            return isel.use(inst.toRef()),
+        .slice_len, .slice_ptr => |tag| {
+            const operand = air_data.ty_op.operand;
+            const slice_vi = try isel.sharedValue(operand.toIndex() orelse return isel.use(inst.toRef()));
+            var part_it = slice_vi.field(isel.air.typeOf(operand, ip), if (tag == .slice_len) 8 else 0, 8);
+            break :shared try part_it.only(isel) orelse return isel.use(inst.toRef());
+        },
+        .load => {
+            const ptr = isel.promotion.stored_once_loads.get(inst) orelse return isel.use(inst.toRef());
+            const local = &isel.promotion.stored_once.values()[ptr.local];
+            if (!local.valid) return isel.use(inst.toRef());
+            const value_inst = local.value.?;
+            const load_size = isel.air.typeOfIndex(inst, ip).abiSize(zcu);
+            if (load_size == 0) return isel.use(inst.toRef());
+            const value_vi = try isel.sharedValue(value_inst);
+            const load_ty = isel.air.typeOfIndex(inst, ip);
+            if (ptr.offset == 0 and load_ty.toIntern() == isel.air.typeOfIndex(value_inst, ip).toIntern())
+                break :shared value_vi;
+            // Narrower parts carry signedness of their own.
+            if (load_size == 4 or load_size == 8) {
+                var part_it = value_vi.field(isel.air.typeOfIndex(value_inst, ip), ptr.offset, load_size);
+                // A float field of a value in general registers is a general
+                // register part, but users of a float take a vector register.
+                const load_is_vector = Value.isVectorSize(load_size) and
+                    CallAbiIterator.homogeneousAggregateBaseType(zcu, load_ty.toIntern()) != null;
+                if (try part_it.only(isel)) |part_vi| if (part_vi.position(isel)[1] == load_size and
+                    part_vi.isVector(isel) == load_is_vector)
+                    break :shared part_vi;
+            }
+            // The store stays: this load reads memory.
+            local.valid = false;
+            return isel.use(inst.toRef());
+        },
+    };
+    if (isel.air.instructions.items(.tag)[@backingInt(inst)] == .load and
+        !isel.promotion.shared_loads.contains(inst)) try isel.promotion.shared_loads.putNoClobber(gpa, inst, {});
+    try isel.live_values.putNoClobber(gpa, inst, shared_vi.ref(isel));
+    return shared_vi;
 }
 
 fn promotableLocalIndex(isel: *Select, ptr_ref: Air.Inst.Ref) ?usize {
@@ -1165,9 +1322,9 @@ fn pinnedStoreSourceAdjacent(isel: *Select, preceding: []const Air.Inst.Index, s
             .dbg_stmt, .dbg_empty_stmt, .dbg_var_ptr, .dbg_var_val, .dbg_arg_inline, .alloc => continue,
         }
         if (inst != src_inst) return false;
-        // A cast that shares an earlier instruction's value is defined
-        // there, not here.
-        if (isel.promotion.casts.contains(inst)) return false;
+        // A value shared with an earlier instruction (`sharedValue`) is
+        // defined there, not here.
+        if (isel.promotion.casts.contains(inst) or isel.promotion.shared_loads.contains(inst)) return false;
         // A result defined by a nested body is written where that body
         // leaves, which may be anywhere in it.
         return switch (air_tags[@backingInt(inst)]) {
@@ -1222,24 +1379,26 @@ pub fn finishAnalysis(isel: *Select, promote: bool) !void {
         invalid_gop.value_ptr.live = loop_live_len;
     }
 
-    // Casts share their operand's value.
-    var cast_it = isel.promotion.casts.iterator();
-    while (cast_it.next()) |cast| {
-        if (isel.live_values.contains(cast.key_ptr.*)) continue;
-        const vi = try isel.use(cast.value_ptr.*.toRef());
-        try isel.live_values.putNoClobber(gpa, cast.key_ptr.*, vi.ref(isel));
-    }
+    // Loads of stored-once locals share the stored value, or the part of it
+    // they load; casts share their operand's value; `slice_len`/`slice_ptr`
+    // of those loads a part of it. Each is resolved on demand, since one can
+    // be the operand of another. This comes first: a local one of whose loads
+    // cannot share is not stored-once after all, and may be promoted.
+    for (isel.promotion.stored_once_loads.keys()) |load_inst| _ = try isel.sharedValue(load_inst);
+    var cast_it = isel.promotion.casts.keyIterator();
+    while (cast_it.next()) |cast_inst| _ = try isel.sharedValue(cast_inst.*);
+    for (isel.promotion.slice_fields.items) |slice_field| _ = try isel.sharedValue(slice_field[0]);
 
     if (promote) {
         isel.promotion.enabled = true;
         Promotion.promoteLocals(isel);
-        // A load of a promoted local whose value analysis created already
-        // prefers the local's register, as `use` makes the others.
+        // A load of a promoted local whose value analysis or sharing created
+        // already prefers the local's register, as `use` makes the others.
         var load_it = isel.promotion.local_loads.iterator();
         while (load_it.next()) |load_entry| {
             const load_inst = load_entry.key_ptr.*;
             const load = load_entry.value_ptr;
-            if (!load.aliasable) continue;
+            if (!load.aliasable or isel.promotion.shared_loads.contains(load_inst)) continue;
             const local = isel.promotion.locals.values()[load.local];
             if (local.ra == .zr) continue;
             const vi = isel.live_values.get(load_inst) orelse continue;
@@ -2454,6 +2613,11 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
         },
         .load => {
             const ty_op = air.data(air.inst_index).ty_op;
+            if (isel.promotion.shared_loads.contains(air.inst_index)) {
+                if (isel.live_values.fetchRemove(air.inst_index)) |dst_vi| dst_vi.value.deref(isel);
+                if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
+                break :air_tag;
+            }
             if (isel.promotedLocalRegister(ty_op.operand)) |pin_ra| {
                 if (isel.live_values.fetchRemove(air.inst_index)) |dst_vi| unused: {
                     defer dst_vi.value.deref(isel);
@@ -8773,6 +8937,10 @@ fn selectStore(
 ) !void {
     const zcu = isel.pt.zcu;
     const ip = &zcu.intern_pool;
+    // Every load of a stored-once local shares the stored value. Nothing
+    // else reads its memory: `analyze` does not count `dbg_var_ptr` as a use,
+    // since no variable locations are emitted (see `body`).
+    if (bin_op.lhs.toIndex()) |ptr_inst| if (isel.promotion.stored_once.get(ptr_inst)) |local| if (local.valid) return;
     if (isel.promotedLocalRegister(bin_op.lhs)) |pin_ra| return isel.storeToPromotedLocal(pin_ra, bin_op, before);
     const ptr_ty = isel.air.typeOf(bin_op.lhs, ip);
     const ptr_info = ptr_ty.ptrInfo(zcu);

@@ -5128,19 +5128,28 @@ fn selectTry(isel: *Select, inst: Air.Inst.Index) !void {
     );
     const error_set_part_vi = (try error_set_part_it.only(isel)).?;
     const error_set_part_mat = try error_set_part_vi.matReg(isel);
-    // Any evicted continuation value must be restored on the success
-    // path too. The predicate register is only needed before the branch
-    // at runtime, so error-path calls may use it during selection.
+    // The test is the only use of the register, before the branch at
+    // runtime, so the error path may use it too; a value it evicts there is
+    // restored on both paths.
     isel.freeReg(error_set_part_mat.ra);
 
     const cont_label = isel.instructions.items.len;
     const cont_live_registers = isel.live_registers;
     try isel.body(unwrapped_try.else_body, null);
-    // Error-path materializations must not become prerequisites of
-    // the test which selects that path.
-    try isel.merge(&cont_live_registers, .{ .fill_extra = true });
+    // As at a `cond_br`, values the error path uses stay where it expects
+    // them before the branch.
+    try isel.merge(&cont_live_registers, .{});
 
-    assert(isel.live_registers.get(error_set_part_mat.ra) == .free);
+    // An error path that wants the error set in a register tests that one,
+    // and the materialization above is not used.
+    if (error_set_part_vi.register(isel)) |error_set_ra| if (!error_set_ra.isVector()) {
+        assert(isel.live_registers.get(error_set_ra) == error_set_part_vi);
+        assert(isel.live_registers.get(error_set_part_mat.ra) != .allocating);
+        return isel.emitBranch(.{ .zero = error_set_ra.w() }, cont_label);
+    };
+    // Error-path values left in the register are moved by the error path,
+    // the only one that uses them.
+    try isel.vacateBranchReg(error_set_part_mat.ra);
     isel.reserveReg(error_set_part_mat.ra);
     try isel.emitBranch(.{ .zero = error_set_part_mat.ra.w() }, cont_label);
     try error_set_part_mat.finish(isel);
@@ -5179,14 +5188,14 @@ fn selectTryPtr(isel: *Select, inst: Air.Inst.Index) !void {
     const cont_label = isel.instructions.items.len;
     const cont_live_registers = isel.live_registers;
     try isel.body(unwrapped_try.else_body, null);
-    // Error-path materializations must not become prerequisites of
-    // the test which selects that path.
-    try isel.merge(&cont_live_registers, .{ .fill_extra = true });
+    // As for `try`: error-path values stay in registers, and only the
+    // registers taken by the test are vacated, on the error path.
+    try isel.merge(&cont_live_registers, .{});
 
-    assert(isel.live_registers.get(error_set_ra) == .free);
-    assert(isel.live_registers.get(error_union_ptr_mat.ra) == .free);
+    try isel.vacateBranchReg(error_set_ra);
     const error_set_lock = isel.lockReg(error_set_ra);
     defer error_set_lock.unlock(isel);
+    try isel.vacateBranchReg(error_union_ptr_mat.ra);
     isel.reserveReg(error_union_ptr_mat.ra);
     try isel.emitBranch(.{ .zero = error_set_ra.w() }, cont_label);
     try isel.loadReg(
@@ -14451,6 +14460,31 @@ pub fn fill(isel: *Select, dst_ra: Register.Alias) Error!bool {
     assert(src_live_vi.* == .allocating);
     src_live_vi.* = dst_vi;
     return true;
+}
+
+/// Frees `ra`, which a branch reserved before selecting the path it skips, so
+/// that the branch can reserve it again. A value which that path left live in `ra` is
+/// moved elsewhere at the start of the path, the only one that uses it.
+/// Unlike `fill`, this never displaces another live value, such as one in
+/// the moved value's hint register: the moves are only emitted on that path,
+/// so every other value must stay where both paths expect it.
+fn vacateBranchReg(isel: *Select, ra: Register.Alias) !void {
+    const live_vi = isel.live_registers.getPtr(ra);
+    const vi = switch (live_vi.*) {
+        _ => |vi| vi,
+        .allocating => return isel.promotionBug("branch register {t} is not free", .{ra}),
+        .free => return,
+    };
+    switch (if (vi.isVector(isel)) isel.tryAllocVecReg() else isel.tryAllocIntReg()) {
+        .allocated => |new_ra| {
+            try vi.liveIn(isel, new_ra, comptime &.initFill(.free));
+            const new_live_vi = isel.live_registers.getPtr(new_ra);
+            assert(new_live_vi.* == .allocating);
+            new_live_vi.* = vi;
+        },
+        .fill_candidate, .out_of_registers => assert(try isel.fillMemory(ra)),
+    }
+    assert(live_vi.* == .free);
 }
 
 fn fillMemory(isel: *Select, dst_ra: Register.Alias) Error!bool {

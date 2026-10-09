@@ -2198,6 +2198,13 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) Error!void {
                 } else {
                     try dst_vi.value.defAddr(isel, .fromInterned(ptr_info.child), .{}) orelse break :unused;
 
+                    if (!ptr_info.flags.is_volatile and try isel.copyInline(
+                        .{ .value = .{ .vi = dst_vi.value } },
+                        .{ .ptr = try isel.use(ty_op.operand) },
+                        size,
+                        false,
+                    )) break :unused;
+
                     try call.prepareVoidGlobal(isel, "memcpy");
                     const ptr_vi = try isel.use(ty_op.operand);
                     try isel.movImmediate(.x2, size);
@@ -2336,7 +2343,7 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) Error!void {
             if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
         },
         .store, .store_safe => |air_tag| {
-            try isel.selectStore(air.data(air.inst_index).bin_op, air_tag == .store_safe);
+            try isel.selectStore(air.data(air.inst_index).bin_op, air_tag == .store_safe, air.body[0..air.body_index]);
             if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
         },
         .unreach => if (air.next()) |next_air_tag| continue :air_tag next_air_tag,
@@ -2972,6 +2979,13 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) Error!void {
                     .@"union" => {
                         try field_vi.value.defAddr(isel, field_ty, .{}) orelse break :unused;
 
+                        if (try isel.copyInline(
+                            .{ .value = .{ .vi = field_vi.value } },
+                            .{ .value = .{ .vi = agg_vi, .offset = agg_ty.unionGetLayout(zcu).payloadOffset() } },
+                            field_vi.value.size(isel),
+                            false,
+                        )) break :unused;
+
                         try call.prepareVoidGlobal(isel, "memcpy");
                         const union_layout = agg_ty.unionGetLayout(zcu);
                         const payload_offset = union_layout.payloadOffset();
@@ -3431,6 +3445,16 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) Error!void {
             const dst_ty = isel.air.typeOf(bin_op.lhs, ip);
             const dst_info = dst_ty.ptrInfo(zcu);
 
+            if (dst_info.flags.size == .one and !dst_info.flags.is_volatile) {
+                const src_ty = isel.air.typeOf(bin_op.rhs, ip);
+                if (src_ty.ptrSize(zcu) != .slice and !src_ty.isVolatilePtr(zcu) and try isel.copyInline(
+                    .{ .ptr = try isel.use(bin_op.lhs) },
+                    .{ .ptr = try isel.use(bin_op.rhs) },
+                    ZigType.fromInterned(dst_info.child).abiSize(zcu),
+                    air_tag == .memmove,
+                )) break :air_tag if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
+            }
+
             try call.prepareReturn(isel);
             try call.finishReturn(isel);
 
@@ -3807,6 +3831,13 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) Error!void {
                 const init_ty = isel.air.typeOf(extra.init, ip);
                 if (init_ty.abiSize(zcu) == 0) break :unused;
                 try union_vi.value.defAddr(isel, union_ty, .{}) orelse break :unused;
+
+                if (try isel.copyInline(
+                    .{ .value = .{ .vi = union_vi.value, .offset = union_layout.payloadOffset() } },
+                    .{ .value = .{ .vi = try isel.use(extra.init) } },
+                    init_ty.abiSize(zcu),
+                    false,
+                )) break :unused;
 
                 try call.prepareVoidGlobal(isel, "memcpy");
                 const init_vi = try isel.use(extra.init);
@@ -8211,11 +8242,12 @@ fn selectCondBr(isel: *Select, inst: Air.Inst.Index) !void {
     try cond_mat.finish(isel);
 }
 
-/// `store` and `store_safe`.
+/// `store` and `store_safe`, preceded by `before` in their body.
 fn selectStore(
     isel: *Select,
     bin_op: @FieldType(Air.Inst.Data, "bin_op"),
     safety: bool,
+    before: []const Air.Inst.Index,
 ) !void {
     const zcu = isel.pt.zcu;
     const ip = &zcu.intern_pool;
@@ -8238,6 +8270,12 @@ fn selectStore(
             return;
         }
     };
+    if (ptr_info.flags.vector_index == .none and ptr_info.packed_offset.host_size == 0 and
+        !ptr_info.flags.is_volatile)
+    {
+        if (try isel.storeAsMemmove(ptr_info, bin_op, before)) return;
+    }
+
     const src_vi = try isel.use(bin_op.rhs);
     const size = src_vi.size(isel);
     if (ptr_info.flags.vector_index != .none) {
@@ -8262,12 +8300,73 @@ fn selectStore(
         },
         else => {},
     };
+    if (!ptr_info.flags.is_volatile and try isel.copyInline(
+        .{ .ptr = try isel.use(bin_op.lhs) },
+        .{ .value = .{ .vi = src_vi } },
+        size,
+        false,
+    )) return;
     try call.prepareVoidGlobal(isel, "memcpy");
     const ptr_vi = try isel.use(bin_op.lhs);
     try isel.movImmediate(.x2, size);
     try call.paramAddress(isel, src_vi, .r1);
     try call.paramLiveOut(isel, ptr_vi, .r0);
     try call.finishParams(isel);
+}
+
+/// Whether `inst` is in `before`, followed only by instructions with one of
+/// the `allowed` tags.
+fn followedOnlyBy(
+    isel: *Select,
+    before: []const Air.Inst.Index,
+    inst: Air.Inst.Index,
+    comptime allowed: []const Air.Inst.Tag,
+) bool {
+    const tags = isel.air.instructions.items(.tag);
+    var index = before.len;
+    while (index > 0) {
+        index -= 1;
+        if (before[index] == inst) return true;
+        if (std.mem.indexOfScalar(Air.Inst.Tag, allowed, tags[@backingInt(before[index])]) == null) return false;
+    }
+    return false;
+}
+
+/// `dst.* = src.*` where the stored value is only this load, of a value too
+/// big for registers (or a union): copies memory to memory instead of through
+/// the loaded value's stack slot. The operands may overlap, so this is a
+/// memmove. Returns false, having emitted nothing, for any other store.
+fn storeAsMemmove(
+    isel: *Select,
+    ptr_info: InternPool.Key.PtrType,
+    bin_op: @FieldType(Air.Inst.Data, "bin_op"),
+    before: []const Air.Inst.Index,
+) !bool {
+    const zcu = isel.pt.zcu;
+    const ip = &zcu.intern_pool;
+    const load_inst = bin_op.rhs.toIndex() orelse return false;
+    if (isel.air.instructions.items(.tag)[@backingInt(load_inst)] != .load) return false;
+    // Later uses were already selected; earlier ones are excluded below.
+    if (isel.live_values.contains(load_inst)) return false;
+    const load_ptr = isel.air.instructions.items(.data)[@backingInt(load_inst)].ty_op.operand;
+    const load_ptr_info = isel.air.typeOf(load_ptr, ip).ptrInfo(zcu);
+    if (load_ptr_info.flags.vector_index != .none or load_ptr_info.packed_offset.host_size > 0 or
+        load_ptr_info.flags.is_volatile) return false;
+    const ty: ZigType = .fromInterned(ptr_info.child);
+    const size = ty.abiSize(zcu);
+    if (size <= Value.max_parts and ty.zigTypeTag(zcu) != .@"union") return false;
+    // Only instructions that neither access memory nor use the loaded
+    // value may separate the load from this store.
+    if (!isel.followedOnlyBy(before, load_inst, &.{
+        .dbg_stmt,
+        .dbg_empty_stmt,
+        .struct_field_ptr,
+        .struct_field_ptr_index_0,
+        .struct_field_ptr_index_1,
+        .struct_field_ptr_index_2,
+        .struct_field_ptr_index_3,
+    })) return false;
+    return isel.copyInline(.{ .ptr = try isel.use(bin_op.lhs) }, .{ .ptr = try isel.use(load_ptr) }, size, true);
 }
 
 pub fn emitDebug(isel: *Select, info: @FieldType(codegen.aarch64.Mir.Debug, "info")) !void {
@@ -9532,6 +9631,7 @@ fn bitCastContiguous(isel: *Select, dst_vi: Value.Index, dst_ty: ZigType, src_vi
     // The unsigned intermediate created by Legalize can have ABI padding.
     // Copy only logical bytes, then canonicalize integer output registers.
     const size = @divExact(dst_ty.bitSize(zcu), 8);
+    if (try isel.copyInline(.{ .value = .{ .vi = dst_vi } }, .{ .value = .{ .vi = src_vi } }, size, false)) return;
     try call.prepareVoidGlobal(isel, "memcpy");
     try isel.movImmediate(.x2, size);
     try call.paramAddress(isel, src_vi, .r1);
@@ -12329,6 +12429,245 @@ pub fn storeReg(
     defer isel.freeReg(ptr_ra);
     try isel.storeReg(ra, size, ptr_ra, 0);
     try isel.addSubImmediate(.add, ptr_ra.x(), base_ra.x(), @truncate(@as(u65, @bitCast(offset))), .{ .scratch = ptr_ra.x() });
+}
+
+/// Fixed-size copies of at most this many bytes are inlined instead of calling memcpy.
+const inline_copy_max_size = 256;
+/// Overlapping copies hold every byte in a q register, at most this many bytes.
+const inline_move_max_size = 128;
+
+const CopyOperand = union(enum) {
+    /// A pointer value.
+    ptr: Value.Index,
+    /// The memory of a value, from a byte offset.
+    value: struct { vi: Value.Index, offset: u64 = 0 },
+};
+
+/// A part of an inline copy: 32 bytes in a pair of q registers, or 1 to 16
+/// bytes in one register.
+const CopyChunk = struct {
+    offset: u8,
+    size: u8,
+
+    fn regs(chunk: CopyChunk) usize {
+        return if (chunk.size == 32) 2 else 1;
+    }
+};
+
+/// The chunks of an inline copy of `size` bytes, in execution order, as LLVM
+/// copies small fixed sizes: 32-byte q-register pairs, then 16 bytes, then an
+/// overlapping tail; below 16 bytes, the largest power of two from either end.
+fn copyChunks(size: u64, buf: *[inline_copy_max_size / 32 + 2]CopyChunk) []const CopyChunk {
+    var len: usize = 0;
+    if (size >= 16) {
+        var offset: u64 = 0;
+        while (size - offset >= 32) : (offset += 32) {
+            buf[len] = .{ .offset = @intCast(offset), .size = 32 };
+            len += 1;
+        }
+        if (size - offset >= 16) {
+            buf[len] = .{ .offset = @intCast(offset), .size = 16 };
+            len += 1;
+            offset += 16;
+        }
+        if (offset < size) {
+            buf[len] = .{ .offset = @intCast(size - 16), .size = 16 };
+            len += 1;
+        }
+    } else {
+        const width = std.math.floorPowerOfTwo(u64, size);
+        buf[0] = .{ .offset = 0, .size = @intCast(width) };
+        len = 1;
+        if (width < size) {
+            buf[1] = .{ .offset = @intCast(size - width), .size = @intCast(width) };
+            len = 2;
+        }
+    }
+    return buf[0..len];
+}
+
+/// How an inline copy addresses one operand: memory of a value in a stack
+/// slot directly from `sp` or `fp`; a pointer in its register; any other
+/// memory of a value through its address in a scratch register.
+const CopyBase = struct {
+    ra: Register.Alias,
+    offset: i65,
+    kind: enum { direct, ptr, address },
+    vi: Value.Index,
+    vi_offset: u64,
+
+    fn direct(isel: *Select, vi: Value.Index, vi_offset: u64, chunks: []const CopyChunk) ?CopyBase {
+        var parent_vi = vi;
+        var offset: i65 = parent_vi.get(isel).offset_from_parent + vi_offset;
+        parent: switch (parent_vi.parent(isel)) {
+            .unallocated => {
+                const stack_slot = parent_vi.allocStackSlot(isel);
+                parent_vi.setParent(isel, .{ .stack_slot = stack_slot });
+                continue :parent .{ .stack_slot = stack_slot };
+            },
+            .stack_slot => |stack_slot| {
+                switch (stack_slot.base) {
+                    .sp, .fp => {},
+                    else => return null,
+                }
+                offset += stack_slot.offset;
+                if (!fits(offset, chunks)) return null;
+                return .{ .ra = stack_slot.base, .offset = offset, .kind = .direct, .vi = vi, .vi_offset = vi_offset };
+            },
+            .value => |next_vi| {
+                parent_vi = next_vi;
+                offset += parent_vi.get(isel).offset_from_parent;
+                continue :parent parent_vi.parent(isel);
+            },
+            .address, .constant, .stack_address => return null,
+        }
+    }
+
+    /// A pointer that is a stack address is folded into the accesses.
+    fn ptr(isel: *Select, vi: Value.Index, chunks: []const CopyChunk) CopyBase {
+        switch (vi.parent(isel)) {
+            else => {},
+            .stack_address => |stack_address| if (fits(stack_address.offset, chunks)) return .{
+                .ra = stack_address.base,
+                .offset = stack_address.offset,
+                .kind = .direct,
+                .vi = vi,
+                .vi_offset = 0,
+            },
+        }
+        return .{ .ra = .zr, .offset = 0, .kind = .ptr, .vi = vi, .vi_offset = 0 };
+    }
+
+    /// Whether every access of `chunks` from `offset` has an immediate offset.
+    fn fits(offset: i65, chunks: []const CopyChunk) bool {
+        for (chunks) |chunk| {
+            const width: u8 = @min(chunk.size, 16);
+            var chunk_offset = offset + chunk.offset;
+            while (chunk_offset < offset + chunk.offset + chunk.size) : (chunk_offset += width) {
+                if (chunk_offset >= 0 and @rem(chunk_offset, width) == 0 and
+                    @divExact(chunk_offset, width) < 1 << 12) continue;
+                if (std.math.cast(i9, chunk_offset) != null) continue;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Loads or stores `chunk` of the operand with `regs`.
+    fn emitChunk(base: CopyBase, isel: *Select, comptime is_load: bool, chunk: CopyChunk, regs: []const Register.Alias) !void {
+        const offset = base.offset + chunk.offset;
+        if (chunk.size == 32) {
+            if (std.math.cast(i10, offset)) |pair_offset| if (@rem(pair_offset, 16) == 0) {
+                return isel.emit(if (is_load)
+                    .ldp(regs[0].q(), regs[1].q(), .{ .signed_offset = .{ .base = base.ra.x(), .offset = pair_offset } })
+                else
+                    .stp(regs[0].q(), regs[1].q(), .{ .signed_offset = .{ .base = base.ra.x(), .offset = pair_offset } }));
+            };
+            if (is_load) {
+                try isel.loadReg(regs[1], 16, .unsigned, base.ra, offset + 16);
+                try isel.loadReg(regs[0], 16, .unsigned, base.ra, offset);
+            } else {
+                try isel.storeReg(regs[1], 16, base.ra, offset + 16);
+                try isel.storeReg(regs[0], 16, base.ra, offset);
+            }
+            return;
+        }
+        if (is_load)
+            try isel.loadReg(regs[0], chunk.size, .unsigned, base.ra, offset)
+        else
+            try isel.storeReg(regs[0], chunk.size, base.ra, offset);
+    }
+};
+
+/// Emits an inline copy of `size` bytes from `src` to `dst` (`copyChunks`).
+/// With `overlap` (memmove), the operands may overlap, so every byte is loaded
+/// before any is stored; otherwise (memcpy) they must not overlap.
+/// Returns false, having emitted nothing, if the copy should call a function instead.
+fn copyInline(isel: *Select, dst: CopyOperand, src: CopyOperand, size: u64, overlap: bool) !bool {
+    if (size == 0 or size > @as(u64, if (overlap) inline_move_max_size else inline_copy_max_size)) return false;
+    if (isel.target.cpu.has(.aarch64, .strict_align)) return false;
+    var chunks_buf: [inline_copy_max_size / 32 + 2]CopyChunk = undefined;
+    const chunks = copyChunks(size, &chunks_buf);
+
+    // Without overlap, the chunks reuse the same registers.
+    var regs_needed: usize = 0;
+    for (chunks) |chunk| regs_needed = if (overlap) regs_needed + chunk.regs() else @max(regs_needed, chunk.regs());
+    var regs_buf: [inline_move_max_size / 16 + 1]Register.Alias = undefined;
+    var regs_len: usize = 0;
+    defer for (regs_buf[0..regs_len]) |ra| isel.freeReg(ra);
+    while (regs_len < regs_needed) : (regs_len += 1) switch (isel.tryAllocVecReg()) {
+        .allocated => |ra| regs_buf[regs_len] = ra,
+        // Under register pressure the call, which spills anyway, is no worse.
+        .fill_candidate, .out_of_registers => return false,
+    };
+
+    var bases: [2]CopyBase = undefined;
+    var bases_len: usize = 0;
+    defer for (bases[0..bases_len]) |base| if (base.kind == .address) isel.freeReg(base.ra);
+    for ([_]CopyOperand{ dst, src }) |operand| {
+        switch (operand) {
+            .ptr => |vi| bases[bases_len] = CopyBase.ptr(isel, vi, chunks),
+            .value => |value| bases[bases_len] = CopyBase.direct(isel, value.vi, value.offset, chunks) orelse switch (isel.tryAllocIntReg()) {
+                .allocated => |ra| .{ .ra = ra, .offset = 0, .kind = .address, .vi = value.vi, .vi_offset = value.offset },
+                .fill_candidate, .out_of_registers => return false,
+            },
+        }
+        bases_len += 1;
+    }
+    // Materializing a pointer cannot fail softly, so it comes last.
+    var mats: [2]?Value.Materialize = .{ null, null };
+    for ([_]CopyOperand{ dst, src }, &bases, &mats) |operand, *base, *mat| switch (operand) {
+        .ptr => |vi| if (base.kind == .ptr) {
+            mat.* = try vi.matReg(isel);
+            base.* = .{ .ra = mat.*.?.ra, .offset = 0, .kind = .ptr, .vi = vi, .vi_offset = 0 };
+        },
+        .value => {},
+    };
+    const dst_base = bases[0];
+    const src_base = bases[1];
+
+    // Emitted backwards.
+    const regs = regs_buf[0..regs_len];
+    if (overlap) {
+        var regs_end = regs.len;
+        var chunk_index = chunks.len;
+        while (chunk_index > 0) {
+            chunk_index -= 1;
+            const chunk = chunks[chunk_index];
+            try dst_base.emitChunk(isel, false, chunk, regs[regs_end - chunk.regs() .. regs_end]);
+            regs_end -= chunk.regs();
+        }
+        regs_end = regs.len;
+        chunk_index = chunks.len;
+        while (chunk_index > 0) {
+            chunk_index -= 1;
+            const chunk = chunks[chunk_index];
+            try src_base.emitChunk(isel, true, chunk, regs[regs_end - chunk.regs() .. regs_end]);
+            regs_end -= chunk.regs();
+        }
+    } else {
+        var chunk_index = chunks.len;
+        while (chunk_index > 0) {
+            chunk_index -= 1;
+            const chunk = chunks[chunk_index];
+            try dst_base.emitChunk(isel, false, chunk, regs);
+            try src_base.emitChunk(isel, true, chunk, regs);
+        }
+    }
+
+    for (&bases, &mats) |*base, mat| switch (base.kind) {
+        .direct => {},
+        .ptr => try mat.?.finish(isel),
+        .address => {
+            // `paramAddressAt` frees the base register first.
+            base.kind = .direct;
+            try call.paramAddressAt(isel, base.vi, base.vi_offset, base.ra);
+            // An indirect value's pointer can now live in the base register
+            // (for example an incoming argument); only free a plain scratch.
+            if (isel.live_registers.get(base.ra) == .allocating) isel.freeReg(base.ra);
+        },
+    };
+    return true;
 }
 
 const DomInt = u8;

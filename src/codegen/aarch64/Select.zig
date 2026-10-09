@@ -20,6 +20,9 @@ dom_start: u32,
 dom_len: u32,
 dom: std.ArrayList(DomInt),
 promotion: Promotion = .{},
+/// Loads and stores that may access memory through the operand of their
+/// constant offset pointer (`analyzeOffsetAccess`).
+offset_accesses: std.AutoHashMapUnmanaged(Air.Inst.Index, void) = .empty,
 
 // Wip Mir
 saved_registers: std.enums.EnumSet(Register.Alias),
@@ -149,6 +152,7 @@ pub fn deinit(isel: *Select) void {
     isel.loop_live.list.deinit(gpa);
     isel.dom.deinit(gpa);
     isel.promotion.deinit(gpa);
+    isel.offset_accesses.deinit(gpa);
 
     isel.tail_branches.deinit(gpa);
     isel.instructions.deinit(gpa);
@@ -415,7 +419,10 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index, outermost: bool)
                 _ = try isel.analyzeLiveness(ty_op.operand);
             } else if (stored_once_load) {
                 _ = try isel.analyzeLiveness(ty_op.operand);
-            } else try isel.analyzeUse(ty_op.operand);
+            } else {
+                try isel.analyzeOffsetAccess(air_inst_index, ty_op.operand);
+                try isel.analyzeUse(ty_op.operand);
+            }
             try isel.def_order.putNoClobber(gpa, air_inst_index, {});
 
             air_body_index += 1;
@@ -436,7 +443,10 @@ pub fn analyze(isel: *Select, air_body: []const Air.Inst.Index, outermost: bool)
                 _ = try isel.analyzeLiveness(bin_op.lhs);
             } else if (stored_once_store) {
                 _ = try isel.analyzeLiveness(bin_op.lhs);
-            } else try isel.analyzeUse(bin_op.lhs);
+            } else {
+                try isel.analyzeOffsetAccess(air_inst_index, bin_op.lhs);
+                try isel.analyzeUse(bin_op.lhs);
+            }
 
             air_body_index += 1;
             air_inst_index = air_body[air_body_index];
@@ -2659,8 +2669,7 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
                     try isel.packedMemory(dst_vi.value, ty_op.ty, ptr_mat.ra, ptr_info.packed_offset.bit_offset, false);
                     try ptr_mat.finish(isel);
                 } else if (size <= Value.max_parts and ip.zigTypeTag(ptr_info.child) != .@"union") {
-                    const ptr_vi = try isel.use(ty_op.operand);
-                    const ptr_base: MemoryBase = try .init(isel, ptr_vi);
+                    const ptr_base = try isel.accessBase(air.inst_index, ty_op.operand, size);
                     // Bits above an integer's width are undefined in memory (for example
                     // after an undefined store and a packed field store), so normalize.
                     _ = try dst_vi.value.load(isel, ty_op.ty, ptr_base.ra, .{
@@ -2675,8 +2684,7 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
                     // No use needs the value's memory, only parts in registers: load
                     // those from the pointer instead of copying the value to a stack
                     // slot first.
-                    const ptr_vi = try isel.use(ty_op.operand);
-                    const ptr_base: MemoryBase = try .init(isel, ptr_vi);
+                    const ptr_base = try isel.accessBase(air.inst_index, ty_op.operand, size);
                     _ = try dst_vi.value.load(isel, ty_op.ty, ptr_base.ra, .{
                         .offset = ptr_base.offset,
                         .split = false,
@@ -2831,7 +2839,7 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
             if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
         },
         .store, .store_safe => |air_tag| {
-            try isel.selectStore(air.data(air.inst_index).bin_op, air_tag == .store_safe, air.body[0..air.body_index]);
+            try isel.selectStore(air.inst_index, air.data(air.inst_index).bin_op, air_tag == .store_safe, air.body[0..air.body_index]);
             if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
         },
         .unreach => if (air.next()) |next_air_tag| continue :air_tag next_air_tag,
@@ -3628,10 +3636,11 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
                         break :unused;
                     }
                 };
+                const const_offset = isel.constantElemOffset(bin_op.rhs, elem_size);
                 switch (elem_size) {
                     0 => unreachable,
                     1, 2, 4, 8 => scalar: {
-                        if (elem_vi.value.parts(isel).only() == null) break :scalar;
+                        if (elem_vi.value.parts(isel).only() == null or const_offset != null) break :scalar;
                         const elem_ra = try elem_vi.value.defReg(isel) orelse break :unused;
                         const array_ptr_ra = try isel.allocIntReg();
                         defer if (isel.live_registers.get(array_ptr_ra) == .allocating)
@@ -3698,9 +3707,11 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
                 }
                 const ptr_ra = try isel.allocIntReg();
                 defer if (isel.live_registers.get(ptr_ra) == .allocating) isel.freeReg(ptr_ra);
-                if (!try elem_vi.value.load(isel, elem_ty, ptr_ra, .{})) break :unused;
-                const index_vi = try isel.use(bin_op.rhs);
-                try isel.elemPtr(ptr_ra, ptr_ra, .add, elem_size, index_vi);
+                if (!try elem_vi.value.load(isel, elem_ty, ptr_ra, .{ .offset = const_offset orelse 0 })) break :unused;
+                if (const_offset == null) {
+                    const index_vi = try isel.use(bin_op.rhs);
+                    try isel.elemPtr(ptr_ra, ptr_ra, .add, elem_size, index_vi);
+                }
                 const array_vi = try isel.use(bin_op.lhs);
                 isel.freeReg(ptr_ra);
                 try array_vi.address(isel, 0, ptr_ra);
@@ -3716,7 +3727,16 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
                 const ptr_info = slice_ty.ptrInfo(zcu);
                 const elem_size = elem_vi.value.size(isel);
                 const elem_is_vector = elem_vi.value.isVector(isel);
-                if (switch (elem_size) {
+                if (isel.constantElemOffset(bin_op.rhs, elem_size)) |offset| {
+                    const slice_vi = try isel.use(bin_op.lhs);
+                    var ptr_part_it = slice_vi.field(slice_ty, 0, 8);
+                    const ptr_part_mat = try (try ptr_part_it.only(isel)).?.matReg(isel);
+                    _ = try elem_vi.value.load(isel, slice_ty.childType(zcu), ptr_part_mat.ra, .{
+                        .offset = offset,
+                        .@"volatile" = ptr_info.flags.is_volatile,
+                    });
+                    try ptr_part_mat.finish(isel);
+                } else if (switch (elem_size) {
                     0 => unreachable,
                     1, 2, 4, 8 => true,
                     16 => elem_is_vector,
@@ -3828,7 +3848,14 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
                 const ptr_info = ptr_ty.ptrInfo(zcu);
                 const elem_size = elem_vi.value.size(isel);
                 const elem_is_vector = elem_vi.value.isVector(isel);
-                if (switch (elem_size) {
+                if (isel.constantElemOffset(bin_op.rhs, elem_size)) |offset| {
+                    const base: MemoryBase = try .init(isel, try isel.use(bin_op.lhs));
+                    _ = try elem_vi.value.load(isel, ptr_ty.childType(zcu), base.ra, .{
+                        .offset = base.offset + offset,
+                        .@"volatile" = ptr_info.flags.is_volatile,
+                    });
+                    try base.finish(isel);
+                } else if (switch (elem_size) {
                     0 => unreachable,
                     1, 2, 4, 8 => true,
                     16 => elem_is_vector,
@@ -3909,12 +3936,16 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
         .ptr_elem_ptr => {
             if (isel.live_values.fetchRemove(air.inst_index)) |elem_ptr_vi| unused: {
                 defer elem_ptr_vi.value.deref(isel);
+                const ty_pl = air.data(air.inst_index).ty_pl;
+                const bin_op = isel.air.extraData(Air.Bin, ty_pl.payload).data;
+                if (isel.constantOffsetPointer(air.inst_index)) |offset_ptr| if (offset_ptr[1] == 0) {
+                    try elem_ptr_vi.value.move(isel, bin_op.lhs);
+                    break :unused;
+                };
                 const elem_ptr_ra = try elem_ptr_vi.value.defReg(isel) orelse break :unused;
                 const ptr_result_lock = isel.tryLockReg(elem_ptr_ra);
                 defer ptr_result_lock.unlock(isel);
 
-                const ty_pl = air.data(air.inst_index).ty_pl;
-                const bin_op = isel.air.extraData(Air.Bin, ty_pl.payload).data;
                 const elem_size = ty_pl.ty.childType(zcu).abiSize(zcu);
 
                 const base_vi = try isel.use(bin_op.lhs);
@@ -9054,6 +9085,7 @@ fn condBrFused(isel: *Select, cond_inst: Air.Inst.Index, else_body: []const Air.
 /// `store` and `store_safe`, preceded by `before` in their body.
 fn selectStore(
     isel: *Select,
+    inst: Air.Inst.Index,
     bin_op: @FieldType(Air.Inst.Data, "bin_op"),
     safety: bool,
     before: []const Air.Inst.Index,
@@ -9106,7 +9138,7 @@ fn selectStore(
     if (ZigType.fromInterned(ptr_info.child).zigTypeTag(zcu) != .@"union") switch (size) {
         0 => unreachable,
         1...Value.max_parts => {
-            const ptr_base: MemoryBase = try .init(isel, try isel.use(bin_op.lhs));
+            const ptr_base = try isel.accessBase(inst, bin_op.lhs, size);
             try src_vi.store(isel, src_ty, ptr_base.ra, .{
                 .offset = ptr_base.offset,
                 .@"volatile" = ptr_info.flags.is_volatile,
@@ -9953,6 +9985,20 @@ fn elemPtr(
 ) !void {
     const result_lock = isel.tryLockReg(elem_ptr_ra);
     defer result_lock.unlock(isel);
+    if (isel.constantImmediate(index_vi)) |index| {
+        // A comptime-known index is a constant byte offset.
+        const offset = elem_size *% index;
+        return switch (base_ra) {
+            else => isel.addSubImmediate(op, elem_ptr_ra.x(), base_ra.x(), offset, .{
+                .scratch = if (elem_ptr_ra != base_ra) elem_ptr_ra.x() else null,
+            }),
+            // Register 31 of an add immediate is sp, not zr.
+            .zr => isel.movImmediate(elem_ptr_ra.x(), switch (op) {
+                .add => offset,
+                .sub => -%offset,
+            }),
+        };
+    }
     const index_mat = try index_vi.matReg(isel);
     switch (@popCount(elem_size)) {
         0 => unreachable,
@@ -14513,6 +14559,13 @@ fn constantOffsetPointer(isel: *Select, inst: Air.Inst.Index) ?struct { Air.Inst
         },
         .optional_payload_ptr, .ptr_slice_ptr_ptr => return .{ data.ty_op.operand, 0 },
         .ptr_slice_len_ptr => return .{ data.ty_op.operand, 8 },
+        .ptr_elem_ptr => {
+            const ptr_info = data.ty_pl.ty.ptrInfo(zcu);
+            if (ptr_info.flags.vector_index != .none or ptr_info.packed_offset.host_size > 0) return null;
+            const bin_op = isel.air.extraData(Air.Bin, data.ty_pl.payload).data;
+            const index = Constant.fromInterned(bin_op.rhs.toInterned() orelse return null).getUnsignedInt(zcu) orelse return null;
+            return .{ bin_op.lhs, std.math.mul(u64, ZigType.fromInterned(ptr_info.child).abiSize(zcu), index) catch return null };
+        },
         .struct_field_ptr => {
             const extra = isel.air.extraData(Air.StructField, data.ty_pl.payload).data;
             return .{ extra.struct_operand, codegen.fieldOffset(
@@ -14553,11 +14606,80 @@ fn derivedStackAddress(isel: *Select, inst: Air.Inst.Index) Error!?Value.Indirec
     const operand_vi = try isel.use(operand);
     return switch (operand_vi.parent(isel)) {
         else => null,
-        .stack_address => |stack_address| if (std.math.cast(u24, @as(u64, @intCast(stack_address.offset)) + offset)) |total|
+        .stack_address => |stack_address| if (std.math.cast(u24, std.math.add(u64, @intCast(stack_address.offset), offset) catch return null)) |total|
             .{ .base = stack_address.base, .offset = total }
         else
             null,
     };
+}
+
+/// Records a load or store through `ptr` that may use the operand of the
+/// constant offset pointer `ptr` instead (`accessBase`). `ptr` must be defined
+/// in the innermost loop around the access: its own use of the operand is
+/// then in that loop too, so the operand's loop liveness does not change. A
+/// pointer into a local is a stack address already.
+fn analyzeOffsetAccess(isel: *Select, access_inst: Air.Inst.Index, ptr: Air.Inst.Ref) !void {
+    const ptr_inst = ptr.toIndex() orelse return;
+    const operand, const offset, const is_slice = isel.accessOffsetPointer(ptr_inst) orelse return;
+    if (offset == 0) return;
+    var root = if (is_slice) null else operand.toIndex();
+    while (root) |root_inst| switch (isel.air.instructions.items(.tag)[@backingInt(root_inst)]) {
+        .alloc, .ret_ptr => return,
+        else => root = (isel.constantOffsetPointer(root_inst) orelse break)[0].toIndex(),
+    };
+    if (isel.active_loops.getLastOrNull()) |active_loop|
+        if ((isel.def_order.getIndex(ptr_inst) orelse return) < active_loop.get(isel).def_order) return;
+    try isel.offset_accesses.put(isel.pt.zcu.gpa, access_inst, {});
+}
+
+/// The operand and constant offset of `ptr_inst` as `constantOffsetPointer`
+/// finds them, or for a `slice_elem_ptr` at a comptime-known index the slice
+/// whose pointer the offset is from (then true).
+fn accessOffsetPointer(isel: *Select, ptr_inst: Air.Inst.Index) ?struct { Air.Inst.Ref, u64, bool } {
+    const zcu = isel.pt.zcu;
+    if (isel.air.instructions.items(.tag)[@backingInt(ptr_inst)] != .slice_elem_ptr) {
+        const operand, const offset = isel.constantOffsetPointer(ptr_inst) orelse return null;
+        return .{ operand, offset, false };
+    }
+    const ty_pl = isel.air.instructions.items(.data)[@backingInt(ptr_inst)].ty_pl;
+    const bin_op = isel.air.extraData(Air.Bin, ty_pl.payload).data;
+    const index = Constant.fromInterned(bin_op.rhs.toInterned() orelse return null).getUnsignedInt(zcu) orelse return null;
+    return .{ bin_op.lhs, std.math.mul(u64, ty_pl.ty.childType(zcu).abiSize(zcu), index) catch return null, true };
+}
+
+/// The base to access `size` bytes through `ptr` for `access_inst`. If
+/// `analyzeOffsetAccess` recorded the access and no later use needs the
+/// pointer itself, this uses the pointer's operand and folds the constant
+/// offset into the access when it fits, so the pointer need not be computed.
+fn accessBase(isel: *Select, access_inst: Air.Inst.Index, ptr: Air.Inst.Ref, size: u64) !MemoryBase {
+    if (isel.offset_accesses.contains(access_inst)) fold: {
+        const ptr_inst = ptr.toIndex().?;
+        if (isel.live_values.contains(ptr_inst)) break :fold;
+        const operand, const offset, const is_slice = isel.accessOffsetPointer(ptr_inst).?;
+        if (!accessOffsetFits(size, offset)) break :fold;
+        const operand_vi = try isel.use(operand);
+        var base: MemoryBase = try .init(isel, if (is_slice) slice_ptr: {
+            var ptr_part_it = operand_vi.field(isel.air.typeOf(operand, &isel.pt.zcu.intern_pool), 0, 8);
+            break :slice_ptr (try ptr_part_it.only(isel)).?;
+        } else operand_vi);
+        base.offset += offset;
+        return base;
+    }
+    return .init(isel, try isel.use(ptr));
+}
+
+/// Whether an access of `size` bytes at `offset` from a base register, split
+/// into parts or not, encodes without scratch address registers.
+fn accessOffsetFits(size: u64, offset: u64) bool {
+    return offset +| size <= 4096 or memoryOffsetFits(size, offset);
+}
+
+/// The byte offset of the element at `index` when it is comptime-known and
+/// an access of the element there fits `accessOffsetFits`.
+fn constantElemOffset(isel: *Select, index: Air.Inst.Ref, elem_size: u64) ?u64 {
+    const index_val = Constant.fromInterned(index.toInterned() orelse return null).getUnsignedInt(isel.pt.zcu) orelse return null;
+    const offset = std.math.mul(u64, elem_size, index_val) catch return null;
+    return if (accessOffsetFits(elem_size, offset)) offset else null;
 }
 
 /// Whether `loadReg`/`storeReg` of `size` bytes at `offset` from a base

@@ -11006,7 +11006,8 @@ fn callArguments(isel: *Select, call_info: CallInfo, tail: bool) !u24 {
     return param_it.stackSize();
 }
 
-/// `switch_br` and `loop_switch_br`: a compare chain.
+/// `switch_br` and `loop_switch_br`: a branch table when the cases are
+/// dense enough, else a compare chain.
 fn switchBr(isel: *Select, inst: Air.Inst.Index, is_loop: bool) !void {
     const zcu = isel.pt.zcu;
     const switch_br = isel.air.unwrapSwitch(inst);
@@ -11032,7 +11033,8 @@ fn switchBr(isel: *Select, inst: Air.Inst.Index, is_loop: bool) !void {
     const loop = if (is_loop) try isel.beginLoopSwitch(inst) else null;
     if (cond_int_info.bits > 64)
         try isel.switchWide(inst, loop, cond_int_info)
-    else
+    else if (cond_int_info.bits == 1 or cond_ty.isPtrAtRuntime(zcu) or
+        !try isel.switchTable(inst, loop, cond_int_info))
         try isel.switchChain(inst, loop, cond_int_info);
     if (loop) |target_loop| try isel.finishLoopSwitch(inst, target_loop);
 }
@@ -11220,6 +11222,158 @@ fn switchWide(isel: *Select, inst: Air.Inst.Index, loop: ?*Loop, int_info: std.l
             try isel.cmp(match_ra, compare_ty, cond_vi, .gte, try isel.use(range[0]));
         }
     }
+}
+
+/// Lowers a dense `switch_br` or `loop_switch_br` on an integer of at most 64
+/// bits through a table of branches indexed by `cond - min`:
+///
+///     sub  idx, cond, #min
+///     cmp  idx, #(max - min)
+///     b.hi default
+///     adr  addr, table
+///     add  addr, addr, idx, lsl #2
+///     br   addr
+///   table:
+///     b    case_for_min
+///     ...
+///
+/// The table holds code, not data, and is addressed relative to the `adr`, so
+/// it needs no relocations. Returns false, having emitted nothing, unless
+/// there are at least `min_clusters` runs of consecutive values with the same
+/// prong, the table has at most `max_len` entries, and either a quarter of
+/// them are distinct items or ranges (the x86_64 backend's density rule) or
+/// 40% of them belong to a prong (LLVM's density rule when optimizing for
+/// size; a byte switch with a few wide ranges qualifies only by this one).
+fn switchTable(
+    isel: *Select,
+    inst: Air.Inst.Index,
+    loop: ?*Loop,
+    int_info: std.lang.Type.Int,
+) !bool {
+    const min_clusters = 4;
+    const max_len = 1024;
+    const zcu = isel.pt.zcu;
+    const gpa = zcu.gpa;
+    const switch_br = isel.air.unwrapSwitch(inst);
+
+    var prong_items: usize = 0;
+    var min: i128 = std.math.maxInt(i128);
+    var max: i128 = std.math.minInt(i128);
+    {
+        var cases_it = switch_br.iterateCases();
+        while (cases_it.next()) |case| {
+            prong_items += case.items.len + case.ranges.len;
+            for (case.items) |item| {
+                const value = try isel.caseInt(.fromInterned(item.toInterned().?));
+                min = @min(min, value);
+                max = @max(max, value);
+            }
+            for (case.ranges) |range| {
+                min = @min(min, try isel.caseInt(.fromInterned(range[0].toInterned().?)));
+                max = @max(max, try isel.caseInt(.fromInterned(range[1].toInterned().?)));
+            }
+        }
+    }
+    if (prong_items < min_clusters or max - min >= max_len) return false;
+    const table_len: usize = @intCast(max - min + 1);
+
+    const no_case = std.math.maxInt(u32);
+    const targets = try gpa.alloc(u32, table_len);
+    defer gpa.free(targets);
+    @memset(targets, no_case);
+    {
+        var cases_it = switch_br.iterateCases();
+        while (cases_it.next()) |case| {
+            for (case.items) |item|
+                targets[@intCast(try isel.caseInt(.fromInterned(item.toInterned().?)) - min)] = case.idx;
+            for (case.ranges) |range| @memset(targets[@intCast(
+                try isel.caseInt(.fromInterned(range[0].toInterned().?)) - min,
+            )..@intCast(
+                try isel.caseInt(.fromInterned(range[1].toInterned().?)) - min + 1,
+            )], case.idx);
+        }
+    }
+    var clusters: usize = 0;
+    var covered: usize = 0;
+    for (targets, 0..) |target, index| {
+        if (target == no_case) continue;
+        covered += 1;
+        if (index == 0 or targets[index - 1] != target) clusters += 1;
+    }
+    if (clusters < min_clusters) return false;
+    if (table_len > prong_items * 4 and table_len * 2 > covered * 5) return false;
+
+    const case_labels = try gpa.alloc(u32, switch_br.cases_len);
+    defer gpa.free(case_labels);
+    var default_label: u32 = undefined;
+    var cases_it = switch_br.iterateCases();
+    if (switch_br.else_body_len > 0) {
+        while (cases_it.next()) |_| {}
+        try isel.body(cases_it.elseBody());
+        default_label = @intCast(isel.instructions.items.len);
+        cases_it = switch_br.iterateCases();
+    } else {
+        // Without an else prong, the first prong also takes the values that
+        // cannot occur, as in the compare chain.
+        const case = cases_it.next().?;
+        try isel.body(case.body);
+        default_label = @intCast(isel.instructions.items.len);
+        case_labels[case.idx] = default_label;
+    }
+    // As in the compare chain, each prong keeps the register assignments of
+    // the prongs selected before it, so the registers at the dispatch agree
+    // with every prong's entry.
+    while (cases_it.next()) |case| {
+        const prev_live_registers = isel.live_registers;
+        try isel.body(case.body);
+        try isel.merge(&prev_live_registers, .{});
+        case_labels[case.idx] = @intCast(isel.instructions.items.len);
+    }
+
+    try isel.instructions.ensureUnusedCapacity(gpa, table_len);
+    var table_index = table_len;
+    while (table_index > 0) {
+        table_index -= 1;
+        const target = targets[table_index];
+        const target_label = if (target == no_case) default_label else case_labels[target];
+        try isel.emit(.b(std.math.cast(i28, (isel.instructions.items.len + 1 - target_label) << 2) orelse
+            return isel.fail("switch table branch too large", .{})));
+    }
+    const table_label = isel.instructions.items.len;
+
+    const cond_reg: Register, const cond_mat: ?Value.Materialize = if (loop != null) cond: {
+        const cond_ra = try isel.allocIntReg();
+        break :cond .{ switch (int_info.bits) {
+            else => unreachable,
+            1...32 => cond_ra.w(),
+            33...64 => cond_ra.x(),
+        }, null };
+    } else cond: {
+        const cond_mat = try (try isel.use(switch_br.operand)).matReg(isel);
+        break :cond .{ switch (int_info.bits) {
+            else => unreachable,
+            1...32 => cond_mat.ra.w(),
+            33...64 => cond_mat.ra.x(),
+        }, cond_mat };
+    };
+    const addr_ra = try isel.allocIntReg();
+    defer isel.freeReg(addr_ra);
+    const idx_ra = try isel.allocIntReg();
+    defer isel.freeReg(idx_ra);
+    const idx_reg = rangeCheckReg(cond_reg, switch (cond_reg.format.general) {
+        .word => idx_ra.w(),
+        .doubleword => idx_ra.x(),
+    }, min);
+    try isel.emit(.br(addr_ra.x()));
+    try isel.emit(.add(addr_ra.x(), addr_ra.x(), switch (idx_reg.format.general) {
+        .word => .{ .extended_register = .{ .register = idx_reg, .extend = .{ .uxtw = 2 } } },
+        .doubleword => .{ .shifted_register = .{ .register = idx_reg, .shift = .{ .lsl = 2 } } },
+    }));
+    try isel.emit(.adr(addr_ra.x(), @intCast((isel.instructions.items.len + 1 - table_label) << 2)));
+    try isel.emitBranch(.{ .flags = .hi }, default_label);
+    try isel.rangeCheck(cond_reg, idx_reg, min, max, null);
+    if (cond_mat) |mat| try mat.finish(isel) else try isel.loadLoopSwitchCondition(inst, cond_reg);
+    return true;
 }
 
 /// An inclusive range of case values, in the condition's signedness.

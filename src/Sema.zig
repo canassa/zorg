@@ -4684,7 +4684,7 @@ fn zirValidatePtrArrayInit(
             });
         } else if (array_ty.sentinel(zcu)) |sentinel| {
             const array_len_ref = try pt.intRef(.usize, array_len);
-            const sentinel_ptr = try sema.elemPtrArray(block, init_src, init_src, array_ptr, init_src, array_len_ref, true, true);
+            const sentinel_ptr = try sema.elemPtrArray(block, init_src, init_src, array_ptr, init_src, array_len_ref, .usize, true, true);
             try sema.checkKnownAllocPtr(block, array_ptr, sentinel_ptr);
             try sema.storePtr2(block, init_src, sentinel_ptr, init_src, .fromValue(sentinel), init_src, .store);
         },
@@ -9724,7 +9724,7 @@ fn zirElemPtrLoad(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
         }
     }
     const elem_index = try sema.coerce(block, .usize, uncoerced_elem_index, elem_index_src);
-    const elem_ptr = try elemPtr(sema, block, src, array_ptr, elem_index, elem_index_src, false, true);
+    const elem_ptr = try elemPtr(sema, block, src, array_ptr, elem_index, sema.typeOf(uncoerced_elem_index), elem_index_src, false, true);
     return analyzeLoad(sema, block, src, elem_ptr, elem_index_src);
 }
 
@@ -9760,7 +9760,7 @@ fn zirElemPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air
     }
     try sema.checkIndexable(block, src, indexable_ty);
     try sema.ensureLayoutResolved(indexable_ty.childType(zcu), src, .ptr_access);
-    return sema.elemPtrOneLayerOnly(block, src, array_ptr, elem_index, src, false, false);
+    return sema.elemPtrOneLayerOnly(block, src, array_ptr, elem_index, sema.typeOf(elem_index), src, false, false);
 }
 
 fn zirElemPtrNode(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air.Inst.Ref {
@@ -9771,7 +9771,7 @@ fn zirElemPtrNode(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError
     const array_ptr = sema.resolveInst(extra.lhs);
     const uncoerced_elem_index = sema.resolveInst(extra.rhs);
     const elem_index = try sema.coerce(block, .usize, uncoerced_elem_index, elem_index_src);
-    return sema.elemPtr(block, src, array_ptr, elem_index, elem_index_src, false, true);
+    return sema.elemPtr(block, src, array_ptr, elem_index, sema.typeOf(uncoerced_elem_index), elem_index_src, false, true);
 }
 
 fn zirArrayInitElemPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air.Inst.Ref {
@@ -9789,7 +9789,7 @@ fn zirArrayInitElemPtr(sema: *Sema, block: *Block, inst: Zir.Inst.Index) Compile
             return sema.failWithArrayInitNotSupported(block, src, array_ty);
         },
     }
-    return sema.elemPtr(block, src, array_ptr, elem_index, src, true, true);
+    return sema.elemPtr(block, src, array_ptr, elem_index, .usize, src, true, true);
 }
 
 fn zirSliceStart(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air.Inst.Ref {
@@ -26033,17 +26033,36 @@ fn safetyPanicUnwrapError(sema: *Sema, block: *Block, src: LazySrcLoc, err: Air.
     }
 }
 
+/// `uncoerced_index_ty` is the type of `index` before its coercion to `usize`.
 fn addSafetyCheckIndexOob(
     sema: *Sema,
     parent_block: *Block,
     src: LazySrcLoc,
     index: Air.Inst.Ref,
+    uncoerced_index_ty: Type,
     len: Air.Inst.Ref,
     cmp_op: Air.Inst.Tag,
 ) !void {
     assert(!parent_block.isComptime());
+    if (sema.indexTypeProvesBound(uncoerced_index_ty, len, cmp_op)) return;
     const ok = try parent_block.addBinOp(cmp_op, index, len);
     return addSafetyCheckCall(sema, parent_block, src, ok, .@"panic.outOfBounds", &.{ index, len });
+}
+
+/// Whether `index cmp_op len` holds for every index of type `index_ty`, with `len`
+/// comptime-known: a `u8` index into 256 elements, for one, needs no bounds check.
+fn indexTypeProvesBound(sema: *Sema, index_ty: Type, len: Air.Inst.Ref, cmp_op: Air.Inst.Tag) bool {
+    const zcu = sema.pt.zcu;
+    const bound = (sema.resolveValue(len) orelse return false).toUnsignedInt(zcu);
+    if (index_ty.zigTypeTag(zcu) != .int) return false;
+    const info = index_ty.intInfo(zcu);
+    if (info.signedness != .unsigned or info.bits >= 64) return false;
+    const max = (@as(u64, 1) << @intCast(info.bits)) - 1;
+    return switch (cmp_op) {
+        else => unreachable,
+        .cmp_lt => max < bound,
+        .cmp_lte => max <= bound,
+    };
 }
 
 fn addSafetyCheckInactiveUnionField(
@@ -27315,6 +27334,7 @@ fn elemPtr(
     src: LazySrcLoc,
     indexable_ptr: Air.Inst.Ref,
     elem_index: Air.Inst.Ref,
+    uncoerced_index_ty: Type,
     elem_index_src: LazySrcLoc,
     init: bool,
     oob_safety: bool,
@@ -27333,13 +27353,13 @@ fn elemPtr(
 
     const elem_ptr = switch (indexable_ty.zigTypeTag(zcu)) {
         .vector => try sema.elemPtrVector(block, indexable_ptr_src, indexable_ptr, elem_index_src, elem_index, init),
-        .array => try sema.elemPtrArray(block, src, indexable_ptr_src, indexable_ptr, elem_index_src, elem_index, init, oob_safety),
+        .array => try sema.elemPtrArray(block, src, indexable_ptr_src, indexable_ptr, elem_index_src, elem_index, uncoerced_index_ty, init, oob_safety),
         .@"struct" => try sema.tupleElemPtr(block, src, indexable_ptr, elem_index, elem_index_src),
         .spirv => try sema.elemPtrSpirvRuntimeArray(block, indexable_ptr, elem_index),
         else => {
             const indexable = try sema.analyzeLoad(block, indexable_ptr_src, indexable_ptr, indexable_ptr_src);
             try sema.ensureLayoutResolved(sema.typeOf(indexable).childType(zcu), src, .ptr_access);
-            return elemPtrOneLayerOnly(sema, block, src, indexable, elem_index, elem_index_src, init, oob_safety);
+            return elemPtrOneLayerOnly(sema, block, src, indexable, elem_index, uncoerced_index_ty, elem_index_src, init, oob_safety);
         },
     };
 
@@ -27354,6 +27374,7 @@ fn elemPtrOneLayerOnly(
     src: LazySrcLoc,
     indexable: Air.Inst.Ref,
     elem_index: Air.Inst.Ref,
+    uncoerced_index_ty: Type,
     elem_index_src: LazySrcLoc,
     init: bool,
     oob_safety: bool,
@@ -27369,7 +27390,7 @@ fn elemPtrOneLayerOnly(
     child_ty.assertHasLayout(zcu);
 
     switch (indexable_ty.ptrSize(zcu)) {
-        .slice => return sema.elemPtrSlice(block, src, indexable_src, indexable, elem_index_src, elem_index, oob_safety),
+        .slice => return sema.elemPtrSlice(block, src, indexable_src, indexable, elem_index_src, elem_index, uncoerced_index_ty, oob_safety),
         .many, .c => {
             const maybe_ptr_val = try sema.resolveDefinedValue(block, indexable_src, indexable);
             const maybe_index_val = try sema.resolveDefinedValue(block, elem_index_src, elem_index);
@@ -27396,7 +27417,7 @@ fn elemPtrOneLayerOnly(
         .one => {
             const elem_ptr = switch (child_ty.zigTypeTag(zcu)) {
                 .vector => try sema.elemPtrVector(block, indexable_src, indexable, elem_index_src, elem_index, init),
-                .array => try sema.elemPtrArray(block, src, indexable_src, indexable, elem_index_src, elem_index, init, oob_safety),
+                .array => try sema.elemPtrArray(block, src, indexable_src, indexable, elem_index_src, elem_index, uncoerced_index_ty, init, oob_safety),
                 .@"struct" => try sema.tupleElemPtr(block, indexable_src, indexable, elem_index, elem_index_src),
                 .spirv => try sema.elemPtrSpirvRuntimeArray(block, indexable, elem_index),
                 else => unreachable, // Guaranteed by checkIndexable
@@ -27432,7 +27453,7 @@ fn elemVal(
             const child_ty = indexable_ty.childType(zcu);
             try sema.ensureLayoutResolved(child_ty, src, .ptr_access);
             switch (indexable_ty.ptrSize(zcu)) {
-                .slice => return sema.elemValSlice(block, src, indexable_src, indexable, elem_index_src, elem_index, oob_safety),
+                .slice => return sema.elemValSlice(block, src, indexable_src, indexable, elem_index_src, elem_index, sema.typeOf(elem_index_uncasted), oob_safety),
                 .many, .c => {
                     const maybe_indexable_val = try sema.resolveDefinedValue(block, indexable_src, indexable);
                     const maybe_index_val = try sema.resolveDefinedValue(block, elem_index_src, elem_index);
@@ -27470,15 +27491,15 @@ fn elemVal(
                         if (index != child_ty.arrayLen(zcu)) break :arr_sent;
                         return .fromValue(sentinel);
                     }
-                    const elem_ptr = try sema.elemPtr(block, indexable_src, indexable, elem_index, elem_index_src, false, oob_safety);
+                    const elem_ptr = try sema.elemPtr(block, indexable_src, indexable, elem_index, sema.typeOf(elem_index_uncasted), elem_index_src, false, oob_safety);
                     return sema.analyzeLoad(block, indexable_src, elem_ptr, elem_index_src);
                 },
             }
         },
-        .array => return sema.elemValArray(block, src, indexable_src, indexable, elem_index_src, elem_index, oob_safety),
+        .array => return sema.elemValArray(block, src, indexable_src, indexable, elem_index_src, elem_index, sema.typeOf(elem_index_uncasted), oob_safety),
         .vector => {
             // TODO: If the index is a vector, the result should be a vector.
-            return sema.elemValArray(block, src, indexable_src, indexable, elem_index_src, elem_index, oob_safety);
+            return sema.elemValArray(block, src, indexable_src, indexable, elem_index_src, elem_index, sema.typeOf(elem_index_uncasted), oob_safety);
         },
         .@"struct" => {
             // Tuple field access.
@@ -27599,6 +27620,7 @@ fn elemValArray(
     array: Air.Inst.Ref,
     elem_index_src: LazySrcLoc,
     elem_index: Air.Inst.Ref,
+    uncoerced_index_ty: Type,
     oob_safety: bool,
 ) CompileError!Air.Inst.Ref {
     const pt = sema.pt;
@@ -27649,7 +27671,7 @@ fn elemValArray(
         if (maybe_index_val == null) {
             const len_inst = try pt.intRef(.usize, array_len);
             const cmp_op: Air.Inst.Tag = if (array_sent != null) .cmp_lte else .cmp_lt;
-            try sema.addSafetyCheckIndexOob(block, src, elem_index, len_inst, cmp_op);
+            try sema.addSafetyCheckIndexOob(block, src, elem_index, uncoerced_index_ty, len_inst, cmp_op);
         }
     }
 
@@ -27744,6 +27766,7 @@ fn elemPtrArray(
     array_ptr: Air.Inst.Ref,
     elem_index_src: LazySrcLoc,
     elem_index: Air.Inst.Ref,
+    uncoerced_index_ty: Type,
     init: bool,
     oob_safety: bool,
 ) CompileError!Air.Inst.Ref {
@@ -27793,7 +27816,7 @@ fn elemPtrArray(
     if (oob_safety and block.wantSafety() and maybe_index == null) {
         const len_inst = try pt.intRef(.usize, array_len);
         const cmp_op: Air.Inst.Tag = if (array_sent) .cmp_lte else .cmp_lt;
-        try sema.addSafetyCheckIndexOob(block, src, elem_index, len_inst, cmp_op);
+        try sema.addSafetyCheckIndexOob(block, src, elem_index, uncoerced_index_ty, len_inst, cmp_op);
     }
 
     if (array_ty.childType(zcu).abiSize(zcu) == 0) {
@@ -27813,6 +27836,7 @@ fn elemValSlice(
     slice: Air.Inst.Ref,
     elem_index_src: LazySrcLoc,
     elem_index: Air.Inst.Ref,
+    uncoerced_index_ty: Type,
     oob_safety: bool,
 ) CompileError!Air.Inst.Ref {
     const pt = sema.pt;
@@ -27857,7 +27881,7 @@ fn elemValSlice(
         else
             try block.addTyOp(.slice_len, .usize, slice);
         const cmp_op: Air.Inst.Tag = if (slice_sent) .cmp_lte else .cmp_lt;
-        try sema.addSafetyCheckIndexOob(block, src, elem_index, len_inst, cmp_op);
+        try sema.addSafetyCheckIndexOob(block, src, elem_index, uncoerced_index_ty, len_inst, cmp_op);
     }
     try sema.checkLogicalPtrOperation(block, src, slice_ty);
     return block.addBinOp(.slice_elem_val, slice, elem_index);
@@ -27872,6 +27896,7 @@ fn elemPtrSlice(
     slice: Air.Inst.Ref,
     elem_index_src: LazySrcLoc,
     elem_index: Air.Inst.Ref,
+    uncoerced_index_ty: Type,
     oob_safety: bool,
 ) CompileError!Air.Inst.Ref {
     const pt = sema.pt;
@@ -27921,7 +27946,7 @@ fn elemPtrSlice(
             break :len try block.addTyOp(.slice_len, .usize, slice);
         };
         const cmp_op: Air.Inst.Tag = if (slice_sent) .cmp_lte else .cmp_lt;
-        try sema.addSafetyCheckIndexOob(block, src, elem_index, len_inst, cmp_op);
+        try sema.addSafetyCheckIndexOob(block, src, elem_index, uncoerced_index_ty, len_inst, cmp_op);
     }
     if (elem_ty.abiSize(zcu) == 0) {
         // zero-bit child type; just extract the pointer and bitcast it
@@ -30561,7 +30586,7 @@ fn coerceArrayLike(
         const index_ref = Air.internedToRef((try pt.intValue(.usize, i)).toIntern());
         const src = inst_src; // TODO better source location
         const elem_src = inst_src; // TODO better source location
-        const elem_ref = try sema.elemValArray(block, src, inst_src, inst, elem_src, index_ref, true);
+        const elem_ref = try sema.elemValArray(block, src, inst_src, inst, elem_src, index_ref, .usize, true);
         const coerced = try sema.coerce(block, dest_elem_ty, elem_ref, elem_src);
         ref.* = coerced;
         if (runtime_src == null) {
@@ -31591,6 +31616,8 @@ fn analyzeSlice(
     // underlying object because it is an array (which has the length in the type), or
     // we might learn of the length because it is a comptime-known slice value.
     var end_is_len = uncasted_end_opt == .none;
+    // The type of `end` before its coercion to `usize`, if `end` is the explicit end index.
+    const uncoerced_end_ty: Type = if (end_is_len or by_length) .usize else sema.typeOf(uncasted_end_opt);
     const end = e: {
         if (array_ty.zigTypeTag(zcu) == .array) {
             const len_val = try pt.intValue(.usize, array_ty.arrayLen(zcu));
@@ -31870,14 +31897,14 @@ fn analyzeSlice(
                             try sema.analyzeArithmetic(block, .add, slice_len, .one, src, end_src, end_src, true);
                     } else break :bounds_check;
 
-                    const actual_end = if (slice_sentinel != null)
-                        try sema.analyzeArithmetic(block, .add, end, .one, src, end_src, end_src, true)
-                    else
-                        end;
+                    const actual_end: Air.Inst.Ref, const uncoerced_actual_end_ty: Type = if (slice_sentinel != null) .{
+                        try sema.analyzeArithmetic(block, .add, end, .one, src, end_src, end_src, true),
+                        .usize,
+                    } else .{ end, uncoerced_end_ty };
 
                     if (try sema.resolveDefinedValue(block, src, actual_len) == null or
                         try sema.resolveDefinedValue(block, src, actual_end) == null)
-                        try sema.addSafetyCheckIndexOob(block, src, actual_end, actual_len, .cmp_lte);
+                        try sema.addSafetyCheckIndexOob(block, src, actual_end, uncoerced_actual_end_ty, actual_len, .cmp_lte);
                 }
 
                 // requirement: result[new_len] == slice_sentinel
@@ -31936,11 +31963,11 @@ fn analyzeSlice(
             break :blk try sema.analyzeArithmetic(block, .add, slice_len_inst, .one, src, end_src, end_src, true);
         } else null;
         if (opt_len_inst) |len_inst| {
-            const actual_end = if (slice_sentinel != null)
-                try sema.analyzeArithmetic(block, .add, end, .one, src, end_src, end_src, true)
-            else
-                end;
-            try sema.addSafetyCheckIndexOob(block, src, actual_end, len_inst, .cmp_lte);
+            const actual_end: Air.Inst.Ref, const uncoerced_actual_end_ty: Type = if (slice_sentinel != null) .{
+                try sema.analyzeArithmetic(block, .add, end, .one, src, end_src, end_src, true),
+                .usize,
+            } else .{ end, uncoerced_end_ty };
+            try sema.addSafetyCheckIndexOob(block, src, actual_end, uncoerced_actual_end_ty, len_inst, .cmp_lte);
         }
     }
     const result = try block.addInst(.{

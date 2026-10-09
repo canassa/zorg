@@ -788,6 +788,9 @@ pub const Index = enum(u32) {
         split: bool = true,
         wrap: ?std.lang.Type.Int = null,
         expected_live_registers: *const LiveRegisters = &.initFill(.free),
+        /// The memory is the value's own stack slot: a loaded part is not
+        /// stored back to it, and a part not live in a register is not loaded.
+        in_place: bool = false,
     };
 
     pub fn load(
@@ -810,7 +813,7 @@ pub const Index = enum(u32) {
                 assert(part_it.only() == null);
                 break :only;
             }
-            const part_ra = if (try part_vi.defReg(isel)) |part_ra|
+            const part_ra = if (try part_vi.defRegAdvanced(isel, .{ .store_home = !opts.in_place })) |part_ra|
                 part_ra
             else if (opts.@"volatile")
                 .zr
@@ -854,6 +857,7 @@ pub const Index = enum(u32) {
                 } else null,
             },
             .expected_live_registers = opts.expected_live_registers,
+            .in_place = opts.in_place,
         });
         return used;
     }
@@ -991,10 +995,20 @@ pub const Index = enum(u32) {
             .split = false,
             .wrap = opts.wrap,
             .expected_live_registers = opts.expected_live_registers,
+            // Normalizing an integer's top part also normalizes its memory.
+            .in_place = if (opts.wrap) |wrap| wrap.bits == 8 * def_vi.size(isel) else true,
         });
     }
 
     pub fn defReg(def_vi: Value.Index, isel: *Select) !?Register.Alias {
+        return def_vi.defRegAdvanced(isel, .{});
+    }
+
+    pub fn defRegAdvanced(def_vi: Value.Index, isel: *Select, opts: struct {
+        /// Store the definition to the stack slot that holds the value. Off when
+        /// the definition is loaded from that slot: memory already holds it.
+        store_home: bool = true,
+    }) !?Register.Alias {
         var vi = def_vi;
         var offset: i65 = 0;
         var def_ra: ?Register.Alias = null;
@@ -1132,6 +1146,7 @@ pub const Index = enum(u32) {
                 // Uses rematerialize stack addresses, so the definition is unused.
                 .unallocated, .stack_address => return def_ra,
                 .stack_slot => |stack_slot| {
+                    if (!opts.store_home) return def_ra;
                     offset += stack_slot.offset;
                     const def_is_vector = def_vi.isVector(isel);
                     const ra = def_ra orelse if (def_is_vector) try isel.allocVecReg() else try isel.allocIntReg();

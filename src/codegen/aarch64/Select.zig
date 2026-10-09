@@ -2214,6 +2214,20 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
                         .wrap = if (ty_op.ty.isAbiInt(zcu)) ty_op.ty.intInfo(zcu) else null,
                     });
                     try ptr_base.finish(isel);
+                } else if (dst_vi.value.parent(isel) == .unallocated and !ptr_info.flags.is_volatile and
+                    ip.zigTypeTag(ptr_info.child) != .@"union")
+                {
+                    // No use needs the value's memory, only parts in registers: load
+                    // those from the pointer instead of copying the value to a stack
+                    // slot first.
+                    const ptr_vi = try isel.use(ty_op.operand);
+                    const ptr_base: MemoryBase = try .init(isel, ptr_vi);
+                    _ = try dst_vi.value.load(isel, ty_op.ty, ptr_base.ra, .{
+                        .offset = ptr_base.offset,
+                        .split = false,
+                        .wrap = if (ty_op.ty.isAbiInt(zcu)) ty_op.ty.intInfo(zcu) else null,
+                    });
+                    try ptr_base.finish(isel);
                 } else {
                     try dst_vi.value.defAddr(isel, .fromInterned(ptr_info.child), .{}) orelse break :unused;
 
@@ -2996,6 +3010,30 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
                         }
                     },
                     .@"union" => {
+                        // No use needs the payload's memory, only parts in registers:
+                        // load those from the union's stack slot instead of copying
+                        // the payload to a slot of its own first.
+                        if (field_vi.value.parent(isel) == .unallocated) direct: {
+                            const union_slot: Value.Indirect = switch (agg_vi.parent(isel)) {
+                                .unallocated => slot: {
+                                    const new_slot = agg_vi.allocStackSlot(isel);
+                                    agg_vi.setParent(isel, .{ .stack_slot = new_slot });
+                                    break :slot new_slot;
+                                },
+                                .stack_slot => |stack_slot| stack_slot,
+                                else => break :direct,
+                            };
+                            switch (union_slot.base) {
+                                .sp, .fp => {},
+                                else => break :direct,
+                            }
+                            _ = try field_vi.value.load(isel, field_ty, union_slot.base, .{
+                                .offset = std.math.cast(u64, @as(i65, union_slot.offset) + agg_ty.unionGetLayout(zcu).payloadOffset()) orelse break :direct,
+                                .split = false,
+                            });
+                            break :unused;
+                        }
+
                         try field_vi.value.defAddr(isel, field_ty, .{}) orelse break :unused;
 
                         if (try isel.copyInline(
@@ -8435,6 +8473,7 @@ fn selectStore(
         !ptr_info.flags.is_volatile)
     {
         if (try isel.storeAsMemmove(ptr_info, bin_op, before)) return;
+        if (try isel.storeByDefiningInPlace(ptr_ty, bin_op, before)) return;
     }
 
     const src_vi = try isel.use(bin_op.rhs);
@@ -8528,6 +8567,62 @@ fn storeAsMemmove(
         .struct_field_ptr_index_3,
     })) return false;
     return isel.copyInline(.{ .ptr = try isel.use(bin_op.lhs) }, .{ .ptr = try isel.use(load_ptr) }, size, true);
+}
+
+/// A store into a local of a large value whose last use is this store and
+/// which is defined just before it, part by part from other values: defines
+/// it in the local instead of in a temporary that is then copied (and read
+/// back with wider loads than the part stores that just wrote it). Returns
+/// false, having emitted nothing, for any other store.
+fn storeByDefiningInPlace(
+    isel: *Select,
+    ptr_ty: ZigType,
+    bin_op: @FieldType(Air.Inst.Data, "bin_op"),
+    before: []const Air.Inst.Index,
+) !bool {
+    const zcu = isel.pt.zcu;
+    const src_inst = bin_op.rhs.toIndex() orelse return false;
+    // Later uses were already selected.
+    if (isel.live_values.contains(src_inst)) return false;
+    const ty = ptr_ty.childType(zcu);
+    if (ty.abiSize(zcu) <= Value.max_parts) return false;
+    if (ptr_ty.ptrAlignment(zcu).compare(.lt, ty.abiAlignment(zcu))) return false;
+    switch (isel.air.instructions.items(.tag)[@backingInt(src_inst)]) {
+        // These read only operand values, never memory through a pointer.
+        .optional_payload,
+        .unwrap_errunion_payload,
+        .agg_field_val,
+        .wrap_optional,
+        .wrap_errunion_payload,
+        .aggregate_init,
+        => {},
+        // Defined by the `br`s that end its body, after the rest of the
+        // body has run; only the instructions after the block are scanned.
+        .block => {},
+        else => return false,
+    }
+    // Nothing between the definition and the store may access memory, so
+    // the local is not read or written before the store.
+    if (!isel.followedOnlyBy(before, src_inst, &.{
+        .dbg_stmt,
+        .dbg_empty_stmt,
+        .dbg_var_ptr,
+        .dbg_var_val,
+        .alloc,
+        .struct_field_ptr,
+        .struct_field_ptr_index_0,
+        .struct_field_ptr_index_1,
+        .struct_field_ptr_index_2,
+        .struct_field_ptr_index_3,
+    })) return false;
+    const stack_address = switch ((try isel.use(bin_op.lhs)).parent(isel)) {
+        .stack_address => |stack_address| stack_address,
+        else => return false,
+    };
+    const src_vi = try isel.use(bin_op.rhs);
+    if (src_vi.parent(isel) != .unallocated) return false;
+    src_vi.setParent(isel, .{ .stack_slot = stack_address });
+    return true;
 }
 
 pub fn emitDebug(isel: *Select, info: @FieldType(codegen.aarch64.Mir.Debug, "info")) !void {

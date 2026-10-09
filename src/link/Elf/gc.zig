@@ -75,6 +75,12 @@ fn collectRoots(roots: *std.array_list.Managed(*Atom), elf_file: *Elf) !void {
     }.atomRoots;
 
     if (elf_file.zigObjectPtr()) |zo| {
+        // Generated frame metadata must survive collection, like the debug sections.
+        // Do not follow its relocations: they must not keep otherwise unused functions alive.
+        if (zo.eh_frame_index) |sym_index| {
+            const atom = zo.symbol(sym_index).atom(elf_file).?;
+            atom.visited = true;
+        }
         try atomRoots(zo.asFile(), roots, elf_file);
     }
     for (elf_file.objects.items) |index| {

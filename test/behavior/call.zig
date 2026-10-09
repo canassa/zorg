@@ -20,7 +20,6 @@ test "super basic invocations" {
 }
 
 test "basic invocations" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -112,7 +111,6 @@ test "result location of function call argument through runtime condition and st
 }
 
 test "function call with 40 arguments" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
@@ -268,7 +266,6 @@ test "arguments to comptime parameters generated in comptime blocks" {
 }
 
 test "forced tail call" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
@@ -303,7 +300,6 @@ test "forced tail call" {
 }
 
 test "inline call preserves tail call" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
@@ -630,7 +626,6 @@ test "function call with cast to anyopaque pointer" {
 }
 
 test "arguments pointed to on stack into tailcall" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -702,7 +697,6 @@ test "arguments pointed to on stack into tailcall" {
 }
 
 test "tail call function pointer" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
@@ -763,4 +757,305 @@ test "tail call with potentially extended types" {
     try std.testing.expect(S.Test(i8).caller(5, -6, 7, -8) == -2);
     try std.testing.expect(S.Test(u16).caller(9, 10, 11, 12) == 42);
     try std.testing.expect(S.Test(i16).caller(13, 14, 15, -16) == 26);
+}
+
+test "pass a tagged union whose fields split differently by value" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        const Value = union(enum) {
+            triple: [3]u32,
+            byte: u8,
+        };
+        noinline fn consume(value: Value, marker: u32) u32 {
+            return switch (value) {
+                .triple => |words| words[0] + words[1] + words[2] + marker,
+                .byte => |byte| @as(u32, byte) + marker,
+            };
+        }
+    };
+    var seed: u32 = 11;
+    const pointer: *volatile u32 = &seed;
+    var stored: S.Value = .{ .triple = .{ pointer.*, 22, 33 } };
+    const union_pointer: *volatile S.Value = &stored;
+    const first = union_pointer.*;
+    const checksum = S.consume(first, 7);
+    try expect(switch (first) {
+        .triple => |words| words[0] == 11 and words[2] == 33,
+        .byte => false,
+    });
+    try expect(checksum == 73);
+    union_pointer.* = .{ .byte = @truncate(pointer.*) };
+    const second = union_pointer.*;
+    const byte_checksum = S.consume(second, 7);
+    try expect(switch (second) {
+        .triple => false,
+        .byte => |byte| byte == 11,
+    });
+    try expect(byte_checksum == 18);
+}
+
+test "pass a two-register composite after seven integer arguments" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        const Container = union(enum) { first: *u64, second: *u64 };
+        noinline fn exhausted(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, container: Container, tail: *u64) u64 {
+            const payload = switch (container) {
+                .first => |ptr| ptr.*,
+                .second => |ptr| ptr.* + 1,
+            };
+            return a + b + c + d + e + f + g + payload + tail.*;
+        }
+        fn call(tail: *u64, second: bool) u64 {
+            const container: Container = if (second) .{ .second = tail } else .{ .first = tail };
+            return exhausted(1, 2, 3, 4, 5, 6, 7, container, tail);
+        }
+    };
+    var tail: u64 = 1000;
+    try expect(S.call(&tail, false) == 2028);
+    try expect(S.call(&tail, true) == 2029);
+}
+
+test "pass a slice on the stack after ten integer arguments" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        noinline fn consume(a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64, a7: u64, a8: u64, a9: u64, bytes: []const u8) u64 {
+            var sum = a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9;
+            for (bytes) |byte| sum += byte;
+            return sum;
+        }
+    };
+    var source = [_]u64{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const ptr: *volatile [10]u64 = &source;
+    var bytes = [_]u8{ 11, 12, 13 };
+    try expect(S.consume(ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7], ptr[8], ptr[9], &bytes) == 91);
+}
+
+test "return a multi-field aggregate indirectly from a loop" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        const Item = struct { a: u64, b: u32, c: u8 };
+        const List = std.MultiArrayList(Item);
+        noinline fn makeSlice(list: List) List.Slice {
+            return list.slice();
+        }
+    };
+    var storage: [128]u8 align(16) = undefined;
+    const list: S.List = .{ .bytes = &storage, .len = 3, .capacity = 5 };
+    const slice = S.makeSlice(list);
+    try expect(slice.len == 3 and slice.capacity == 5);
+    try expect(@intFromPtr(slice.ptrs[0]) == @intFromPtr(&storage));
+    try expect(@intFromPtr(slice.ptrs[1]) == @intFromPtr(&storage) + 5 * 8);
+    try expect(@intFromPtr(slice.ptrs[2]) == @intFromPtr(&storage) + 5 * 12);
+}
+
+test "pass and return aggregates split across registers" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
+
+    const S = struct {
+        const Wrapper = struct { slice: []const u8 };
+        const Result = union(enum) { bytes: [32]u8, number: u64 };
+        noinline fn sum(x: Wrapper) u64 {
+            var total: u64 = 0;
+            for (x.slice) |byte| total += byte;
+            return total;
+        }
+        noinline fn optional(x: ?f128) ?f128 {
+            if (x) |value| return value;
+            return null;
+        }
+        noinline fn unionBytes(x: [31]u8) Result {
+            var result: Result = .{ .bytes = undefined };
+            result.bytes[0..31].* = x;
+            result.bytes[31] = 199;
+            return result;
+        }
+        noinline fn arrayBytes(bytes: [200]u8) [200]u8 {
+            return bytes;
+        }
+    };
+    const text: []const u8 = "abc";
+    try expect(S.sum(.{ .slice = text }) == 'a' + 'b' + 'c');
+    try expect(S.optional(null) == null);
+    try expect(S.optional(1.25).? == 1.25);
+    var bytes: [31]u8 = undefined;
+    for (&bytes, 0..) |*byte, i| byte.* = 3 + @as(u8, @intCast(i));
+    const result = S.unionBytes(bytes);
+    var total: u64 = 0;
+    for (result.bytes) |byte| total += byte;
+    try expect(total == 31 * 3 + 30 * 31 / 2 + 199);
+    var large: [200]u8 = undefined;
+    for (&large, 0..) |*byte, i| byte.* = @intCast(i);
+    const copied = S.arrayBytes(large);
+    for (copied, 0..) |byte, i| try expect(byte == i);
+}
+
+test "pass and return a struct whose fields leave its second eight bytes padding" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
+
+    const S = struct {
+        const Aligned = extern struct { a: u8 align(16) };
+        noinline fn bump(x: Aligned, after: u64) Aligned {
+            return .{ .a = x.a + @as(u8, @intCast(after)) };
+        }
+    };
+    try expect(S.bump(.{ .a = 41 }, 1).a == 42);
+}
+
+test "struct and tuple arguments of an integer followed by floats" {
+    const S = struct {
+        const IntFloat = struct { a: u32, b: f32 };
+        const IntFloats = struct { a: u32, b: f32, c: f32, d: f32 };
+        const IntDouble = extern struct { a: u64, b: f64 };
+        noinline fn intFloat(p: IntFloat) u64 {
+            return @as(u64, p.a) * 1000 + @as(u64, @intFromFloat(p.b));
+        }
+        noinline fn intFloats(p: IntFloats) u64 {
+            return @as(u64, p.a) * 1000 + @as(u64, @intFromFloat(p.b + p.c + p.d));
+        }
+        noinline fn intDouble(p: IntDouble) callconv(.c) u64 {
+            return p.a * 1000 + @as(u64, @intFromFloat(p.b));
+        }
+        noinline fn tuple(p: struct { u16, f16 }) u64 {
+            return @as(u64, p[0]) * 1000 + @as(u64, @intFromFloat(p[1]));
+        }
+    };
+    try expect(S.intFloat(.{ .a = 3, .b = 7.5 }) == 3007);
+    try expect(S.intFloats(.{ .a = 3, .b = 0.5, .c = -0.0, .d = 3.5 }) == 3004);
+    try expect(S.intDouble(.{ .a = 3, .b = 7.5 }) == 3007);
+    try expect(S.tuple(.{ 3, 7.5 }) == 3007);
+    var a: u32 = 4;
+    var b: f32 = 8.5;
+    var c: f64 = 9.5;
+    var d: f16 = 2.5;
+    _ = .{ &a, &b, &c, &d };
+    try expect(S.intFloat(.{ .a = a, .b = b }) == 4008);
+    try expect(S.intFloats(.{ .a = a, .b = b, .c = b, .d = 1.0 }) == 4018);
+    try expect(S.intDouble(.{ .a = a, .b = c }) == 4009);
+    try expect(S.tuple(.{ @intCast(a), d }) == 4002);
+}
+
+test "float results passed in general registers as fields of a struct" {
+    const S = struct {
+        const IntDouble = struct { a: u64, b: f64 };
+        const IntHalf = struct { a: u16, b: f16 };
+        noinline fn intDouble(p: IntDouble) u64 {
+            return p.a * 1000 + @as(u64, @intFromFloat(p.b));
+        }
+        noinline fn intHalf(p: IntHalf) u64 {
+            return @as(u64, p.a) * 1000 + @as(u64, @intFromFloat(p.b));
+        }
+        noinline fn tuple(p: struct { u32, f32 }) u64 {
+            return @as(u64, p[0]) * 1000 + @as(u64, @intFromFloat(p[1]));
+        }
+    };
+    var a: u32 = 4;
+    var b: f32 = 8.5;
+    var c: f64 = 2.25;
+    _ = .{ &a, &b, &c };
+    try expect(S.intDouble(.{ .a = a, .b = b }) == 4008);
+    try expect(S.intDouble(.{ .a = a, .b = c + 1.0 }) == 4003);
+    try expect(S.intDouble(.{ .a = a, .b = @sqrt(c) }) == 4001);
+    try expect(S.intHalf(.{ .a = @intCast(a), .b = @floatCast(b) }) == 4008);
+    try expect(S.intHalf(.{ .a = @intCast(a), .b = @floatFromInt(a) }) == 4004);
+    try expect(S.tuple(.{ a, b * 2 }) == 4017);
+    try expect(S.tuple(.{ a, @floatCast(c) }) == 4002);
+}
+
+test "stack arguments staged while the argument registers hold arguments and every other register is live" {
+    const S = struct {
+        const Pair = struct { a: u64, b: u32 };
+        noinline fn sink(
+            r0: u64,
+            r1: u64,
+            r2: u64,
+            r3: u64,
+            r4: u64,
+            r5: u64,
+            r6: u64,
+            r7: u64,
+            s0: u64,
+            s1: u64,
+            s2: u64,
+            s3: u64,
+            s4: u64,
+            s5: u64,
+            s6: u64,
+            s7: u64,
+            s8: u64,
+            s9: u64,
+            s10: u64,
+            s11: u64,
+            pair: Pair,
+            last: u64,
+        ) u64 {
+            return r0 + r1 + r2 + r3 + r4 + r5 + r6 + r7 + s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 +
+                s8 + s9 + s10 + s11 + pair.a + pair.b + last;
+        }
+        noinline fn caller(p: *const [32]u64, pair: *const Pair) u64 {
+            // Live across the call: they take the callee-saved registers.
+            const c0 = p[0] *% 3;
+            const c1 = p[1] *% 3;
+            const c2 = p[2] *% 3;
+            const c3 = p[3] *% 3;
+            const c4 = p[4] *% 3;
+            const c5 = p[5] *% 3;
+            const c6 = p[6] *% 3;
+            const c7 = p[7] *% 3;
+            const c8 = p[8] *% 3;
+            const c9 = p[9] *% 3;
+            const c10 = p[10] *% 3;
+            const c11 = p[11] *% 3;
+            // Arguments, each in its own register until the call.
+            const v0 = p[12] +% 1;
+            const v1 = p[13] +% 1;
+            const v2 = p[14] +% 1;
+            const v3 = p[15] +% 1;
+            const v4 = p[16] +% 1;
+            const v5 = p[17] +% 1;
+            const v6 = p[18] +% 1;
+            const v7 = p[19] +% 1;
+            const v8 = p[20] +% 1;
+            const v9 = p[21] +% 1;
+            const v10 = p[22] +% 1;
+            const v11 = p[23] +% 1;
+            const w0 = p[24] +% 2;
+            const w1 = p[25] +% 2;
+            const w2 = p[26] +% 2;
+            const w3 = p[27] +% 2;
+            const w4 = p[28] +% 2;
+            const w5 = p[29] +% 2;
+            const w6 = p[30] +% 2;
+            const w7 = p[31] +% 2;
+            // `pair` is copied to the stack through a scratch register.
+            const r = sink(v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, w0, w1, w2, w3, w4, w5, w6, w7, pair.*, w0);
+            return r +% c0 +% c1 +% c2 +% c3 +% c4 +% c5 +% c6 +% c7 +% c8 +% c9 +% c10 +% c11;
+        }
+    };
+    var values: [32]u64 = undefined;
+    for (&values, 0..) |*v, i| v.* = i;
+    const pair: S.Pair = .{ .a = 100, .b = 200 };
+    var expected: u64 = 0;
+    for (values[0..12]) |v| expected += v * 3;
+    for (values[12..24]) |v| expected += v + 1;
+    for (values[24..32]) |v| expected += v + 2;
+    expected += 300 + values[24] + 2;
+    try expect(S.caller(&values, &pair) == expected);
 }

@@ -32,7 +32,6 @@ test "@bitCast iX -> uX (8, 16, 128)" {
 }
 
 test "@bitCast iX -> uX exotic integers" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
@@ -107,7 +106,6 @@ test "bitcast generates a temporary value" {
 }
 
 test "@bitCast packed structs at runtime and comptime" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -134,7 +132,6 @@ test "@bitCast packed structs at runtime and comptime" {
 }
 
 test "bitcast packed struct to integer and back" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -208,7 +205,6 @@ test "triple level result location with bitcast sandwich passed as tuple element
 }
 
 test "@bitCast packed struct of floats" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -244,7 +240,6 @@ test "@bitCast packed struct of floats" {
 }
 
 test "comptime @bitCast packed struct to int and back" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -278,7 +273,6 @@ test "comptime @bitCast packed struct to int and back" {
 }
 
 test "bitcast vector to integer and back" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
@@ -407,7 +401,6 @@ test "bitcast nan float does not modify signaling bit" {
 }
 
 test "@bitCast of packed struct of bools all true" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest; // TODO
@@ -427,7 +420,6 @@ test "@bitCast of packed struct of bools all true" {
 }
 
 test "@bitCast of packed struct of bools all false" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest; // TODO
 
@@ -630,4 +622,28 @@ test "@bitCast deeply nested arrays to scalar" {
     }} };
     try static.doTheTest(src);
     try comptime static.doTheTest(src);
+}
+
+test "@bitCast between floats and arrays or vectors of integers" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest;
+
+    const S = struct {
+        fn doTheTest(comptime F: type, comptime Aggregate: type, value: F) !void {
+            var x = value;
+            _ = &x;
+            const aggregate: Aggregate = @bitCast(x);
+            try expectEqual(@as(Aggregate, @bitCast(value)), aggregate);
+            var aggregate_var = aggregate;
+            _ = &aggregate_var;
+            try expectEqual(value, @as(F, @bitCast(aggregate_var)));
+        }
+    };
+    try S.doTheTest(f16, [2]u8, -1.5);
+    try S.doTheTest(f32, [4]u8, 3.25);
+    try S.doTheTest(f32, @Vector(4, u8), 3.25);
+    try S.doTheTest(f64, [2]u32, -1234.5678);
+    try S.doTheTest(f64, @Vector(2, u32), -1234.5678);
+    try S.doTheTest(f128, [4]u32, 0.1);
+    try S.doTheTest(f128, [2]u64, -2.5);
 }

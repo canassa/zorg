@@ -874,14 +874,22 @@ pub fn supportsTailCall(target: *const std.Target, backend: std.lang.CompilerBac
             return @import("codegen/llvm.zig").supportsTailCall(target);
         },
         .stage2_c => return true,
+        .stage2_aarch64 => return target.cpu.arch == .aarch64 and switch (target.ofmt) {
+            .elf => target.os.tag == .linux,
+            .macho => target.os.tag.isDarwin(),
+            else => false,
+        },
         else => return false,
     }
 }
 
 pub fn supportsThreads(target: *const std.Target, backend: std.lang.CompilerBackend) bool {
-    _ = target;
     return switch (backend) {
-        .stage2_aarch64 => false,
+        .stage2_aarch64 => target.cpu.arch == .aarch64 and switch (target.ofmt) {
+            .elf => target.os.tag == .linux,
+            .macho => target.os.tag.isDarwin(),
+            else => false,
+        },
         .stage2_loongarch => false,
         else => true,
     };
@@ -974,7 +982,7 @@ pub inline fn backendSupportsFeature(backend: std.lang.CompilerBackend, comptime
             else => false,
         },
         .is_named_enum_value => switch (backend) {
-            .stage2_llvm, .stage2_x86_64, .stage2_wasm => true,
+            .stage2_aarch64, .stage2_llvm, .stage2_x86_64, .stage2_wasm => true,
             else => false,
         },
         .error_set_has_value => switch (backend) {

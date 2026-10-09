@@ -2621,12 +2621,32 @@ pub const CompilerRtFunc = enum(u32) {
     __fixunshfti, __fixunssfti, __fixunsdfti, __fixunsxfti, __fixunstfti, // float to u128
     __fixunshfei, __fixunssfei, __fixunsdfei, __fixunsxfei, __fixunstfei, // float to arbitray uN
 
+    // integers of up to 65535 bits, in memory as 64-bit limbs:
+    // (out, a, b, is_signed, bits) bool: whether the result overflowed
+    __mulo_limb64,
+    // (out, a, shift: u16, is_signed, bits) bool: whether the result overflowed
+    __shlo_limb64,
+    // (out, a, shift: u16, is_signed, bits) void
+    __shr_limb64,
+    // (out, a, b, bits) void
+    __and_limb64, __or_limb64, __xor_limb64,
+    // (out, a, is_signed, bits) void
+    __not_limb64, __bitreverse_limb64, __byteswap_limb64,
+    // (out, a, bits) void
+    __abs_limb64,
+    // (a, bits) u16
+    __clz_limb64, __ctz_limb64, __popcount_limb64,
+
+    // integers in memory, extended to their ABI size:
+    // (q or r, a, b, scratch of twice the ABI size, bits: usize) void
+    __udivei5, __umodei5, __divei5, __modei5,
+
     // zig fmt: on
 
     /// Usually, the tag names of `CompilerRtFunc` match the corresponding symbol name, but not
     /// always; some target triples have slightly different compiler-rt ABIs for one reason or
     /// another.
-    pub fn name(f: CompilerRtFunc, target: *const std.Target) []const u8 {
+    pub fn name(f: CompilerRtFunc, target: *const std.Target) [:0]const u8 {
         const use_gnu_f16_abi = switch (target.cpu.arch) {
             .wasm32,
             .wasm64,
@@ -2862,6 +2882,12 @@ pub const CompilerRtFunc = enum(u32) {
             .__fixunshfdi, .__fixunssfdi, .__fixunsdfdi, .__fixunsxfdi, .__fixunstfdi => .u64,
             .__fixunshfti, .__fixunssfti, .__fixunsdfti, .__fixunsxfti, .__fixunstfti => .u128,
             .__fixunshfei, .__fixunssfei, .__fixunsdfei, .__fixunsxfei, .__fixunstfei => .void,
+
+            .__mulo_limb64, .__shlo_limb64 => .bool,
+            .__shr_limb64, .__and_limb64, .__or_limb64, .__xor_limb64 => .void,
+            .__not_limb64, .__bitreverse_limb64, .__byteswap_limb64, .__abs_limb64 => .void,
+            .__clz_limb64, .__ctz_limb64, .__popcount_limb64 => .u16,
+            .__udivei5, .__umodei5, .__divei5, .__modei5 => .void,
         };
     }
 };

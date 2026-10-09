@@ -1,0 +1,74 @@
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{d}\n", .{caller(7)});
+}
+fn caller(x: u32) u32 {
+    return helper(x) + helper(x + 1);
+}
+fn helper(x: u32) u32 {
+    return x ^ 1;
+}
+#}
+#update
+#check stdout {
+15
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{d}\n", .{caller(7)});
+}
+fn caller(x: u32) u32 {
+    return helper(x) + helper(x + 1);
+}
+fn helper(x: u32) u32 {
+    var h: u32 = x;
+    var i: u32 = 0;
+    while (i < 16) : (i += 1) {
+        h = h *% 31 +% i;
+        h ^= h >> 7;
+        h +%= switch (i % 4) {
+            0 => 3,
+            1 => h >> 3,
+            2 => h << 2,
+            else => i * i,
+        };
+    }
+    return h % 1000;
+}
+#}
+#update {
+make the callee large#}
+#check stdout {
+1412
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{d}\n", .{caller(7)});
+}
+fn caller(x: u32) u32 {
+    return helper(x) + helper(x + 1);
+}
+fn helper(x: u32) u32 {
+    return x ^ 16;
+}
+#}
+#update {
+make the callee small again#}
+#check stdout {
+47
+#}

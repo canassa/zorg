@@ -917,6 +917,29 @@ pub fn codeAlloc(self: *ZigObject, elf_file: *Elf, atom_index: Atom.Index) ![]u8
     return code;
 }
 
+pub fn clearDeadFrameRanges(self: *ZigObject, elf_file: *Elf, atom_index: Atom.Index, code: []u8) void {
+    const dwarf = if (self.dwarf) |*d| d else return;
+    if (dwarf.debug_frame.header.format != .eh_frame) return;
+    if (self.symbol(self.eh_frame_index.?).ref.index != atom_index) return;
+
+    for (dwarf.debug_frame.section.units.items) |unit| {
+        for (unit.entries.items) |entry| {
+            for (entry.external_relocs.items) |reloc| {
+                const target = self.symbol(@backingInt(reloc.target_sym)).atom(elf_file) orelse continue;
+                if (target.alive) continue;
+
+                // Keep incremental unit/entry offsets stable; object-file FDEs are
+                // separately repacked by Elf/eh_frame.zig. A collected function must
+                // describe an empty range, including when its initial PC is rebased
+                // in a PIE. The CIE encoding determines both address-field widths.
+                assert(Dwarf.eh_frame_pointer_encoding.type == .sdata4 and Dwarf.eh_frame_pointer_encoding.rel == .pcrel);
+                const range_off = unit.off + unit.header_len + entry.off + reloc.source_off + 4;
+                mem.writeInt(u32, code[@intCast(range_off)..][0..4], 0, dwarf.endian);
+            }
+        }
+    }
+}
+
 pub fn navSymbol(
     zo: *ZigObject,
     elf_file: *Elf,
@@ -1948,12 +1971,12 @@ pub fn getGlobalSymbol(self: *ZigObject, elf_file: *Elf, name: []const u8, lib_n
 const max_trampoline_len = 12;
 
 fn trampolineSize(cpu_arch: std.Target.Cpu.Arch) u64 {
-    const len = switch (cpu_arch) {
+    comptime assert(aarch64.trampoline_len <= max_trampoline_len);
+    return switch (cpu_arch) {
         .x86_64 => 5, // jmp rel32
+        .aarch64 => aarch64.trampoline_len,
         else => @panic("TODO implement trampoline size for this CPU arch"),
     };
-    comptime assert(len <= max_trampoline_len);
-    return len;
 }
 
 fn writeTrampoline(tr_sym: Symbol, target: Symbol, elf_file: *Elf) !void {
@@ -1966,6 +1989,7 @@ fn writeTrampoline(tr_sym: Symbol, target: Symbol, elf_file: *Elf) !void {
     var buf: [max_trampoline_len]u8 = undefined;
     const out = switch (elf_file.getTarget().cpu.arch) {
         .x86_64 => try x86_64.writeTrampolineCode(source_addr, target_addr, &buf),
+        .aarch64 => try aarch64.writeTrampolineCode(source_addr, target_addr, &buf),
         else => @panic("TODO implement write trampoline for this CPU arch"),
     };
     try elf_file.base.file.?.writePositionalAll(io, out, fileoff);
@@ -2370,6 +2394,29 @@ const NavTable = std.array_hash_map.Auto(InternPool.Nav.Index, AvMetadata);
 const UavTable = std.array_hash_map.Auto(InternPool.Index, AvMetadata);
 const LazySymbolTable = std.array_hash_map.Auto(InternPool.Index, LazySymbolMetadata);
 const TlsTable = std.array_hash_map.Auto(Atom.Index, void);
+
+const aarch64 = struct {
+    /// `adrp x16, target; add x16, x16, :lo12:target; br x16`, as in `Thunk`: x16 is the
+    /// intra-procedure-call scratch register, which a call may clobber.
+    const trampoline_len = 3 * @sizeOf(u32);
+
+    fn writeTrampolineCode(source_addr: i64, target_addr: i64, buf: *[max_trampoline_len]u8) ![]u8 {
+        dev.checkAny(&.{ .llvm_backend, .aarch64_backend });
+        const out = buf[0..trampoline_len];
+        mem.writeInt(u32, out[0..4], @bitCast(
+            util.encoding.Instruction.adrp(.x16, try util.calcNumberOfPages(source_addr, target_addr) << 12),
+        ), .little);
+        mem.writeInt(u32, out[4..8], @bitCast(util.encoding.Instruction.add(
+            .x16,
+            .x16,
+            .{ .immediate = @truncate(@as(u64, @bitCast(target_addr))) },
+        )), .little);
+        mem.writeInt(u32, out[8..12], @bitCast(util.encoding.Instruction.br(.x16)), .little);
+        return out;
+    }
+
+    const util = @import("../aarch64.zig");
+};
 
 const x86_64 = struct {
     fn writeTrampolineCode(source_addr: i64, target_addr: i64, buf: *[max_trampoline_len]u8) ![]u8 {

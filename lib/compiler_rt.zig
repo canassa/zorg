@@ -133,7 +133,8 @@ comptime {
     _ = @import("compiler_rt/divmodei4.zig");
     _ = @import("compiler_rt/udivmodei4.zig");
 
-    if (builtin.cpu.arch.isWasm()) _ = @import("compiler_rt/limb64.zig");
+    // Wide integer helpers used by the self-hosted wasm and aarch64 backends.
+    if (builtin.cpu.arch.isWasm() or builtin.cpu.arch.isAARCH64()) _ = @import("compiler_rt/limb64.zig");
 
     // extra
     _ = @import("compiler_rt/os_version_check.zig");

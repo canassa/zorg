@@ -1,0 +1,97 @@
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{d}\n", .{a(5)});
+}
+fn a(x: u32) u32 {
+    return b(x) + 1;
+}
+fn b(x: u32) u32 {
+    return c(x) * 2;
+}
+fn c(x: u32) u32 {
+    return x + 1;
+}
+#}
+#update
+#check stdout {
+13
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{d}\n", .{a(5)});
+}
+fn a(x: u32) u32 {
+    return b(x) + 1;
+}
+fn b(x: u32) u32 {
+    return c(x) * 2;
+}
+fn c(x: u32) u32 {
+    return x + 10;
+}
+#}
+#update {
+change the innermost callee#}
+#check stdout {
+31
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{d}\n", .{a(5)});
+}
+fn a(x: u32) u32 {
+    return b(x) + 1;
+}
+fn b(x: u32) u32 {
+    return c(x) * 3;
+}
+fn c(x: u32) u32 {
+    return x + 10;
+}
+#}
+#update {
+change the middle callee#}
+#check stdout {
+46
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{d}\n", .{a(5)});
+}
+fn a(x: u32) u32 {
+    return b(x) + 1;
+}
+fn b(x: u32) u32 {
+    return c(x) * 3;
+}
+fn c(x: u32) u32 {
+    return d(x) + 10;
+}
+fn d(x: u32) u32 {
+    return x * x;
+}
+#}
+#update {
+change the innermost callee to call a new function#}
+#check stdout {
+106
+#}

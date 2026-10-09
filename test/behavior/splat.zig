@@ -79,7 +79,6 @@ test "@splat zero-length array" {
 }
 
 test "splat with an error union or optional result type" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
 
     const S = struct {
         fn doTest(T: type) !?T {
@@ -113,7 +112,6 @@ test "read/write through global variable array of struct fields initialized via 
 }
 
 test "vector @splat" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;

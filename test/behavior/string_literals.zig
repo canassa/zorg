@@ -60,7 +60,6 @@ fn testFnForSrc() std.builtin.SourceLocation {
 }
 
 test "@src() returns a struct containing 0-terminated string slices" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 

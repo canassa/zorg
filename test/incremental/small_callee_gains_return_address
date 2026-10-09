@@ -1,0 +1,77 @@
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{s}\n", .{caller()});
+}
+noinline fn caller() []const u8 {
+    const r = helper();
+    const entry = @intFromPtr(&caller);
+    if (r == 1234) return "constant";
+    if (r == @returnAddress()) return "caller's return address";
+    if (r > entry and r - entry < 4096) return "inside caller";
+    return "elsewhere";
+}
+fn helper() usize {
+    return 1234;
+}
+#}
+#update
+#check stdout {
+constant
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{s}\n", .{caller()});
+}
+noinline fn caller() []const u8 {
+    const r = helper();
+    const entry = @intFromPtr(&caller);
+    if (r == 1234) return "constant";
+    if (r == @returnAddress()) return "caller's return address";
+    if (r > entry and r - entry < 4096) return "inside caller";
+    return "elsewhere";
+}
+fn helper() usize {
+    return @returnAddress();
+}
+#}
+#update {
+use @returnAddress in the callee#}
+#check stdout {
+inside caller
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{s}\n", .{caller()});
+}
+noinline fn caller() []const u8 {
+    const r = helper();
+    const entry = @intFromPtr(&caller);
+    if (r == 1234) return "constant";
+    if (r == @returnAddress()) return "caller's return address";
+    if (r > entry and r - entry < 4096) return "inside caller";
+    return "elsewhere";
+}
+fn helper() usize {
+    return 1234;
+}
+#}
+#update {
+stop using @returnAddress#}
+#check stdout {
+constant
+#}

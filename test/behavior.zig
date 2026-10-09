@@ -2,10 +2,12 @@ const builtin = @import("builtin");
 
 test {
     _ = @import("behavior/addrspace_and_linksection.zig");
+    _ = @import("behavior/aggregate_copies.zig");
     _ = @import("behavior/align.zig");
     _ = @import("behavior/alignof.zig");
     _ = @import("behavior/array.zig");
     _ = @import("behavior/atomics.zig");
+    _ = @import("behavior/auto_inline.zig");
     _ = @import("behavior/backing_int.zig");
     _ = @import("behavior/basic.zig");
     _ = @import("behavior/bit_shifting.zig");
@@ -18,6 +20,9 @@ test {
     _ = @import("behavior/call.zig");
     _ = @import("behavior/cast.zig");
     _ = @import("behavior/cast_int.zig");
+    _ = @import("behavior/cmp_branch.zig");
+    _ = @import("behavior/promoted_locals.zig");
+    _ = @import("behavior/error_union_registers.zig");
     _ = @import("behavior/comptime_memory.zig");
     _ = @import("behavior/const_slice_child.zig");
     _ = @import("behavior/decl_literals.zig");
@@ -42,9 +47,12 @@ test {
     _ = @import("behavior/if.zig");
     _ = @import("behavior/import.zig");
     _ = @import("behavior/incomplete_struct_param_tld.zig");
+    _ = @import("behavior/inline_candidates.zig");
     _ = @import("behavior/inline_switch.zig");
     _ = @import("behavior/int128.zig");
     _ = @import("behavior/int_comparison_elision.zig");
+    _ = @import("behavior/int_immediate.zig");
+    _ = @import("behavior/narrow_int_uses.zig");
     _ = @import("behavior/ptrfromint.zig");
     _ = @import("behavior/ir_block_deps.zig");
     _ = @import("behavior/lower_strlit_to_vector.zig");
@@ -73,14 +81,17 @@ test {
     _ = @import("behavior/ref_var_in_if_after_if_2nd_switch_prong.zig");
     _ = @import("behavior/reflection.zig");
     _ = @import("behavior/return_address.zig");
+    _ = @import("behavior/rotate.zig");
     _ = @import("behavior/saturating_arithmetic.zig");
     _ = @import("behavior/select.zig");
     _ = @import("behavior/shuffle.zig");
     _ = @import("behavior/sizeof_and_typeof.zig");
     _ = @import("behavior/slice.zig");
     _ = @import("behavior/slice_sentinel_comptime.zig");
+    _ = @import("behavior/small_index.zig");
     _ = @import("behavior/splat.zig");
     _ = @import("behavior/src.zig");
+    _ = @import("behavior/stack_locals.zig");
     _ = @import("behavior/string_literals.zig");
     _ = @import("behavior/struct.zig");
     _ = @import("behavior/struct_contains_null_ptr_itself.zig");

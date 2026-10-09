@@ -496,6 +496,9 @@ pub fn generateSymbol(
                 },
             },
             .vector_type => |vector_type| {
+                const elem_ty: Type = .fromInterned(vector_type.child);
+                const packed_int = zcu.comp.getZigBackend() == .stage2_aarch64 and endian == .little and
+                    elem_ty.zigTypeTag(zcu) == .int and elem_ty.bitSize(zcu) != 8 * elem_ty.abiSize(zcu);
                 const vector_bool_bitpacked = switch (zcu.comp.getZigBackend()) {
                     .stage2_wasm => false,
                     else => true,
@@ -539,6 +542,22 @@ pub fn generateSymbol(
                                 else => unreachable,
                             },
                         }) byte.* |= mask else byte.* &= ~mask;
+                    }
+                } else if (packed_int) {
+                    const bytes = try w.writableSlice(abi_size);
+                    @memset(bytes, 0xaa);
+                    const elem_bits: usize = @intCast(elem_ty.bitSize(zcu));
+                    const len: usize = @intCast(vector_type.len);
+                    for (0..len) |index| {
+                        const elem = switch (aggregate.storage) {
+                            .bytes => unreachable,
+                            .elems => |elems| elems[index],
+                            .repeated_elem => |elem| elem,
+                        };
+                        if (ip.indexToKey(elem) == .undef) continue;
+                        var space: Value.BigIntSpace = undefined;
+                        const int_val = Value.fromInterned(elem).toBigInt(&space, zcu);
+                        int_val.writePackedTwosComplement(bytes, index * elem_bits, elem_bits, .little);
                     }
                 } else {
                     switch (aggregate.storage) {

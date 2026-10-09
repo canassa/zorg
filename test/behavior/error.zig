@@ -524,7 +524,6 @@ test "function pointer with return type that is error union with payload which i
 }
 
 test "return result loc as peer result loc in inferred error set function" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -1042,7 +1041,6 @@ test "@errorCast from error union to error union" {
 }
 
 test "result location initialization of error union with OPV payload" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -1143,4 +1141,166 @@ test "error union with vector type" {
     var x: anyerror!@Vector(5, f64) = undefined;
     x = error.Expected;
     try expect(x == error.Expected);
+}
+
+test "try on large error union payloads with deferred calls and large frames" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        fn Test(comptime words: usize, comptime frame_bytes: usize) type {
+            return struct {
+                const Payload = extern struct { words: [words]usize };
+                var effects: u32 = 0;
+                noinline fn note() void {
+                    @as(*volatile u32, &effects).* += 1;
+                }
+                noinline fn produce(input: *const Payload, succeed: bool) error{Failed}!Payload {
+                    if (!succeed) return error.Failed;
+                    return input.*;
+                }
+                noinline fn unwrap(input: *const Payload, succeed: bool) error{Failed}!Payload {
+                    var padding: [frame_bytes]u8 = undefined;
+                    const observed: *volatile [frame_bytes]u8 = &padding;
+                    observed[0] = 0x61;
+                    observed[frame_bytes - 1] = 0x71;
+                    defer note();
+                    const result = try produce(input, succeed);
+                    if (observed[0] != 0x61 or observed[frame_bytes - 1] != 0x71) return error.Failed;
+                    if (input.words[0] != 1) return error.Failed;
+                    return result;
+                }
+                fn run() !void {
+                    var input: Payload = undefined;
+                    for (&input.words, 0..) |*word, index| word.* = index + 1;
+                    var flag = true;
+                    const runtime_flag: *volatile bool = &flag;
+                    const output = try unwrap(&input, runtime_flag.*);
+                    const observed: *const volatile Payload = &output;
+                    for (0..words) |index| try expect(observed.words[index] == index + 1);
+                    try std.testing.expectError(error.Failed, unwrap(&input, !runtime_flag.*));
+                    try expect(effects == 2);
+                }
+            };
+        }
+    };
+    try S.Test(27, 2).run();
+    try S.Test(27, 12288).run();
+    try S.Test(1100, 2).run();
+}
+
+test "error union payload keeps its last byte before padding" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        const Resolved = struct {
+            tag: enum(u8) { first, second },
+            lhs: u32,
+            rhs: u32,
+        };
+        noinline fn resolve(which: bool, fail: bool) error{Missing}!Resolved {
+            if (fail) return error.Missing;
+            return .{ .tag = if (which) .first else .second, .lhs = 0x12345678, .rhs = 0x87654321 };
+        }
+        noinline fn rewrite(which: bool, fail: bool) error{Missing}!u64 {
+            const resolved = try resolve(which, fail);
+            return ((@as(u64, resolved.lhs) << 32) | resolved.rhs) ^ @backingInt(resolved.tag);
+        }
+    };
+    try expect(try S.rewrite(true, false) == 0x1234567887654321);
+    try expect(try S.rewrite(false, false) == 0x1234567887654320);
+    try std.testing.expectError(error.Missing, S.rewrite(false, true));
+}
+
+test "try forwards errors and payload pointers" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        const Failure = error{ First, Second };
+        const Packet = struct { ptr: *u8, len: usize, token: u64 };
+        noinline fn produce(fail: bool, ptr: *u8) Failure!Packet {
+            if (fail) return error.First;
+            return .{ .ptr = ptr, .len = 4, .token = 0x123456789abcdef0 };
+        }
+        noinline fn consume(fail: bool, ptr: *u8) Failure!u64 {
+            const packet = try produce(fail, ptr);
+            if (packet.ptr != ptr or packet.len != 4) return error.Second;
+            return packet.token;
+        }
+        noinline fn payloadPtr(comptime T: type, ptr: *Failure!T) Failure!*T {
+            return &(try ptr.*);
+        }
+    };
+    var byte: u8 = 19;
+    try expect(try S.consume(false, &byte) == 0x123456789abcdef0);
+    if (S.consume(true, &byte)) |_| return error.TestUnexpectedResult else |err| try expect(err == error.First);
+    inline for (.{ u8, u64 }) |T| {
+        var value: S.Failure!T = @as(T, 71);
+        const ptr = try S.payloadPtr(T, &value);
+        ptr.* = 29;
+        try expect(try value == 29);
+        value = error.Second;
+        if (S.payloadPtr(T, &value)) |_| return error.TestUnexpectedResult else |err| try expect(err == error.Second);
+    }
+}
+
+test "assign a zero-bit payload to an error union through a pointer" {
+    const S = struct {
+        const Empty = struct { map: void };
+        noinline fn setVoid(ptr: *error{Unexpected}!void) void {
+            ptr.* = {};
+        }
+        noinline fn setStruct(ptr: *error{Unexpected}!Empty) void {
+            ptr.* = .{ .map = {} };
+        }
+    };
+    var empty_void: error{Unexpected}!void = error.Unexpected;
+    S.setVoid(&empty_void);
+    try empty_void;
+    var empty_struct: error{Unexpected}!S.Empty = error.Unexpected;
+    S.setStruct(&empty_struct);
+    _ = try empty_struct;
+}
+
+test "@errorName in a tuple next to a float" {
+    const S = struct {
+        var len: usize = 0;
+        var float: f64 = 0;
+        noinline fn take(args: anytype) void {
+            len = args[0].len;
+            float = args[1];
+        }
+        noinline fn name(err: anyerror, x: f64) void {
+            take(.{ @errorName(err), x });
+        }
+    };
+    S.name(error.TupleFloat, 1.5);
+    try expectEqual(@as(usize, "TupleFloat".len), S.len);
+    try expectEqual(@as(f64, 1.5), S.float);
+}
+
+test "compare optional error sets" {
+    const E = error{ A, B };
+    const S = struct {
+        noinline fn eql(a: ?anyerror, b: ?anyerror) bool {
+            return a == b;
+        }
+        noinline fn neq(a: ?E, b: ?E) bool {
+            return a != b;
+        }
+    };
+    try expect(S.eql(null, null));
+    try expect(!S.eql(error.A, null));
+    try expect(!S.eql(null, error.A));
+    try expect(S.eql(error.A, error.A));
+    try expect(!S.eql(error.A, error.B));
+    try expect(!S.neq(null, null));
+    try expect(S.neq(error.A, null));
+    try expect(!S.neq(error.B, error.B));
+    try expect(S.neq(error.A, error.B));
 }

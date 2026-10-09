@@ -299,7 +299,6 @@ test "branching inside tuple literal" {
 }
 
 test "tuple initialized with a runtime known value" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
@@ -568,4 +567,48 @@ test "call function at comptime through container-level const tuple" {
         }
     };
     comptime assert(static.val[0]() == 1234);
+}
+
+test "format a tuple containing a runtime union" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const CheckDiagnostic = std.Build.Cache.Manifest.CheckDiagnostic;
+    const S = struct {
+        noinline fn write(diagnostic: CheckDiagnostic, writer: *std.Io.Writer) !void {
+            return diagnostic.fmt(undefined).format(writer);
+        }
+    };
+    var buffer: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try S.write(.{ .manifest_create = error.AccessDenied }, &writer);
+    try expectEqualStrings("manifest_create AccessDenied", writer.buffered());
+}
+
+test "tuple initialized from a struct whose parts straddle the tuple's parts" {
+    const Inner = struct {
+        tag: struct { number: u16, constructed: bool, class: enum(u2) { a, b, c, d } },
+        slice: struct { start: u32, end: u32 },
+    };
+    const S = struct {
+        fn check(args: anytype) !void {
+            try expect(args[0] == error.EndOfStream);
+            try expect(args[1].tag.number == 16);
+            try expect(args[1].tag.constructed);
+            try expect(args[1].tag.class == .c);
+            try expect(args[1].slice.start == 2);
+            try expect(args[1].slice.end == 5);
+        }
+
+        fn pair(e: error{ EndOfStream, InvalidEncoding }!Inner, payload: Inner) !void {
+            if (e) |_| {} else |err| try check(.{ err, payload });
+        }
+    };
+    var inner: Inner = .{
+        .tag = .{ .number = 16, .constructed = true, .class = .c },
+        .slice = .{ .start = 2, .end = 5 },
+    };
+    _ = &inner;
+    try S.pair(error.EndOfStream, inner);
 }

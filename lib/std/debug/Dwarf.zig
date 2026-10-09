@@ -314,6 +314,15 @@ const PcRange = struct {
 const Func = struct {
     pc_range: ?PcRange,
     name: ?[]const u8,
+    /// For an inlined call (`DW_TAG_inlined_subroutine`), where it is in the caller.
+    call_site: ?CallSite = null,
+};
+
+const CallSite = struct {
+    /// An index into the line number program's file table, like `LineEntry.file`.
+    file: u32,
+    line: u32,
+    column: u32,
 };
 
 pub fn section(di: Dwarf, dwarf_section: Section.Id) ?[]const u8 {
@@ -509,6 +518,20 @@ fn scanAllFunctions(di: *Dwarf, gpa: Allocator, endian: Endian) ScanError!void {
                         break :x null;
                     };
 
+                    const call_site: ?CallSite = call_site: {
+                        if (die_obj.tag_id != DW.TAG.inlined_subroutine) break :call_site null;
+                        const file = die_obj.getAttr(AT.call_file) orelse break :call_site null;
+                        const line = die_obj.getAttr(AT.call_line) orelse break :call_site null;
+                        break :call_site .{
+                            .file = file.getUInt(u32) catch break :call_site null,
+                            .line = line.getUInt(u32) catch break :call_site null,
+                            .column = if (die_obj.getAttr(AT.call_column)) |column|
+                                column.getUInt(u32) catch 0
+                            else
+                                0,
+                        };
+                    };
+
                     var range_added = if (die_obj.getAttrAddr(di, endian, AT.low_pc, &compile_unit)) |low_pc| blk: {
                         if (die_obj.getAttr(AT.high_pc)) |high_pc_value| {
                             const pc_end = switch (high_pc_value.*) {
@@ -523,6 +546,7 @@ fn scanAllFunctions(di: *Dwarf, gpa: Allocator, endian: Endian) ScanError!void {
                                     .start = low_pc,
                                     .end = pc_end,
                                 },
+                                .call_site = call_site,
                             });
 
                             break :blk true;
@@ -548,6 +572,7 @@ fn scanAllFunctions(di: *Dwarf, gpa: Allocator, endian: Endian) ScanError!void {
                                     .start = range.start,
                                     .end = range.end,
                                 },
+                                .call_site = call_site,
                             });
                         }
                     }
@@ -1305,17 +1330,60 @@ pub fn getLineNumberInfo(
     try d.populateSrcLocCache(gpa, endian, compile_unit);
     const slc = &compile_unit.src_loc_cache.?;
     const entry = try slc.findSource(target_address);
-    const file_index = entry.file - @intFromBool(slc.version < 5);
+    return .{
+        .line = entry.line,
+        .column = entry.column,
+        .file_name = try fileName(slc, text_arena, entry.file),
+    };
+}
+
+/// The path of `file`, an index into the line number program's file table.
+fn fileName(slc: *const CompileUnit.SrcLocCache, text_arena: Allocator, file: u32) ![]const u8 {
+    const file_index = std.math.sub(u32, file, @intFromBool(slc.version < 5)) catch return bad();
     if (file_index >= slc.files.len) return bad();
     const file_entry = &slc.files[file_index];
     if (file_entry.dir_index >= slc.directories.len) return bad();
     const dir_name = slc.directories[file_entry.dir_index].path;
-    const file_name = try std.fs.path.join(text_arena, &.{ dir_name, file_entry.path });
-    return .{
-        .line = entry.line,
-        .column = entry.column,
-        .file_name = file_name,
-    };
+    return std.fs.path.join(text_arena, &.{ dir_name, file_entry.path });
+}
+
+/// Appends a symbol for each call inlined at `address`, after the symbol of the innermost
+/// function: the function the call is in, at the call site, from the innermost call outwards.
+pub fn appendInlineCallers(
+    di: *Dwarf,
+    gpa: Allocator,
+    symbol_allocator: Allocator,
+    text_arena: Allocator,
+    endian: Endian,
+    compile_unit: *CompileUnit,
+    address: u64,
+    symbols: *std.ArrayList(std.debug.Symbol),
+) !void {
+    // `func_list` is in DIE order, so a function comes before the calls inlined into it, and
+    // the functions containing `address` are the nested inlined calls, outermost first.
+    var chain: std.ArrayList(*const Func) = .empty;
+    defer chain.deinit(gpa);
+    for (di.func_list.items) |*func| {
+        const range = func.pc_range orelse continue;
+        if (address >= range.start and address < range.end) try chain.append(gpa, func);
+    }
+    if (chain.items.len < 2) return;
+    try di.populateSrcLocCache(gpa, endian, compile_unit);
+    const slc = &compile_unit.src_loc_cache.?;
+    const compile_unit_name = if (symbols.items.len > 0) symbols.items[symbols.items.len - 1].compile_unit_name else null;
+    var index = chain.items.len - 1;
+    while (index > 0) : (index -= 1) {
+        const call_site = chain.items[index].call_site orelse return;
+        try symbols.append(symbol_allocator, .{
+            .name = chain.items[index - 1].name,
+            .compile_unit_name = compile_unit_name,
+            .source_location = .{
+                .line = call_site.line,
+                .column = call_site.column,
+                .file_name = fileName(slc, text_arena, call_site.file) catch return,
+            },
+        });
+    }
 }
 
 fn getString(di: Dwarf, offset: u64) ![:0]const u8 {
@@ -1644,7 +1712,6 @@ pub fn getSymbols(
     resolve_inline_callers: bool,
     symbols: *std.ArrayList(std.debug.Symbol),
 ) std.debug.SelfInfoError!void {
-    _ = resolve_inline_callers;
     const gpa = std.debug.getDebugInfoAllocator();
 
     const compile_unit = di.findCompileUnit(endian, address) catch |err| switch (err) {
@@ -1667,6 +1734,11 @@ pub fn getSymbols(
             else => |e| return e,
         },
     });
+    if (resolve_inline_callers) di.appendInlineCallers(gpa, symbol_allocator, text_arena, endian, compile_unit, address, symbols) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        // The innermost frame is still useful.
+        else => {},
+    };
 }
 
 /// DWARF5 7.4: "In the 32-bit DWARF format, all values that represent lengths of DWARF sections and

@@ -31,7 +31,7 @@ pub fn hash(opts: @This()) [std.Build.Cache.bin_digest_len]u8 {
             std.hash.autoHash(&h, opts.target.os.versionRange());
             std.hash.autoHash(&h, opts.target.abi);
             std.hash.autoHash(&h, opts.target.ofmt);
-            std.hash.autoHash(&h, opts.target.dynamic_linker);
+            std.hash.autoHashStrat(&h, opts.target.dynamic_linker.get(), .Deep);
         } else {
             std.hash.autoHash(&h, @field(opts, f_name));
         }
@@ -380,3 +380,33 @@ const AstGen = std.zig.AstGen;
 const File = @import("Zcu.zig").File;
 const Compilation = @import("Compilation.zig");
 const log = std.log.scoped(.builtin);
+
+test "hash does not depend on the unused bytes of the dynamic linker buffer" {
+    var opts: @This() = .{
+        .target = builtin.target,
+        .zig_backend = .stage2_aarch64,
+        .output_mode = .Exe,
+        .link_mode = .static,
+        .unwind_tables = .none,
+        .is_test = false,
+        .single_threaded = false,
+        .link_libc = false,
+        .link_libcpp = false,
+        .optimize_mode = .Debug,
+        .error_tracing = false,
+        .valgrind = false,
+        .sanitize_thread = false,
+        .fuzz = false,
+        .pic = false,
+        .pie = false,
+        .strip = false,
+        .code_model = .default,
+        .omit_frame_pointer = false,
+        .wasi_exec_model = .command,
+    };
+    opts.target.dynamic_linker.buffer = @splat(0xaa);
+    opts.target.dynamic_linker.set("/lib/ld.so");
+    const expected = opts.hash();
+    opts.target.dynamic_linker.buffer["/lib/ld.so".len] = 0x55;
+    try std.testing.expectEqual(expected, opts.hash());
+}

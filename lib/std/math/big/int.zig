@@ -4247,8 +4247,7 @@ fn llsignedor(r: []Limb, a: []const Limb, a_positive: bool, b: []const Limb, b_p
         assert(r_carry == 0);
 
         // With b = 0, we get (-a - 1) & ~0 = -a - 1.
-        // Note, if a_borrow is zero we do not need to compute anything for
-        // the higher limbs so we can early return here.
+        // Once a_borrow is zero the higher limbs are those of a.
         while (i < a.len and a_borrow == 1) : (i += 1) {
             const ov = @subWithOverflow(a[i], a_borrow);
             r[i] = ov[0];
@@ -4256,6 +4255,11 @@ fn llsignedor(r: []Limb, a: []const Limb, a_positive: bool, b: []const Limb, b_p
         }
 
         assert(a_borrow == 0); // a was 0.
+
+        // r may not alias a.
+        while (i < a.len) : (i += 1) {
+            r[i] = a[i];
+        }
 
         return false;
     } else if (a_positive and !b_positive) {

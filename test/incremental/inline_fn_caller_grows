@@ -1,0 +1,67 @@
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    var x: u32 = 1;
+    _ = &x;
+    try std.Io.File.stdout().writeStreamingAll(io, if (twice(x) == 2) "a\n" else "b\n");
+}
+inline fn twice(x: u32) u32 {
+    return x * 2;
+}
+fn other(x: u32) u32 {
+    return twice(x) + 1;
+}
+comptime {
+    _ = &other;
+}
+#}
+#update
+#check stdout {
+a
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    var x: u32 = 1;
+    _ = &x;
+    var y: u32 = twice(x);
+    y += twice(y);
+    y += twice(y);
+    y += twice(y);
+    y += twice(y);
+    y += twice(y);
+    y += twice(y);
+    y += twice(y);
+    y += twice(y);
+    y += twice(y);
+    y += twice(y);
+    y += twice(y);
+    y += twice(y);
+    y += twice(y);
+    y += twice(y);
+    y += twice(y);
+    try std.Io.File.stdout().writeStreamingAll(io, if (y != 0) "a\n" else "b\n");
+}
+inline fn twice(x: u32) u32 {
+    return x * 2;
+}
+fn other(x: u32) u32 {
+    return twice(x) + 1;
+}
+comptime {
+    _ = &other;
+}
+#}
+#update {
+grow main
+#}
+#check stdout {
+a
+#}

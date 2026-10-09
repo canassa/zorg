@@ -1372,6 +1372,18 @@ pub fn init(lf: *link.File, format: DW.Format) Dwarf {
                         .{ .offset = .{ .reg = Register.rip.dwarfNum(), .off = -8 } },
                     },
                 };
+            } else if (target.cpu.arch == .aarch64 or target.cpu.arch == .aarch64_be) header: {
+                dev.checkAny(&.{ .llvm_backend, .aarch64_backend });
+                const Register = @import("../codegen/aarch64/encoding.zig").Register;
+                break :header comptime .{
+                    .code_alignment_factor = 1,
+                    .data_alignment_factor = -8,
+                    .return_address_register = Register.Alias.lr.dwarfNum(),
+                    .initial_instructions = &.{
+                        .{ .def_cfa = .{ .reg = Register.Alias.sp.dwarfNum(), .off = 0 } },
+                        .{ .same_value = Register.Alias.lr.dwarfNum() },
+                    },
+                };
             } else .{
                 .code_alignment_factor = undefined,
                 .data_alignment_factor = undefined,
@@ -1805,6 +1817,32 @@ pub fn genDebugFrameCie(
             try df_w.writeByte(@as(u8, DW.CFA.offset) + Register.rip.dwarfNum());
             try df_w.writeUleb128(1);
         },
+        .aarch64, .aarch64_be => {
+            dev.checkAny(&.{ .llvm_backend, .aarch64_backend });
+            const Register = @import("../codegen/aarch64/encoding.zig").Register;
+            switch (format) {
+                .eh_frame => try df_w.writeAll("zR\x00"),
+                .debug_frame => try df_w.writeAll("\x00" ++ .{ @backingInt(dwarf.address_size), 0 }),
+            }
+            try df_w.writeUleb128(dwarf.frame.header.code_alignment_factor);
+            try df_w.writeSleb128(dwarf.frame.header.data_alignment_factor);
+            switch (format) {
+                .eh_frame => try df_w.writeByte(@intCast(dwarf.frame.header.return_address_register)),
+                .debug_frame => try df_w.writeUleb128(dwarf.frame.header.return_address_register),
+            }
+            switch (format) {
+                .eh_frame => {
+                    try df_w.writeUleb128(1);
+                    try df_w.writeByte(@bitCast(@as(DW.EH.PE, .{ .type = .sdata4, .rel = .pcrel })));
+                },
+                .debug_frame => {},
+            }
+            try df_w.writeByte(DW.CFA.def_cfa);
+            try df_w.writeUleb128(Register.Alias.sp.dwarfNum());
+            try df_w.writeUleb128(0);
+            try df_w.writeByte(DW.CFA.same_value);
+            try df_w.writeUleb128(Register.Alias.lr.dwarfNum());
+        },
     }
     @memset(df_w.unusedCapacitySlice(), DW.CFA.nop);
 }
@@ -2038,7 +2076,7 @@ pub fn genDebugLinePadding(dl_w: *std.Io.Writer, size: u64) std.Io.Writer.Error!
                 },
                 .gt => op_len_size += 1,
             };
-            try dl_w.writeByte(DW.LNE.padding);
+            try dl_w.writeByte(line_padding_opcode);
         },
     }
 }
@@ -6309,6 +6347,9 @@ const codegen = @import("../codegen.zig");
 const Compilation = @import("../Compilation.zig");
 const dev = @import("../dev.zig");
 const DW = std.dwarf;
+// Unknown extended opcodes must be skipped. Do not use lo_user: readelf
+// recognizes it as HP_source_file_correlation and decodes the padding bytes.
+const line_padding_opcode = DW.LNE.hi_user;
 const Dwarf = @This();
 const InternPool = @import("../InternPool.zig");
 const link = @import("../link.zig");

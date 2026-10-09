@@ -398,6 +398,8 @@ pub fn zeroes(comptime T: type) T {
 }
 
 test zeroes {
+    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // copies of an extern struct do not keep its padding (test/behavior/struct.zig)
+
     const C_struct = extern struct {
         x: u32,
         y: u32 align(128),

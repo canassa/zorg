@@ -437,6 +437,33 @@
             .amount = .amount,
         } } },
     },
+    // C6.2.10 ADR
+    .{
+        .pattern = "ADR <Xd>, .",
+        .symbols = .{
+            .Xd = .{ .reg = .{ .format = .{ .general = .doubleword } } },
+        },
+        .encode = .{ .adr, .Xd, 0 },
+    },
+    // C6.2.12 AND (immediate)
+    .{
+        .pattern = "AND <Wd|WSP>, <Wn>, #<imm>",
+        .symbols = .{
+            .Wd = .{ .reg = .{ .format = .{ .general = .word }, .allow_sp = true } },
+            .Wn = .{ .reg = .{ .format = .{ .general = .word } } },
+            .imm = .{ .logical_imm = .word },
+        },
+        .encode = .{ .@"and", .Wd, .Wn, .{ .immediate = .imm } },
+    },
+    .{
+        .pattern = "AND <Xd|SP>, <Xn>, #<imm>",
+        .symbols = .{
+            .Xd = .{ .reg = .{ .format = .{ .general = .doubleword }, .allow_sp = true } },
+            .Xn = .{ .reg = .{ .format = .{ .general = .doubleword } } },
+            .imm = .{ .logical_imm = .doubleword },
+        },
+        .encode = .{ .@"and", .Xd, .Xn, .{ .immediate = .imm } },
+    },
     // C6.2.13 AND (shifted register)
     .{
         .pattern = "AND <Wd>, <Wn>, <Wm>",
@@ -660,6 +687,22 @@
         },
         .encode = .{ .bfm, .Xd, .Xn, .{ .N = .doubleword, .immr = .immr, .imms = .imms } },
     },
+    // C6.2.26 B
+    .{
+        .pattern = "B <label>",
+        .symbols = .{
+            .label = .{ .imm = .{ .type = .{ .signedness = .signed, .bits = 28 }, .multiple_of = 4 } },
+        },
+        .encode = .{ .b, .label },
+    },
+    // C6.2.34 BL
+    .{
+        .pattern = "BL <label>",
+        .symbols = .{
+            .label = .{ .imm = .{ .type = .{ .signedness = .signed, .bits = 28 }, .multiple_of = 4 } },
+        },
+        .encode = .{ .bl, .label },
+    },
     // C6.2.35 BLR
     .{
         .pattern = "BLR <Xn>",
@@ -683,6 +726,39 @@
             .imm = .{ .imm = .{ .type = .{ .signedness = .unsigned, .bits = 16 } } },
         },
         .encode = .{ .brk, .imm },
+    },
+    // C6.2.46 CBNZ / C6.2.47 CBZ
+    .{
+        .pattern = "CBNZ <Wt>, <label>",
+        .symbols = .{
+            .Wt = .{ .reg = .{ .format = .{ .general = .word } } },
+            .label = .{ .imm = .{ .type = .{ .signedness = .signed, .bits = 21 }, .multiple_of = 4 } },
+        },
+        .encode = .{ .cbnz, .Wt, .label },
+    },
+    .{
+        .pattern = "CBNZ <Xt>, <label>",
+        .symbols = .{
+            .Xt = .{ .reg = .{ .format = .{ .general = .doubleword } } },
+            .label = .{ .imm = .{ .type = .{ .signedness = .signed, .bits = 21 }, .multiple_of = 4 } },
+        },
+        .encode = .{ .cbnz, .Xt, .label },
+    },
+    .{
+        .pattern = "CBZ <Wt>, <label>",
+        .symbols = .{
+            .Wt = .{ .reg = .{ .format = .{ .general = .word } } },
+            .label = .{ .imm = .{ .type = .{ .signedness = .signed, .bits = 21 }, .multiple_of = 4 } },
+        },
+        .encode = .{ .cbz, .Wt, .label },
+    },
+    .{
+        .pattern = "CBZ <Xt>, <label>",
+        .symbols = .{
+            .Xt = .{ .reg = .{ .format = .{ .general = .doubleword } } },
+            .label = .{ .imm = .{ .type = .{ .signedness = .signed, .bits = 21 }, .multiple_of = 4 } },
+        },
+        .encode = .{ .cbz, .Xt, .label },
     },
     // C6.2.52 CFINV
     .{
@@ -2446,6 +2522,15 @@
             .imm = .{ .imm = .{ .type = .{ .signedness = .unsigned, .bits = 16 } } },
         },
         .encode = .{ .tcancel, .imm },
+    },
+    // C6.2.403 UXTW (alias of UBFM)
+    .{
+        .pattern = "UXTW <Xd>, <Wn>",
+        .symbols = .{
+            .Xd = .{ .reg = .{ .format = .{ .general = .doubleword } } },
+            .Wn = .{ .reg = .{ .format = .{ .general = .word } } },
+        },
+        .encode = .{ .uxtw, .Xd, .Wn },
     },
     // C6.2.385 UBFM
     .{

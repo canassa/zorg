@@ -41,7 +41,6 @@ fn testSwitchWithAllRanges(x: u32, y: u32) u32 {
 }
 
 test "switch arbitrary int size" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest; // TODO
@@ -267,7 +266,6 @@ const SwitchProngWithVarEnum = union(enum) {
 };
 
 test "switch prong with variable" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
@@ -673,7 +671,6 @@ test "switch prong pointer capture alignment" {
 }
 
 test "switch on pointer type" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_llvm) return error.SkipZigTest; // https://github.com/llvm/llvm-project/issues/176634
@@ -828,7 +825,6 @@ test "switch capture peer type resolution" {
 }
 
 test "switch capture peer type resolution for in-memory coercible payloads" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
 
     const T1 = c_int;
     const t1_info = @typeInfo(T1).int;
@@ -851,7 +847,6 @@ test "switch capture peer type resolution for in-memory coercible payloads" {
 }
 
 test "switch pointer capture peer type resolution" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const T1 = c_int;
@@ -891,7 +886,6 @@ test "inline switch range that includes the maximum value of the switched type" 
 }
 
 test "nested break ignores switch conditions and breaks instead" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
@@ -1027,7 +1021,6 @@ test "labeled switch with break" {
 }
 
 test "unlabeled break ignores switch" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -1567,4 +1560,305 @@ test "union field pointer capture preserves alignment in inline prong" {
     try U.doTheTest(&.{ .b = 123 });
     try comptime U.doTheTest(&.{ .a = 123 });
     try comptime U.doTheTest(&.{ .b = 123 });
+}
+
+test "switch on runtime values with many ranges" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        noinline fn classify(value: u8) u8 {
+            return switch (value) {
+                0...0x1f => 0,
+                0x20...('"' - 1), ('"' + 1)...('\\' - 1), ('\\' + 1)...0x7f => 1,
+                '"' => 2,
+                '\\' => 3,
+                0x80...0xff => 4,
+            };
+        }
+        noinline fn signedRange(value: i64) u8 {
+            return switch (value) {
+                -900...-800, -400...-350, 1000...1100 => 1,
+                else => 0,
+            };
+        }
+    };
+    var input: u8 = 0;
+    const ptr: *volatile u8 = &input;
+    for (0..256) |index| {
+        ptr.* = @intCast(index);
+        const value = ptr.*;
+        const expected: u8 = if (value < 0x20) 0 else if (value == '"') 2 else if (value == '\\') 3 else if (value < 0x80) 1 else 4;
+        try expect(S.classify(value) == expected);
+    }
+    var signed: i64 = 0;
+    const signed_ptr: *volatile i64 = &signed;
+    for ([_]i64{ -901, -900, -850, -800, -799, -401, -400, -375, -350, -349, 999, 1000, 1050, 1100, 1101 }) |value| {
+        signed_ptr.* = value;
+        const expected: u8 = @intFromBool((value >= -900 and value <= -800) or
+            (value >= -400 and value <= -350) or (value >= 1000 and value <= 1100));
+        try expect(S.signedRange(signed_ptr.*) == expected);
+    }
+}
+
+fn denseSwitch(comptime T: type, comptime base: comptime_int, value: T) u8 {
+    return switch (value) {
+        base + 0 => 1,
+        base + 1, base + 3 => 2,
+        base + 2 => 3,
+        base + 5...base + 9 => 4,
+        base + 4, base + 11 => 5,
+        base + 13...base + 15, base + 17 => 6,
+        base + 20 => 7,
+        else => 0,
+    };
+}
+
+fn denseReference(offset: i128) u8 {
+    return switch (offset) {
+        0 => 1,
+        1, 3 => 2,
+        2 => 3,
+        5...9 => 4,
+        4, 11 => 5,
+        13...15, 17 => 6,
+        20 => 7,
+        else => 0,
+    };
+}
+
+fn expectDenseSwitch(comptime T: type, comptime base: comptime_int) !void {
+    const S = struct {
+        noinline fn classify(value: T) u8 {
+            return denseSwitch(T, base, value);
+        }
+    };
+    var offset: i128 = -40;
+    while (offset <= 40) : (offset += 1) {
+        const wide = base + offset;
+        if (wide < minInt(T) or wide > maxInt(T)) continue;
+        var value: T = @intCast(wide);
+        _ = &value;
+        try expect(S.classify(value) == denseReference(offset));
+    }
+    for ([_]i128{ minInt(T), maxInt(T), 0 }) |wide| {
+        var value: T = @intCast(wide);
+        _ = &value;
+        try expect(S.classify(value) == denseReference(wide - base));
+    }
+}
+
+test "switch on runtime values with dense cases of various integer types" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    try expectDenseSwitch(u8, 0);
+    try expectDenseSwitch(u8, 235);
+    try expectDenseSwitch(i8, -10);
+    try expectDenseSwitch(i8, -128);
+    try expectDenseSwitch(i8, 107);
+    try expectDenseSwitch(u7, 3);
+    try expectDenseSwitch(u16, 1000);
+    try expectDenseSwitch(i16, -20000);
+    try expectDenseSwitch(u32, 0xffff_ff00);
+    try expectDenseSwitch(i32, -5);
+    try expectDenseSwitch(i32, 0x7fff_f000);
+    try expectDenseSwitch(u33, 0x1_0000_0000);
+    try expectDenseSwitch(u64, 1 << 40);
+    try expectDenseSwitch(u64, maxInt(u64) - 20);
+    try expectDenseSwitch(i64, minInt(i64));
+    try expectDenseSwitch(i64, -10);
+    try expectDenseSwitch(u100, 5);
+    try expectDenseSwitch(i100, -3);
+}
+
+test "switch on runtime values with sparse cases" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        noinline fn sparse(value: u32) u8 {
+            return switch (value) {
+                0 => 1,
+                1000 => 2,
+                70000, 70002 => 3,
+                1 << 30 => 4,
+                0xffff_fffe...0xffff_ffff => 5,
+                else => 0,
+            };
+        }
+        noinline fn signedSparse(value: i64) u8 {
+            return switch (value) {
+                minInt(i64) => 1,
+                -1_000_000 => 2,
+                -1 => 3,
+                0...3 => 4,
+                1 << 50 => 5,
+                maxInt(i64) => 6,
+                else => 0,
+            };
+        }
+    };
+    for ([_]u32{ 0, 1, 999, 1000, 1001, 69999, 70000, 70001, 70002, 1 << 30, (1 << 30) + 1, 0xffff_fffd, 0xffff_fffe, 0xffff_ffff }) |value| {
+        var v = value;
+        _ = &v;
+        const expected: u8 = switch (value) {
+            0 => 1,
+            1000 => 2,
+            70000, 70002 => 3,
+            1 << 30 => 4,
+            0xffff_fffe, 0xffff_ffff => 5,
+            else => 0,
+        };
+        try expect(S.sparse(v) == expected);
+    }
+    for ([_]i64{ minInt(i64), minInt(i64) + 1, -1_000_001, -1_000_000, -2, -1, 0, 3, 4, 1 << 50, maxInt(i64) - 1, maxInt(i64) }) |value| {
+        var v = value;
+        _ = &v;
+        const expected: u8 = if (value == minInt(i64)) 1 else if (value == -1_000_000) 2 else if (value == -1) 3 else if (value >= 0 and value <= 3) 4 else if (value == 1 << 50) 5 else if (value == maxInt(i64)) 6 else 0;
+        try expect(S.signedSparse(v) == expected);
+    }
+}
+
+test "switch without else prong covering every value" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const E = enum { a, b, c, d, e, f, g, h, i, j };
+    const S = struct {
+        noinline fn small(value: u3) u8 {
+            return switch (value) {
+                0 => 10,
+                1, 2 => 20,
+                3 => 30,
+                4...6 => 40,
+                7 => 50,
+            };
+        }
+        noinline fn full(value: u8) u8 {
+            return switch (value) {
+                0...9 => 1,
+                10, 12, 14 => 2,
+                11, 13 => 3,
+                15...200 => 4,
+                201...254 => 5,
+                255 => 6,
+            };
+        }
+        noinline fn onEnum(value: E) u8 {
+            return switch (value) {
+                .a, .j => 1,
+                .b => 2,
+                .c, .d => 3,
+                .e => 4,
+                .f, .g, .h => 5,
+                .i => 6,
+            };
+        }
+        noinline fn onEnumElse(value: E) u8 {
+            return switch (value) {
+                .b => 2,
+                .c, .d => 3,
+                .e => 4,
+                .h => 5,
+                else => 9,
+            };
+        }
+    };
+    for (0..8) |index| {
+        var value: u3 = @intCast(index);
+        _ = &value;
+        try expect(S.small(value) == ([_]u8{ 10, 20, 20, 30, 40, 40, 40, 50 })[index]);
+    }
+    for (0..256) |index| {
+        var value: u8 = @intCast(index);
+        _ = &value;
+        const expected: u8 = if (index <= 9) 1 else if (index == 10 or index == 12 or index == 14) 2 else if (index == 11 or index == 13) 3 else if (index <= 200) 4 else if (index <= 254) 5 else 6;
+        try expect(S.full(value) == expected);
+    }
+    const expected_enum = [_]u8{ 1, 2, 3, 3, 4, 5, 5, 5, 6, 1 };
+    const expected_enum_else = [_]u8{ 9, 2, 3, 3, 4, 9, 9, 5, 9, 9 };
+    for (0..10) |index| {
+        var value: E = @fromBackingInt(@as(u4, @intCast(index)));
+        _ = &value;
+        try expect(S.onEnum(value) == expected_enum[index]);
+        try expect(S.onEnumElse(value) == expected_enum_else[index]);
+    }
+}
+
+test "switch on runtime values with many inline cases" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        noinline fn many(value: u16) u32 {
+            return switch (value) {
+                inline 0...299 => |c| c * 3 + 1,
+                inline 1000...1099 => |c| c ^ 0x55,
+                else => 0,
+            };
+        }
+    };
+    var value: u16 = 0;
+    while (value < 1200) : (value += 1) {
+        const expected: u32 = if (value < 300) @as(u32, value) * 3 + 1 else if (value >= 1000 and value < 1100) value ^ 0x55 else 0;
+        try expect(S.many(value) == expected);
+    }
+}
+
+test "dense switch with values live across the prongs" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        noinline fn mix(selector: u8, a: u64, b: u64, c: u32, d: u16) u64 {
+            var x = a *% 3;
+            var y = b +% c;
+            const z = d;
+            switch (selector) {
+                'a' => x +%= y,
+                'b' => y = x ^ z,
+                'c', 'e' => {
+                    x = y;
+                    y = z;
+                },
+                'd' => x = @as(u64, c) << 3,
+                'f'...'h' => |s| y +%= s,
+                'k' => return x -% y,
+                else => {},
+            }
+            return x *% 7 +% y *% 11 +% z;
+        }
+        fn reference(selector: u8, a: u64, b: u64, c: u32, d: u16) u64 {
+            var x = a *% 3;
+            var y = b +% c;
+            const z = d;
+            if (selector == 'a') {
+                x +%= y;
+            } else if (selector == 'b') {
+                y = x ^ z;
+            } else if (selector == 'c' or selector == 'e') {
+                x = y;
+                y = z;
+            } else if (selector == 'd') {
+                x = @as(u64, c) << 3;
+            } else if (selector >= 'f' and selector <= 'h') {
+                y +%= selector;
+            } else if (selector == 'k') {
+                return x -% y;
+            }
+            return x *% 7 +% y *% 11 +% z;
+        }
+    };
+    var selector: u8 = 'Z';
+    while (selector <= 'm') : (selector += 1) {
+        try expect(S.mix(selector, 0x1234_5678_9abc, 77, 0xdead_beef, 0x4321) ==
+            S.reference(selector, 0x1234_5678_9abc, 77, 0xdead_beef, 0x4321));
+    }
 }

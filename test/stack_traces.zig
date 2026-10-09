@@ -57,6 +57,44 @@ pub fn addCases(cases: *Context, params: *const Context.CaseParameters, target: 
     cases.addCase(.{
         .params = params,
         .target = target,
+        .name = "panic in inlined callees",
+        .source =
+        \\pub fn main() void {
+        \\    foo();
+        \\}
+        \\inline fn foo() void {
+        \\    bar();
+        \\}
+        \\inline fn bar() void {
+        \\    @panic("oh no");
+        \\}
+        \\
+        ,
+        .unwind = .any,
+        .expect_panic = true,
+        .expect =
+        \\panic: oh no
+        \\source.zig:8:5: [address] in bar
+        \\    @panic("oh no");
+        \\    ^
+        \\source.zig:5:8: [address] in foo
+        \\    bar();
+        \\       ^
+        \\source.zig:2:8: [address] in main
+        \\    foo();
+        \\       ^
+        \\
+        ,
+        .expect_strip =
+        \\panic: oh no
+        \\???:?:?: [address] in source.main
+        \\
+        ,
+    });
+
+    cases.addCase(.{
+        .params = params,
+        .target = target,
         .name = "dump current trace",
         .source =
         \\pub fn main() void {
@@ -235,6 +273,126 @@ pub fn addCases(cases: *Context, params: *const Context.CaseParameters, target: 
         \\???:?:?: [address] in source.captureItInner
         \\???:?:?: [address] in source.captureIt
         \\???:?:?: [address] in source.threadMain
+        \\
+        ,
+    });
+
+    // A small, ordinary callee is a candidate for automatic inlining by the
+    // compiler. Whether or not that happens, the trace must show the callee's
+    // line first and then the line of the call that failed.
+    cases.addCase(.{
+        .params = params,
+        .target = target,
+        .name = "panic in small callee called twice",
+        .source =
+        \\pub fn main() void {
+        \\    var x: u32 = 1;
+        \\    _ = &x;
+        \\    _ = check(x);
+        \\    _ = check(x - 1);
+        \\}
+        \\fn check(x: u32) u32 {
+        \\    if (x == 0) @panic("zero");
+        \\    return x;
+        \\}
+        \\
+        ,
+        .unwind = .any,
+        .expect_panic = true,
+        .expect =
+        \\panic: zero
+        \\source.zig:8:17: [address] in check
+        \\    if (x == 0) @panic("zero");
+        \\                ^
+        \\source.zig:5:14: [address] in main
+        \\    _ = check(x - 1);
+        \\             ^
+        \\
+        ,
+        .expect_strip =
+        \\panic: zero
+        \\???:?:?: [address] in source.check
+        \\???:?:?: [address] in source.main
+        \\
+        ,
+    });
+
+    cases.addCase(.{
+        .params = params,
+        .target = target,
+        .name = "integer overflow in nested small callees",
+        .source =
+        \\pub fn main() void {
+        \\    var x: u8 = 200;
+        \\    _ = &x;
+        \\    _ = outer(x);
+        \\}
+        \\fn outer(x: u8) u8 {
+        \\    return inner(x, x);
+        \\}
+        \\fn inner(a: u8, b: u8) u8 {
+        \\    return a + b;
+        \\}
+        \\
+        ,
+        .unwind = .any,
+        .expect_panic = true,
+        .expect =
+        \\panic: integer overflow
+        \\source.zig:10:14: [address] in inner
+        \\    return a + b;
+        \\             ^
+        \\source.zig:7:17: [address] in outer
+        \\    return inner(x, x);
+        \\                ^
+        \\source.zig:4:14: [address] in main
+        \\    _ = outer(x);
+        \\             ^
+        \\
+        ,
+        .expect_strip =
+        \\panic: integer overflow
+        \\???:?:?: [address] in source.inner
+        \\???:?:?: [address] in source.outer
+        \\???:?:?: [address] in source.main
+        \\
+        ,
+    });
+
+    cases.addCase(.{
+        .params = params,
+        .target = target,
+        .name = "index out of bounds in small callee called from a loop",
+        .source =
+        \\pub fn main() void {
+        \\    const xs = [_]u32{ 1, 2, 3 };
+        \\    var sum: u32 = 0;
+        \\    for (0..4) |i| {
+        \\        sum += at(&xs, i);
+        \\    }
+        \\    if (sum == 0) unreachable;
+        \\}
+        \\fn at(xs: []const u32, i: usize) u32 {
+        \\    return xs[i];
+        \\}
+        \\
+        ,
+        .unwind = .any,
+        .expect_panic = true,
+        .expect =
+        \\panic: index out of bounds: index 3, len 3
+        \\source.zig:10:14: [address] in at
+        \\    return xs[i];
+        \\             ^
+        \\source.zig:5:18: [address] in main
+        \\        sum += at(&xs, i);
+        \\                 ^
+        \\
+        ,
+        .expect_strip =
+        \\panic: index out of bounds: index 3, len 3
+        \\???:?:?: [address] in source.at
+        \\???:?:?: [address] in source.main
         \\
         ,
     });

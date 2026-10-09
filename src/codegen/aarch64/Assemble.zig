@@ -1,11 +1,45 @@
 source: [*:0]const u8,
 operands: std.StringHashMapUnmanaged(Operand),
+reloc: ?u32 = null,
+source_start: ?[*:0]const u8 = null,
+instruction_source: ?[*:0]const u8 = null,
 
 pub const Operand = union(enum) {
     register: aarch64.encoding.Register,
+    immediate: i128,
+    symbol: u32,
 };
 
+pub fn nextDirective(as: *Assemble) !?aarch64.encoding.Register {
+    if (as.source_start == null) as.source_start = as.source;
+    const original_source = as.source;
+    as.skipTrivia();
+    const source = std.mem.span(as.source);
+    const directive = ".cfi_undefined";
+    if (!std.mem.startsWith(u8, source, directive) or source.len == directive.len or
+        !std.ascii.isWhitespace(source[directive.len])) return null;
+    as.source = @ptrCast(source.ptr + directive.len);
+    var buf: [token_buf_len]u8 = undefined;
+    const reg = aarch64.encoding.Register.parse(try as.nextToken(&buf, .{})) orelse {
+        as.source = original_source;
+        return error.InvalidSyntax;
+    };
+    const Alias = aarch64.encoding.Register.Alias;
+    switch (@backingInt(reg.alias)) {
+        @backingInt(Alias.r0)...@backingInt(Alias.r30),
+        @backingInt(Alias.sp),
+        @backingInt(Alias.v0)...@backingInt(Alias.v31),
+        => {},
+        else => return error.InvalidSyntax,
+    }
+    const end = try as.nextToken(&buf, .{});
+    if (end.len != 0 and end[0] != '\n' and end[0] != ';') return error.InvalidSyntax;
+    return reg;
+}
+
 pub fn nextInstruction(as: *Assemble) !?Instruction {
+    if (as.source_start == null) as.source_start = as.source;
+    as.skipTrivia();
     const original_source = while (true) {
         const original_source = as.source;
         var token_buf: [token_buf_len]u8 = undefined;
@@ -18,6 +52,7 @@ pub fn nextInstruction(as: *Assemble) !?Instruction {
             },
         }
     };
+    as.instruction_source = original_source;
     log.debug(
         \\.
         \\=========================
@@ -27,6 +62,7 @@ pub fn nextInstruction(as: *Assemble) !?Instruction {
     , .{std.zig.fmtString(std.mem.span(original_source))});
     for (matchers) |matcher| {
         as.source = original_source;
+        as.reloc = null;
         if (try matcher(as)) |result| return result;
     }
     as.source = original_source;
@@ -137,51 +173,68 @@ const matchers = matchers: {
                 var token_buf: [token_buf_len]u8 = undefined;
                 const pattern_token = comptime pattern_as.nextToken(&ct_token_buf, .{ .placeholders = true }) catch |err|
                     @compileError(@errorName(err) ++ " while parsing '" ++ instruction.pattern ++ "'");
+                const source_start = as.source;
+                const reloc_start = as.reloc;
                 const source_token = try as.nextToken(&token_buf, .{ .operands = true });
-                log.debug("\"{f}\" -> \"{f}\"", .{
-                    std.zig.fmtString(pattern_token),
-                    std.zig.fmtString(source_token),
-                });
-                if (pattern_token.len == 0) {
-                    comptime var unused_symbol_it = unused_symbols.iterator();
-                    inline while (comptime unused_symbol_it.next()) |unused_symbol|
-                        @compileError(@tagName(unused_symbol) ++ " unused while parsing '" ++ instruction.pattern ++ "'");
-                    switch (source_token.len) {
-                        0 => {},
-                        else => switch (source_token[0]) {
-                            else => {
-                                log.debug("'{s}' not matched...", .{instruction.pattern});
-                                return null;
+                if (comptime std.mem.eql(u8, pattern_token, "#")) {
+                    if (!std.mem.eql(u8, source_token, "#")) {
+                        as.source = source_start;
+                        as.reloc = reloc_start;
+                    }
+                } else {
+                    log.debug("\"{f}\" -> \"{f}\"", .{
+                        std.zig.fmtString(pattern_token),
+                        std.zig.fmtString(source_token),
+                    });
+                    if (pattern_token.len == 0) {
+                        comptime var unused_symbol_it = unused_symbols.iterator();
+                        inline while (comptime unused_symbol_it.next()) |unused_symbol|
+                            @compileError(@tagName(unused_symbol) ++ " unused while parsing '" ++ instruction.pattern ++ "'");
+                        switch (source_token.len) {
+                            0 => {},
+                            else => switch (source_token[0]) {
+                                else => {
+                                    log.debug("'{s}' not matched...", .{instruction.pattern});
+                                    return null;
+                                },
+                                '\n', ';' => {},
                             },
-                            '\n', ';' => {},
-                        },
-                    }
-                    const encode = @field(Instruction, @tagName(instruction.encode[0]));
-                    const Encode = @TypeOf(encode);
-                    var args: std.meta.ArgsTuple(Encode) = undefined;
-                    inline for (&args, @typeInfo(Encode).@"fn".param_types, 1..instruction.encode.len) |*arg, param_type, encode_index|
-                        arg.* = zonCast(param_type.?, instruction.encode[encode_index], symbols);
-                    return @call(.auto, encode, args);
-                } else if (pattern_token[0] == '<') {
-                    const symbol_name = comptime pattern_token[1 .. std.mem.findScalarPos(u8, pattern_token, 1, '|') orelse
-                        pattern_token.len - 1];
-                    const symbol = @field(Symbol, symbol_name);
-                    const symbol_ptr = &@field(symbols, symbol_name);
-                    const symbol_value = zonCast(SymbolSpec, @field(instruction.symbols, symbol_name), .{}).parse(source_token) orelse {
+                        }
+                        const encode = @field(Instruction, @tagName(instruction.encode[0]));
+                        const Encode = @TypeOf(encode);
+                        var args: std.meta.ArgsTuple(Encode) = undefined;
+                        inline for (&args, @typeInfo(Encode).@"fn".param_types, 1..instruction.encode.len) |*arg, param_type, encode_index|
+                            arg.* = zonCast(param_type.?, instruction.encode[encode_index], symbols);
+                        return @call(.auto, encode, args);
+                    } else if (pattern_token[0] == '<') {
+                        const symbol_name = comptime pattern_token[1 .. std.mem.findScalarPos(u8, pattern_token, 1, '|') orelse
+                            pattern_token.len - 1];
+                        const symbol = @field(Symbol, symbol_name);
+                        const symbol_ptr = &@field(symbols, symbol_name);
+                        var label_buf: [token_buf_len]u8 = undefined;
+                        const resolved_token = if (comptime std.mem.eql(u8, symbol_name, "label")) token: {
+                            if (isLocalLabelReference(source_token)) {
+                                const displacement = as.localLabelDisplacement(source_token) orelse return null;
+                                break :token std.mem.print(&label_buf, "{d}", .{displacement}) catch unreachable;
+                            }
+                            break :token source_token;
+                        } else source_token;
+                        const symbol_value = zonCast(SymbolSpec, @field(instruction.symbols, symbol_name), .{}).parse(resolved_token) orelse {
+                            log.debug("'{s}' not matched...", .{instruction.pattern});
+                            return null;
+                        };
+                        if (comptime unused_symbols.contains(symbol)) {
+                            log.debug("{s} = {any}", .{ symbol_name, symbol_value });
+                            symbol_ptr.* = symbol_value;
+                            comptime unused_symbols.remove(symbol);
+                        } else if (symbol_ptr.* != symbol_value) {
+                            log.debug("'{s}' not matched...", .{instruction.pattern});
+                            return null;
+                        }
+                    } else if (!toUpperEqlAssertUpper(source_token, pattern_token)) {
                         log.debug("'{s}' not matched...", .{instruction.pattern});
                         return null;
-                    };
-                    if (comptime unused_symbols.contains(symbol)) {
-                        log.debug("{s} = {any}", .{ symbol_name, symbol_value });
-                        symbol_ptr.* = symbol_value;
-                        comptime unused_symbols.remove(symbol);
-                    } else if (symbol_ptr.* != symbol_value) {
-                        log.debug("'{s}' not matched...", .{instruction.pattern});
-                        return null;
                     }
-                } else if (!toUpperEqlAssertUpper(source_token, pattern_token)) {
-                    log.debug("'{s}' not matched...", .{instruction.pattern});
-                    return null;
                 }
             }
         }
@@ -198,7 +251,101 @@ fn toUpperEqlAssertUpper(lhs: []const u8, rhs: []const u8) bool {
     return true;
 }
 
-const token_buf_len = "v31.b[15]".len;
+const token_buf_len = "-170141183460469231731687303715884105728".len;
+/// Skip statement separators and comment-only lines before an instruction or directive.
+fn skipTrivia(as: *Assemble) void {
+    while (true) switch (as.source[0]) {
+        ' ', '\t', '\n', '\r', 11, 12, ';' => as.source = as.source[1..],
+        '/' => {
+            if (as.source[1] != '/') return;
+            while (as.source[0] != 0 and as.source[0] != '\n') as.source = as.source[1..];
+        },
+        else => {
+            const label_len = localLabelDefinition(std.mem.span(as.source));
+            if (label_len == 0) return;
+            as.source = as.source[label_len..];
+        },
+    };
+}
+
+/// Numeric labels may be repeated; references select the nearest definition in the given direction.
+fn localLabelDefinition(source: []const u8) usize {
+    var pos: usize = 0;
+    while (pos < source.len and std.ascii.isDigit(source[pos])) : (pos += 1) {}
+    if (pos == 0) return 0;
+    while (pos < source.len and (source[pos] == ' ' or source[pos] == '\t')) : (pos += 1) {}
+    return if (pos < source.len and source[pos] == ':') pos + 1 else 0;
+}
+
+fn isLocalLabelReference(token: []const u8) bool {
+    if (token.len < 2) return false;
+    if (token[token.len - 1] != 'f' and token[token.len - 1] != 'b') return false;
+    for (token[0 .. token.len - 1]) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
+fn localLabelDisplacement(as: *const Assemble, token: []const u8) ?i64 {
+    const start = as.source_start.?;
+    const source = std.mem.span(start);
+    const instruction_offset = @intFromPtr(as.instruction_source.?) - @intFromPtr(start);
+    const name = token[0 .. token.len - 1];
+    const forward = token[token.len - 1] == 'f';
+    var current_pc: ?i64 = null;
+    var target_pc: ?i64 = null;
+    var pc: i64 = 0;
+    var pos: usize = 0;
+    while (pos < source.len) {
+        switch (source[pos]) {
+            ' ', '\t', '\n', '\r', 11, 12, ';' => {
+                pos += 1;
+                continue;
+            },
+            '/' => if (pos + 1 < source.len and source[pos + 1] == '/') {
+                while (pos < source.len and source[pos] != '\n') : (pos += 1) {}
+                continue;
+            },
+            else => {},
+        }
+        const label_len = localLabelDefinition(source[pos..]);
+        if (label_len != 0) {
+            var digits: usize = 0;
+            while (std.ascii.isDigit(source[pos + digits])) : (digits += 1) {}
+            if (std.mem.eql(u8, source[pos..][0..digits], name)) {
+                if (forward) {
+                    if (pos > instruction_offset and target_pc == null) target_pc = pc;
+                } else if (pos < instruction_offset) target_pc = pc;
+            }
+            pos += label_len;
+            continue;
+        }
+        if (pos == instruction_offset) current_pc = pc;
+        // Every supported instruction emits four bytes. Directives and labels emit none.
+        if (source[pos] != '.') pc += 4;
+        var quoted = false;
+        while (pos < source.len) : (pos += 1) {
+            const c = source[pos];
+            if (c == '"') quoted = !quoted;
+            if (quoted and c == '\\' and pos + 1 < source.len) {
+                pos += 1;
+                continue;
+            }
+            if (quoted) continue;
+            if (c == '%' and pos + 1 < source.len and source[pos + 1] == '[') {
+                pos += 2;
+                while (pos < source.len and source[pos] != ']') : (pos += 1) {}
+                if (pos == source.len) break;
+                continue;
+            }
+            if (c == '\n' or c == ';') break;
+            if (c == '/' and pos + 1 < source.len and source[pos + 1] == '/') {
+                while (pos < source.len and source[pos] != '\n') : (pos += 1) {}
+                break;
+            }
+        }
+    }
+    return (target_pc orelse return null) - (current_pc orelse return null);
+}
+
 fn nextToken(as: *Assemble, buf: *[token_buf_len]u8, comptime opts: struct {
     operands: bool = false,
     placeholders: bool = false,
@@ -210,6 +357,12 @@ fn nextToken(as: *Assemble, buf: *[token_buf_len]u8, comptime opts: struct {
         '\n', '!', '#', ',', ';', '[', ']' => {
             defer as.source = as.source[1..];
             return as.source[0..1];
+        },
+        '/' => {
+            if (as.source[1] != '/') continue :c invalid_syntax;
+            // Leave the newline for the instruction-pattern end token. This
+            // also handles a trailing comment without a terminating newline.
+            while (as.source[0] != 0 and as.source[0] != '\n') as.source = as.source[1..];
         },
         '%' => if (opts.operands) {
             if (as.source[1] != '[') continue :c invalid_syntax;
@@ -237,25 +390,39 @@ fn nextToken(as: *Assemble, buf: *[token_buf_len]u8, comptime opts: struct {
             const modified_operand: Operand = if (std.mem.eql(u8, modifier, ""))
                 operand
             else if (std.mem.eql(u8, modifier, "w")) switch (operand) {
+                else => continue :c invalid_syntax,
                 .register => |reg| .{ .register = reg.alias.w() },
             } else if (std.mem.eql(u8, modifier, "x")) switch (operand) {
+                else => continue :c invalid_syntax,
                 .register => |reg| .{ .register = reg.alias.x() },
             } else if (std.mem.eql(u8, modifier, "b")) switch (operand) {
+                else => continue :c invalid_syntax,
                 .register => |reg| .{ .register = reg.alias.b() },
             } else if (std.mem.eql(u8, modifier, "h")) switch (operand) {
+                else => continue :c invalid_syntax,
                 .register => |reg| .{ .register = reg.alias.h() },
             } else if (std.mem.eql(u8, modifier, "s")) switch (operand) {
+                else => continue :c invalid_syntax,
                 .register => |reg| .{ .register = reg.alias.s() },
             } else if (std.mem.eql(u8, modifier, "d")) switch (operand) {
+                else => continue :c invalid_syntax,
                 .register => |reg| .{ .register = reg.alias.d() },
             } else if (std.mem.eql(u8, modifier, "q")) switch (operand) {
+                else => continue :c invalid_syntax,
                 .register => |reg| .{ .register = reg.alias.q() },
             } else if (std.mem.eql(u8, modifier, "Z")) switch (operand) {
+                else => continue :c invalid_syntax,
                 .register => |reg| .{ .register = reg.alias.z() },
             } else continue :c invalid_syntax;
+            as.source = as.source[index + 1 ..];
             switch (modified_operand) {
+                .immediate => |imm| return std.mem.print(buf, "{d}", .{imm}) catch unreachable,
+                .symbol => |symbol| {
+                    if (as.reloc != null) continue :c invalid_syntax;
+                    as.reloc = symbol;
+                    return "0";
+                },
                 .register => |reg| {
-                    as.source = as.source[index + 1 ..];
                     return std.mem.print(buf, "{f}", .{reg.fmt()}) catch unreachable;
                 },
             }
@@ -307,6 +474,7 @@ const SymbolSpec = union(enum) {
         min_valid_len: comptime_int = 0,
     },
     systemreg,
+    logical_imm: aarch64.encoding.Register.GeneralSize,
     imm: struct {
         type: std.lang.Type.Int,
         multiple_of: ?comptime_int = null,
@@ -325,6 +493,7 @@ const SymbolSpec = union(enum) {
             .reg => aarch64.encoding.Register,
             .arrangement => aarch64.encoding.Register.Arrangement,
             .systemreg => aarch64.encoding.Register.System,
+            .logical_imm => Instruction.DataProcessingImmediate.Bitmask,
             .imm => |imm_spec| @Int(imm_spec.type.signedness, imm_spec.type.bits),
             .fimm => f16,
             .extend => Instruction.DataProcessingRegister.AddSubtractExtendedRegister.Option,
@@ -402,6 +571,22 @@ const SymbolSpec = union(enum) {
                 };
                 assert(systemreg.op0 >= 2);
                 return systemreg;
+            },
+            .logical_imm => |sf| {
+                const value: u64 = if (std.mem.startsWith(u8, token, "-"))
+                    @bitCast(std.fmt.parseInt(i64, token, 0) catch return null)
+                else
+                    std.fmt.parseInt(u64, token, 0) catch return null;
+                const reg_value = switch (sf) {
+                    .word => word: {
+                        if (std.mem.startsWith(u8, token, "-")) {
+                            if (value < @as(u64, @bitCast(@as(i64, std.math.minInt(i32))))) return null;
+                        } else if (value > std.math.maxInt(u32)) return null;
+                        break :word @as(u32, @truncate(value));
+                    },
+                    .doubleword => value,
+                };
+                return Instruction.DataProcessingImmediate.Bitmask.encodeImmediate(reg_value, sf);
             },
             .imm => |imm_spec| {
                 const imm = std.fmt.parseInt(@Int(
@@ -529,6 +714,135 @@ const SymbolSpec = union(enum) {
         }
     }
 };
+
+test "numeric local labels and clone aliases" {
+    var as: Assemble = .{ .source =
+        \\uxtw x0, w2
+        \\cbz x0, 1f // branch past the parent return
+        \\ret
+        \\1: .cfi_undefined lr
+        \\1: cbnz w3, 1b
+        \\b 2f
+        \\2:
+    , .operands = .empty };
+    // Words independently checked against the AArch64 assembler used by the LLVM control.
+    try std.testing.expectEqual(@as(u32, 0xd3407c40), @as(u32, @bitCast((try as.nextInstruction()).?)));
+    try std.testing.expectEqual(@as(u32, 0xb4000040), @as(u32, @bitCast((try as.nextInstruction()).?)));
+    _ = try as.nextInstruction(); // ret
+    try std.testing.expectEqual(aarch64.encoding.Register.lr, (try as.nextDirective()).?);
+    try std.testing.expectEqual(@as(u32, 0x35000003), @as(u32, @bitCast((try as.nextInstruction()).?)));
+    try std.testing.expectEqual(@as(u32, 0x14000001), @as(u32, @bitCast((try as.nextInstruction()).?)));
+    try std.testing.expect(null == try as.nextInstruction());
+
+    as = .{ .source = "1: mov x0, #0; cbnz x0, 1b; cbz w1, 1f; 1:", .operands = .empty };
+    _ = try as.nextInstruction();
+    try std.testing.expectEqual(@as(u32, 0xb5ffffe0), @as(u32, @bitCast((try as.nextInstruction()).?)));
+    try std.testing.expectEqual(@as(u32, 0x34000021), @as(u32, @bitCast((try as.nextInstruction()).?)));
+    try std.testing.expect(null == try as.nextInstruction());
+    as = .{ .source = "cbz x0, 9f", .operands = .empty };
+    try std.testing.expectError(error.InvalidSyntax, as.nextInstruction());
+    as = .{ .source = "b 9b", .operands = .empty };
+    try std.testing.expectError(error.InvalidSyntax, as.nextInstruction());
+}
+
+test "line comments" {
+    var as: Assemble = .{
+        .source = " // startup\n.cfi_undefined lr // no caller\nmov x0, #42 // value\n// trailing",
+        .operands = .empty,
+    };
+    try std.testing.expectEqual(aarch64.encoding.Register.lr, (try as.nextDirective()).?);
+    try std.testing.expectEqual(null, try as.nextDirective());
+    try std.testing.expectEqual(
+        @as(u32, @bitCast(Instruction.movz(.x0, 42, .{ .lsl = .@"0" }))),
+        @as(u32, @bitCast((try as.nextInstruction()).?)),
+    );
+    try std.testing.expectEqual(null, try as.nextDirective());
+    try std.testing.expectEqual(null, try as.nextInstruction());
+    as.source = "mov x0, #1// immediate comment";
+    try std.testing.expectEqual(
+        @as(u32, @bitCast(Instruction.movz(.x0, 1, .{ .lsl = .@"0" }))),
+        @as(u32, @bitCast((try as.nextInstruction()).?)),
+    );
+    var buf: [token_buf_len]u8 = undefined;
+    as.source = "<name//suffix>";
+    try std.testing.expectEqualStrings("<name//suffix>", try as.nextToken(&buf, .{ .placeholders = true }));
+    as.source = "\"raw//text\"";
+    try std.testing.expectError(error.InvalidSyntax, as.nextToken(&buf, .{}));
+    try std.testing.expectEqualStrings("\"raw//text\"", std.mem.span(as.source));
+    as.source = "mov x0, #1 / invalid";
+    try std.testing.expectError(error.InvalidSyntax, as.nextInstruction());
+}
+
+test "undefined register CFI directive" {
+    var as: Assemble = .{ .source = ".cfi_undefined lr\nmov x0, #42", .operands = .empty };
+    try std.testing.expectEqual(aarch64.encoding.Register.lr, (try as.nextDirective()).?);
+    try std.testing.expectEqual(null, try as.nextDirective());
+    try std.testing.expectEqual(
+        @as(u32, @bitCast(Instruction.movz(.x0, 42, .{ .lsl = .@"0" }))),
+        @as(u32, @bitCast((try as.nextInstruction()).?)),
+    );
+    try std.testing.expectEqual(null, try as.nextInstruction());
+    as.source = ".cfi_undefined xzr";
+    try std.testing.expectError(error.InvalidSyntax, as.nextDirective());
+    as.source = ".cfi_undefined lr, x0";
+    try std.testing.expectError(error.InvalidSyntax, as.nextDirective());
+}
+
+test "logical immediate masks" {
+    inline for (.{ .word, .doubleword }) |sf| {
+        const spec: SymbolSpec = .{ .logical_imm = sf };
+        const negative = spec.parse("-16").?;
+        try std.testing.expectEqual(
+            @as(u64, if (sf == .word) 0xfffffff0 else 0xfffffffffffffff0),
+            negative.decodeImmediate(sf),
+        );
+        const repeated = spec.parse(if (sf == .word) "0x00ff00ff" else "0x00ff00ff00ff00ff").?;
+        try std.testing.expectEqual(@as(u64, if (sf == .word) 0x00ff00ff else 0x00ff00ff00ff00ff), repeated.decodeImmediate(sf));
+        const edge = spec.parse(if (sf == .word) "0x80000001" else "0x8000000000000001").?;
+        try std.testing.expectEqual(@as(u64, if (sf == .word) 0x80000001 else 0x8000000000000001), edge.decodeImmediate(sf));
+        for ([_][]const u8{ "0", "-1", "0x12345678", "18446744073709551616" }) |token|
+            try std.testing.expectEqual(null, spec.parse(token));
+    }
+    const word_spec: SymbolSpec = .{ .logical_imm = .word };
+    for ([_][]const u8{ "0xffffffff", "0x100000001", "0xffffffff80000000", "-2147483649" }) |token|
+        try std.testing.expectEqual(null, word_spec.parse(token));
+    const double_spec: SymbolSpec = .{ .logical_imm = .doubleword };
+    try std.testing.expectEqual(null, double_spec.parse("0xffffffffffffffff"));
+}
+
+test "address of current instruction" {
+    var as: Assemble = .{ .source = "adr x1, .", .operands = .empty };
+    try std.testing.expectEqual(@as(u32, 0x10000001), @as(u32, @bitCast((try as.nextInstruction()).?)));
+    try std.testing.expectEqual(null, try as.nextInstruction());
+}
+
+test "immediate and symbolic operands" {
+    var as: Assemble = .{
+        .source =
+        \\ mov lr, %[number]
+        \\ and sp, x0, #-16
+        \\ b %[target]
+        \\ bl %[target]
+        \\
+        ,
+        .operands = .empty,
+    };
+    defer as.operands.deinit(std.testing.allocator);
+    try as.operands.put(std.testing.allocator, "number", .{ .immediate = 42 });
+    try as.operands.put(std.testing.allocator, "target", .{ .symbol = 7 });
+    try std.testing.expectEqual(
+        @as(u32, @bitCast(Instruction.movz(.lr, 42, .{ .lsl = .@"0" }))),
+        @as(u32, @bitCast((try as.nextInstruction()).?)),
+    );
+    try std.testing.expectEqual(null, as.reloc);
+    _ = (try as.nextInstruction()).?;
+    try std.testing.expectEqual(null, as.reloc);
+    try std.testing.expectEqual(@as(u32, @bitCast(Instruction.b(0))), @as(u32, @bitCast((try as.nextInstruction()).?)));
+    try std.testing.expectEqual(@as(?u32, 7), as.reloc);
+    try std.testing.expectEqual(@as(u32, @bitCast(Instruction.bl(0))), @as(u32, @bitCast((try as.nextInstruction()).?)));
+    try std.testing.expectEqual(@as(?u32, 7), as.reloc);
+    try std.testing.expectEqual(null, try as.nextInstruction());
+}
 
 test "add sub" {
     var as: Assemble = .{

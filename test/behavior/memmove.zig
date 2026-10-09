@@ -114,7 +114,6 @@ fn testMemmoveDestManyPtr() !void {
 }
 
 test "@memmove slice" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -198,4 +197,46 @@ test "@memmove a global array" {
     try expect(S.array_u32[0] == 40);
     @memmove(S.slice_u32, &[1]u32{S.array_u32[0] + 10});
     try expect(S.array_u32[0] == 50);
+}
+
+fn FixedMove(comptime n: usize) type {
+    return struct {
+        noinline fn move(dst: *[n]u8, src: *const [n]u8) void {
+            @memmove(dst, src);
+        }
+
+        fn check(comptime shift: usize) !void {
+            var buf: [n + 2 * shift]u8 = undefined;
+            var expected: [n + 2 * shift]u8 = undefined;
+            for (&buf, 0..) |*byte, i| byte.* = @truncate(i *% 11 +% 1);
+            // Forward overlap: the destination starts after the source.
+            expected = buf;
+            for (0..n) |i| expected[shift + i] = buf[i];
+            move(buf[shift..][0..n], buf[0..n]);
+            try std.testing.expectEqualSlices(u8, &expected, &buf);
+            // Backward overlap: the destination starts before the source.
+            expected = buf;
+            for (0..n) |i| expected[i] = buf[shift + i];
+            move(buf[0..n], buf[shift..][0..n]);
+            try std.testing.expectEqualSlices(u8, &expected, &buf);
+            // Same pointer.
+            expected = buf;
+            move(buf[shift..][0..n], buf[shift..][0..n]);
+            try std.testing.expectEqualSlices(u8, &expected, &buf);
+        }
+    };
+}
+
+test "@memmove fixed sizes with overlap" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
+
+    inline for (.{ 1, 3, 8, 15, 17, 24, 31, 32, 33, 48, 64, 100, 127, 128, 129, 256 }) |n| {
+        try FixedMove(n).check(1);
+        try FixedMove(n).check(7);
+        try FixedMove(n).check(16);
+        try FixedMove(n).check(n / 2 + 1);
+    }
 }

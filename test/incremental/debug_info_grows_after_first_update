@@ -1,0 +1,43 @@
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, "small\n");
+}
+#}
+#update
+#check stdout {
+small
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    // Much more code than the first update, so much more debug info.
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const gpa = gpa_state.allocator();
+    var map: std.StringHashMapUnmanaged(f64) = .empty;
+    defer map.deinit(gpa);
+    try map.put(gpa, "pi", 3.25);
+    try map.put(gpa, "e", 2.5);
+    var values: [4]i64 = .{ 4, -1, 3, 2 };
+    std.mem.sort(i64, &values, {}, std.sort.asc(i64));
+    var buf: [256]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &buf);
+    const w = &stdout_writer.interface;
+    try w.print("{d} {d} {any} {x}\n", .{ map.get("pi").?, map.get("e").?, values, std.hash.Wyhash.hash(0, "big") % 7 });
+    try w.flush();
+}
+#}
+#update {
+add much more code
+#}
+#check stdout {
+3.25 2.5 { -1, 2, 3, 4 } 3
+#}

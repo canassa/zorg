@@ -189,19 +189,33 @@ const module_test_targets = blk: {
             .link_libc = true,
         },
 
+        .{
+            .target = .{
+                .cpu_arch = .aarch64,
+                .os_tag = .linux,
+                .abi = .none,
+            },
+            .use_llvm = false,
+            .use_lld = false,
+            .optimize_mode = .fast,
+            .strip = true,
+            .skip_modules = &.{"std"}, // TODO get these passing
+        },
+        // Safety checks and debug info take other paths through the backend.
+        .{
+            .target = .{
+                .cpu_arch = .aarch64,
+                .os_tag = .linux,
+                .abi = .none,
+            },
+            .use_llvm = false,
+            .use_lld = false,
+            .optimize_mode = .debug,
+            .strip = false,
+            .skip_modules = &.{"std"}, // TODO get these passing
+        },
+
         // Disabled due to https://codeberg.org/ziglang/zig/pulls/30232#issuecomment-9203351
-        //.{
-        //    .target = .{
-        //        .cpu_arch = .aarch64,
-        //        .os_tag = .linux,
-        //        .abi = .none,
-        //    },
-        //    .use_llvm = false,
-        //    .use_lld = false,
-        //    .optimize_mode = .fast,
-        //    .strip = true,
-        //    .skip_modules = &.{"std"}, // TODO get these passing
-        //},
         //.{
         //    .target = .{
         //        .cpu_arch = .aarch64,

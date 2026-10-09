@@ -28,6 +28,25 @@ test "large abi alignment of global" {
     try std.testing.expect(@ctz(@intFromPtr(&S.global)) >= 6);
 }
 
+test "large abi alignment of initialized globals" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        var a: u8 = 1;
+        var b: @This() = .{ .x = 2 };
+        var c: u8 = 3;
+        var d: @This() = .{ .x = 4 };
+        var e: u8 = 5;
+        var f: @This() = .{ .x = 6 };
+        x: u64 align(128),
+    };
+
+    try expect(@ctz(@intFromPtr(&S.b)) >= 7);
+    try expect(@ctz(@intFromPtr(&S.d)) >= 7);
+    try expect(@ctz(@intFromPtr(&S.f)) >= 7);
+    try expect(S.a + S.c + S.e == 9 and S.b.x + S.d.x + S.f.x == 12);
+}
+
 test "large alignment of local constant" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest; // flaky

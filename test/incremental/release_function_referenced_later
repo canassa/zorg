@@ -1,0 +1,40 @@
+#exe {
+-OReleaseSafe
+-Mroot=main.zig
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    // Analyzes `helper` without referencing its code.
+    _ = &helper;
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{d}\n", .{7});
+}
+fn helper(x: u32) u32 {
+    return x * 10;
+}
+#}
+#update
+#check stdout {
+7
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{d}\n", .{helper(7)});
+}
+fn helper(x: u32) u32 {
+    return x * 10;
+}
+#}
+#update {
+call the function
+#}
+#check stdout {
+70
+#}

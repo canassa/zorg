@@ -541,7 +541,6 @@ test "sentinel element count towards the ABI size calculation" {
 }
 
 test "type coercion of anon struct literal to array" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
@@ -940,7 +939,6 @@ test "accessing multidimensional global array at comptime" {
 }
 
 test "union that needs padding bytes inside an array" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -1075,4 +1073,190 @@ test "access element through reference" {
     };
     try comptime S.doTheTest(123);
     try S.doTheTest(123);
+}
+
+test "elements of a signed array argument keep their sign" {
+    const S = struct {
+        noinline fn negate(x: i8) i8 {
+            return -x;
+        }
+
+        noinline fn check(a: [4]i8) !void {
+            inline for (a, 1..) |elem, magnitude| {
+                try expect(elem == negate(magnitude));
+            }
+        }
+    };
+    try S.check(.{ -1, -2, -3, -4 });
+}
+
+test "runtime index into a by-value array of wide elements in nested loops" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        noinline fn check(comptime T: type, comptime len: usize, actual: *const [len]T, expected: [len]T) bool {
+            const U = @Int(.unsigned, @bitSizeOf(T));
+            for (expected, 0..) |element, lane| {
+                for (0..@bitSizeOf(T)) |bit| {
+                    const e: U = @bitCast(element);
+                    const a: U = @bitCast(actual[lane]);
+                    if ((a >> @intCast(bit)) & 1 != (e >> @intCast(bit)) & 1) return false;
+                }
+            }
+            return true;
+        }
+    };
+    const wide = [3]u65{ (1 << 64) | 3, 19, (1 << 64) | 37 };
+    try expect(S.check(u65, 3, &wide, wide));
+    const narrow = [3]i9{ -1, -256, 37 };
+    try expect(S.check(i9, 3, &narrow, narrow));
+    var different = wide;
+    different[2] ^= 1 << 64;
+    try expect(!S.check(u65, 3, &different, wide));
+}
+
+test "splat of a sentinel-terminated array keeps the sentinel" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        const Header = extern struct {
+            checksum: [7:0]u8 = @splat(' '),
+            flag: u8,
+        };
+
+        fn make(flag: u8) Header {
+            return .{ .flag = flag };
+        }
+    };
+    var a: [7:0]u8 = @splat(' ');
+    _ = &a;
+    try expect(@as(*const [8]u8, @ptrCast(&a))[7] == 0);
+
+    var flag: u8 = 5;
+    _ = &flag;
+    const header = S.make(flag);
+    const bytes = std.mem.asBytes(&header);
+    try expect(bytes[6] == ' ');
+    try expect(bytes[7] == 0);
+    try expect(bytes[8] == 5);
+}
+
+/// Past every add/sub immediate (24 bits) and scaled load/store offset.
+var const_index_storage: [(1 << 24) + 0x2000]u8 align(16) = undefined;
+
+/// Byte offsets of the elements accessed, rounded down to the element size:
+/// zero, small, around the 12-bit and 24-bit immediates, and beyond them.
+const const_index_offsets = [_]usize{
+    0,      1,       16,       255,      4095,     4096,    4097,               0x7ff8,
+    0xfff0, 0x10000, 0xfff000, 0xfff010, 0xffffff, 1 << 24, (1 << 24) + 0x1010,
+};
+
+const ConstIndexStruct = extern struct { a: u32, b: u32, c: u32 };
+
+const const_index_types = .{
+    u8,    u16,    u32,    u64,              u128,            f32,             f64,
+    [3]u8, [5]u16, [3]u64, ConstIndexStruct, @Vector(2, u32), @Vector(4, u32), @Vector(8, u16),
+};
+
+fn constIndexPattern(comptime T: type, seed: usize) T {
+    var value: T = undefined;
+    for (mem.asBytes(&value), 0..) |*byte, k| byte.* = @truncate(seed *% 0x9e3779b1 +% k *% 0x3b +% 1);
+    return value;
+}
+
+fn constIndexEql(comptime T: type, a: T, b: T) bool {
+    return mem.eql(u8, mem.asBytes(&a), mem.asBytes(&b));
+}
+
+noinline fn constIndexMemory(comptime T: type, array: *[const_index_storage.len / @sizeOf(T)]T, slice: []T, many: [*]T) !void {
+    const base = @intFromPtr(array);
+    for (const_index_offsets) |offset| {
+        const i = offset / @sizeOf(T);
+        for ([2]usize{ i -% 1, i + 1 }) |j| if (j < array.len) {
+            array[j] = constIndexPattern(T, 0x5a);
+        };
+    }
+    inline for (const_index_offsets) |offset| {
+        const i = offset / @sizeOf(T);
+        // Store through each kind of pointer and load through the others.
+        array[i] = constIndexPattern(T, i);
+        try expect(constIndexEql(T, slice[i], constIndexPattern(T, i)));
+        try expect(constIndexEql(T, many[i], constIndexPattern(T, i)));
+        slice[i] = constIndexPattern(T, i + 1);
+        try expect(constIndexEql(T, array[i], constIndexPattern(T, i + 1)));
+        try expect(constIndexEql(T, many[i], constIndexPattern(T, i + 1)));
+        many[i] = constIndexPattern(T, i + 2);
+        try expect(constIndexEql(T, array[i], constIndexPattern(T, i + 2)));
+        try expect(constIndexEql(T, slice[i], constIndexPattern(T, i + 2)));
+        // Element pointers as values, and stores and loads through them.
+        const array_elem: *T = &array[i];
+        const slice_elem: *T = &slice[i];
+        const many_elem: *T = &many[i];
+        try expect(@intFromPtr(array_elem) == base + i * @sizeOf(T));
+        try expect(@intFromPtr(slice_elem) == base + i * @sizeOf(T));
+        try expect(@intFromPtr(many_elem) == base + i * @sizeOf(T));
+        array_elem.* = constIndexPattern(T, i + 3);
+        try expect(constIndexEql(T, many_elem.*, constIndexPattern(T, i + 3)));
+        slice_elem.* = constIndexPattern(T, i + 4);
+        try expect(constIndexEql(T, array_elem.*, constIndexPattern(T, i + 4)));
+        many_elem.* = constIndexPattern(T, i + 5);
+        try expect(constIndexEql(T, slice_elem.*, constIndexPattern(T, i + 5)));
+    }
+    // The neighbours of the accessed elements are untouched.
+    for (const_index_offsets) |offset| {
+        const i = offset / @sizeOf(T);
+        for ([2]usize{ i -% 1, i + 1 }) |j| if (j < array.len and !constIndexAccessed(T, j)) {
+            try expect(constIndexEql(T, array[j], constIndexPattern(T, 0x5a)));
+        };
+    }
+}
+
+fn constIndexAccessed(comptime T: type, j: usize) bool {
+    for (const_index_offsets) |offset| if (offset / @sizeOf(T) == j) return true;
+    return false;
+}
+
+noinline fn constIndexArrayValue(comptime T: type, comptime len: usize, array: [len]T, indices: anytype) !void {
+    inline for (indices) |i| try expect(constIndexEql(T, array[i], constIndexPattern(T, i)));
+}
+
+fn constIndexLocal(comptime T: type) !void {
+    // A local whose last elements lie past a 12-bit offset from its start.
+    const len = 4096 / @sizeOf(T) + 40;
+    const indices = .{ 0, 1, len / 2, 4096 / @sizeOf(T), len - 1 };
+    var local: [len]T = undefined;
+    inline for (indices) |i| local[i] = constIndexPattern(T, i);
+    inline for (indices) |i| {
+        try expect(constIndexEql(T, local[i], constIndexPattern(T, i)));
+        try expect(@intFromPtr(&local[i]) == @intFromPtr(&local) + i * @sizeOf(T));
+    }
+    try constIndexArrayValue(T, len, local, indices);
+}
+
+fn constIndexLanes(comptime T: type, comptime n: usize) !void {
+    var vector: @Vector(n, T) = @splat(0);
+    const ptr: *@Vector(n, T) = &vector;
+    inline for (0..n) |i| ptr[i] = @intCast(i * 3 + 1);
+    inline for (0..n) |i| try expect(vector[i] == i * 3 + 1);
+    inline for (0..n) |i| try expect(ptr[i] == i * 3 + 1);
+}
+
+test "comptime-known indices of element pointers, loads and stores" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
+
+    inline for (const_index_types) |T| {
+        const len = const_index_storage.len / @sizeOf(T);
+        const array: *[len]T = @ptrCast(@alignCast(&const_index_storage));
+        try constIndexMemory(T, array, array, array);
+        try constIndexLocal(T);
+    }
+    try constIndexLanes(u8, 16);
+    try constIndexLanes(u16, 8);
+    try constIndexLanes(u32, 4);
+    try constIndexLanes(u64, 2);
 }

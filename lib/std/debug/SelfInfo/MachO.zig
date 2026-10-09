@@ -31,7 +31,6 @@ pub fn getSymbols(
     resolve_inline_callers: bool,
     symbols: *std.ArrayList(std.debug.Symbol),
 ) Error!void {
-    _ = resolve_inline_callers;
     const gpa = std.debug.getDebugInfoAllocator();
 
     const module = try si.findModule(gpa, io, address);
@@ -89,6 +88,19 @@ pub fn getSymbols(
             ofile_vaddr,
         ) catch null,
     });
+    if (resolve_inline_callers) ofile_dwarf.appendInlineCallers(
+        gpa,
+        symbol_allocator,
+        text_arena,
+        native_endian,
+        compile_unit,
+        ofile_vaddr,
+        symbols,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        // The innermost frame is still useful.
+        else => {},
+    };
 }
 pub fn getModuleName(si: *SelfInfo, io: Io, address: usize) Error![]const u8 {
     _ = si;

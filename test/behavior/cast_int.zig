@@ -142,7 +142,6 @@ fn testIntCast(comptime S: type, a: S, comptime D: type, expected: D) !void {
 }
 
 test "@intCast <= 64 bits" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     try testIntCast(i32, minInt(i32), i64, minInt(i32));
     try testIntCast(i32, maxInt(i32), i64, maxInt(i32));
@@ -166,8 +165,17 @@ test "@intCast <= 64 bits" {
     try testIntCast(i64, maxInt(u32), u32, maxInt(u32));
 }
 
+test "@intCast with no value bits in common" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+    try testIntCast(i1, 0, usize, 0);
+    try testIntCast(i1, 0, u32, 0);
+    try testIntCast(i1, 0, u1, 0);
+    try testIntCast(u8, 0, i1, 0);
+    try testIntCast(u64, 0, i1, 0);
+    try testIntCast(u1, 0, i1, 0);
+}
+
 test "@intCast > 128 bits" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     try testIntCast(u8, 123, u140, 123);
@@ -211,4 +219,26 @@ test "@intCast > 128 bits" {
     try testIntCast(u32, maxInt(u32), i255, maxInt(u32));
     try testIntCast(u64, maxInt(u64), i255, maxInt(u64));
     try testIntCast(u128, maxInt(u128), i255, maxInt(u128));
+}
+
+test "@intCast and @truncate of a wide integer parameter while other parameters are live" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        noinline fn trunc(a: u256, shift: u6, b: u64) u64 {
+            const t: u64 = @truncate(a);
+            return (t >> shift) +% b;
+        }
+        noinline fn widen(a: i200, b: u64) i300 {
+            const w: i300 = a;
+            return w + b;
+        }
+        noinline fn narrow(a: u256, b: u8) u140 {
+            const n: u140 = @intCast(a);
+            return n + b;
+        }
+    };
+    try expect(S.trunc((1 << 200) | 0xf0, 4, 1) == 0x10);
+    try expect(S.widen(-1 << 150, 3) == (-1 << 150) + 3);
+    try expect(S.narrow((1 << 139) | 5, 2) == (1 << 139) | 7);
 }

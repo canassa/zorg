@@ -260,7 +260,9 @@ pub fn createEmpty(
             .tag = .elf,
             .comp = comp,
             .emit = emit,
-            .gc_sections = options.gc_sections orelse (optimize_mode != .debug and output_mode != .Obj),
+            // A later incremental update can reference a section that nothing referenced before.
+            .gc_sections = options.gc_sections orelse
+                (optimize_mode != .debug and output_mode != .Obj and !comp.config.incremental),
             .print_gc_sections = options.print_gc_sections,
             .stack_size = options.stack_size orelse 16777216,
             .allow_shlib_undefined = options.allow_shlib_undefined orelse !is_native_os,
@@ -901,6 +903,7 @@ fn flushInner(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id) !void {
                 },
                 else => |e| return e,
             };
+            zo.clearDeadFrameRanges(self, atom_index, code);
             try self.pwriteAll(code, file_offset);
         }
 

@@ -501,6 +501,15 @@ pub const Register = struct {
         pub const fp: Alias = .r29;
         pub const lr: Alias = .r30;
 
+        pub fn dwarfNum(ra: Alias) u7 {
+            return switch (@backingInt(ra)) {
+                @backingInt(Alias.r0)...@backingInt(Alias.r30) => @backingInt(ra) - @backingInt(Alias.r0),
+                @backingInt(Alias.sp) => 31,
+                @backingInt(Alias.v0)...@backingInt(Alias.v31) => (@backingInt(ra) - @backingInt(Alias.v0)) + 64,
+                else => unreachable,
+            };
+        }
+
         pub fn alias(ra: Alias, fa: Format.Alias) Register {
             switch (fa) {
                 .general => assert(@backingInt(ra) >= @backingInt(Alias.r0) and @backingInt(ra) <= @backingInt(Alias.sp)),
@@ -837,6 +846,7 @@ pub const Register = struct {
             else
                 null,
             'f' => return if (toLowerEqlAssertLower(reg, "fp")) .fp else null,
+            'l' => return if (toLowerEqlAssertLower(reg, "lr")) .lr else null,
             'p' => return if (toLowerEqlAssertLower(reg, "pc")) .pc else null,
             'v' => if (std.fmt.parseInt(u5, reg[1..], 10)) |n| .{
                 .alias = @fromBackingInt(@intCast(@backingInt(Alias.v0) + n)),
@@ -2018,6 +2028,50 @@ pub const Instruction = packed union {
                 return imm;
             }
 
+            /// Encodes `imm`, a value of the register width, as a logical
+            /// (bitmask) immediate: a rotated run of ones repeated in elements
+            /// of 2 to 64 bits. Null when it is not one, as zero and all ones
+            /// never are.
+            pub fn encodeImmediate(imm: u64, sf: Register.GeneralSize) ?Bitmask {
+                const width: u8 = switch (sf) {
+                    .word => 32,
+                    .doubleword => 64,
+                };
+                const full = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - width);
+                assert(imm & ~full == 0);
+                if (imm == 0 or imm == full) return null;
+                var elem_width: u8 = 2;
+                while (elem_width <= width) : (elem_width <<= 1) {
+                    const emask = full >> @intCast(width - elem_width);
+                    const elem = imm & emask;
+                    if (imm != elem * @divExact(full, emask)) continue;
+                    // The ones of the element form one run, rotated. A run
+                    // that wraps around the element boundary contains bit 0,
+                    // so when bit 0 is set, find the run of zeros instead,
+                    // which does not wrap.
+                    const inverted = elem & 1 != 0;
+                    const run = if (inverted) ~elem & emask else elem;
+                    const run_lsb: u6 = @intCast(@ctz(run));
+                    const run_len: u8 = @popCount(run);
+                    if (run >> run_lsb != (@as(u64, 1) << @intCast(run_len)) - 1) continue;
+                    const above_run = elem_width - run_lsb - run_len;
+                    // `ones` ones rotated right by `rotation` give the element.
+                    const ones: u8, const rotation: u8 = if (inverted)
+                        .{ elem_width - run_len, above_run }
+                    else
+                        .{ run_len, above_run + run_len };
+                    return .{
+                        .N = if (elem_width == 64) .doubleword else .word,
+                        .immr = @intCast(rotation),
+                        // The bits of `imms` above the run length encode the
+                        // element width: 0b0xxxxx for 32 bits, 0b10xxxx for
+                        // 16, ..., 0b11110x for 2, and N for 64.
+                        .imms = @as(u6, @intCast(ones - 1)) | @as(u6, @truncate(~(2 * @as(u64, elem_width) - 1))),
+                    };
+                }
+                return null;
+            }
+
             pub fn decodeBitfield(bitmask: Bitmask, sf: Register.GeneralSize) struct { u64, u64 } {
                 assert(bitmask.validBitfield(sf));
                 return bitmask.decode(sf);
@@ -2535,7 +2589,7 @@ pub const Instruction = packed union {
             };
             pub fn decode(inst: @This()) @This().Decoded {
                 return switch (inst.group.op2) {
-                    0b000, 0b001 => .unallocated,
+                    0b000, 0b001, 0b011 => .unallocated,
                     0b010 => switch (inst.group.Rt) {
                         no_reg => .{ .clrex = inst.clrex },
                         else => .unallocated,
@@ -3044,6 +3098,7 @@ pub const Instruction = packed union {
     /// C4.1.88 Loads and Stores
     pub const LoadStore = packed union {
         group: @This().Group,
+        exclusive: Exclusive,
         register_literal: RegisterLiteral,
         memory: Memory,
         no_allocate_pair_offset: NoAllocatePairOffset,
@@ -3069,6 +3124,20 @@ pub const Instruction = packed union {
             op1: bool,
             decoded27: u1 = 0b1,
             op0: u4,
+        };
+
+        /// Scalar load/store exclusive register instructions.
+        pub const Exclusive = packed struct {
+            Rt: Register.Encoded,
+            Rn: Register.Encoded,
+            Rt2: u5 = 31,
+            ordered: bool,
+            Rs: Register.Encoded,
+            pair: bool = false,
+            load: bool,
+            o2: bool = false,
+            decoded24: u6 = 0b001000,
+            size: u2,
         };
 
         /// Load register (literal)
@@ -5608,6 +5677,7 @@ pub const Instruction = packed union {
 
         pub const Decoded = union(enum) {
             unallocated,
+            exclusive: Exclusive,
             register_literal: RegisterLiteral,
             memory: Memory,
             no_allocate_pair_offset: NoAllocatePairOffset,
@@ -5624,6 +5694,13 @@ pub const Instruction = packed union {
         pub fn decode(inst: @This()) @This().Decoded {
             return switch (inst.group.op0) {
                 else => .unallocated,
+                0b0000, 0b0100, 0b1000, 0b1100 => if (inst.group.op2 == 0 and
+                    !inst.group.op1 and !inst.exclusive.pair and !inst.exclusive.o2 and
+                    inst.exclusive.Rt2 == 31 and (!inst.exclusive.load or
+                    inst.exclusive.Rs == Register.Alias.zr.encode(.{})))
+                    .{ .exclusive = inst.exclusive }
+                else
+                    .unallocated,
                 0b0010, 0b0110, 0b1010, 0b1110 => switch (inst.group.op2) {
                     0b00 => .{ .no_allocate_pair_offset = inst.no_allocate_pair_offset },
                     0b01 => .{ .register_pair_post_indexed = inst.register_pair_post_indexed },
@@ -11307,6 +11384,13 @@ pub const Instruction = packed union {
     pub const AddSubtractOp = enum(u1) {
         add = 0b0,
         sub = 0b1,
+
+        pub fn invert(op: AddSubtractOp) AddSubtractOp {
+            return switch (op) {
+                .add => .sub,
+                .sub => .add,
+            };
+        }
     };
 
     pub const LogicalOpc = enum(u2) {
@@ -12363,6 +12447,14 @@ pub const Instruction = packed union {
     pub fn dcps3(imm: u16) Instruction {
         return .{ .branch_exception_generating_system = .{ .exception_generating = .{
             .dcps3 = .{ .imm16 = imm },
+        } } };
+    }
+    /// C6.2.114 DMB
+    pub fn dmb(option: BranchExceptionGeneratingSystem.Barriers.Option) Instruction {
+        return .{ .branch_exception_generating_system = .{ .barriers = .{
+            .dmb = .{
+                .CRm = option,
+            },
         } } };
     }
     /// C6.2.116 DSB
@@ -14322,6 +14414,71 @@ pub const Instruction = packed union {
             },
         }
     }
+    /// Scalar exclusive load, optionally with acquire ordering.
+    pub fn ldxr(t: Register, n: Register, access_size: u2, acquire: bool) Instruction {
+        assert(t.format.general == (if (access_size == 3) Register.GeneralSize.doubleword else .word));
+        assert(n.format.general == .doubleword);
+        return .{ .load_store = .{ .exclusive = .{
+            .Rt = t.alias.encode(.{}),
+            .Rn = n.alias.encode(.{ .sp = true }),
+            .Rs = Register.Alias.zr.encode(.{}),
+            .ordered = acquire,
+            .load = true,
+            .size = access_size,
+        } } };
+    }
+    /// Scalar exclusive store, optionally with release ordering.
+    pub fn stxr(status: Register, t: Register, n: Register, access_size: u2, release: bool) Instruction {
+        assert(status.format.general == .word);
+        assert(t.format.general == (if (access_size == 3) Register.GeneralSize.doubleword else .word));
+        assert(n.format.general == .doubleword);
+        assert(status.alias != t.alias and status.alias != n.alias);
+        return .{ .load_store = .{ .exclusive = .{
+            .Rt = t.alias.encode(.{}),
+            .Rn = n.alias.encode(.{ .sp = true }),
+            .Rs = status.alias.encode(.{}),
+            .ordered = release,
+            .load = false,
+            .size = access_size,
+        } } };
+    }
+
+    /// C6.2.150 LDAXP / C6.2.217 LDXP: 64-bit exclusive pair load,
+    /// optionally with acquire ordering.
+    pub fn ldxp(t1: Register, t2: Register, n: Register, acquire: bool) Instruction {
+        assert(t1.format.general == .doubleword and t2.format.general == .doubleword);
+        assert(n.format.general == .doubleword);
+        assert(t1.alias != t2.alias);
+        return .{ .load_store = .{ .exclusive = .{
+            .Rt = t1.alias.encode(.{}),
+            .Rn = n.alias.encode(.{ .sp = true }),
+            .Rt2 = @intCast(@backingInt(t2.alias.encode(.{}))),
+            .Rs = Register.Alias.zr.encode(.{}),
+            .ordered = acquire,
+            .pair = true,
+            .load = true,
+            .size = 0b11,
+        } } };
+    }
+    /// C6.2.330 STLXP / C6.2.380 STXP: 64-bit exclusive pair store,
+    /// optionally with release ordering.
+    pub fn stxp(status: Register, t1: Register, t2: Register, n: Register, release: bool) Instruction {
+        assert(status.format.general == .word);
+        assert(t1.format.general == .doubleword and t2.format.general == .doubleword);
+        assert(n.format.general == .doubleword);
+        assert(status.alias != t1.alias and status.alias != t2.alias and status.alias != n.alias);
+        return .{ .load_store = .{ .exclusive = .{
+            .Rt = t1.alias.encode(.{}),
+            .Rn = n.alias.encode(.{ .sp = true }),
+            .Rt2 = @intCast(@backingInt(t2.alias.encode(.{}))),
+            .Rs = status.alias.encode(.{}),
+            .ordered = release,
+            .pair = true,
+            .load = false,
+            .size = 0b11,
+        } } };
+    }
+
     /// C6.2.166 LDR (immediate)
     /// C6.2.167 LDR (literal)
     /// C6.2.168 LDR (register)
@@ -16375,6 +16532,11 @@ pub const Instruction = packed union {
                 .sf = sf,
             },
         } } };
+    }
+    /// C6.2.403 UXTW (alias of UBFM)
+    pub fn uxtw(d: Register, n: Register) Instruction {
+        assert(d.format.general == .doubleword and n.format.general == .word);
+        return ubfm(d, n.alias.x(), .{ .N = .doubleword, .immr = 0, .imms = 31 });
     }
     /// C7.2.353 UCVTF (vector, integer)
     /// C7.2.355 UCVTF (scalar, integer)

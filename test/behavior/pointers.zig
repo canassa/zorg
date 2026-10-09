@@ -779,3 +779,33 @@ test "comptime C pointer to optional pointer" {
     comptime assert(@TypeOf(inner_ptr) == *const *u8);
     comptime assert(@intFromPtr(inner_ptr.*) == 0x1000);
 }
+
+test "pointer arithmetic on many-item pointers to arrays of various sizes" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        noinline fn advance(comptime size: usize, pointer: [*][size]u8, index: usize) [*][size]u8 {
+            return pointer + index;
+        }
+        noinline fn retreat(comptime size: usize, pointer: [*][size]u8, index: usize) [*][size]u8 {
+            return pointer - index;
+        }
+        noinline fn element(values: [2][88]u8, index: usize) [88]u8 {
+            return values[index];
+        }
+    };
+    var address: usize = 0x100000;
+    var offset: usize = 3;
+    var matrix: [2][88]u8 = .{ @splat(0x31), @splat(0x52) };
+    const base = @as(*volatile usize, &address).*;
+    const index = @as(*volatile usize, &offset).*;
+    inline for (.{ 1, 8, 24, 56, 88, 120, 193 }) |size| {
+        const pointer: [*][size]u8 = @ptrFromInt(base);
+        try expect(@intFromPtr(S.advance(size, pointer, index)) == base + size * index);
+        try expect(@intFromPtr(S.retreat(size, pointer, index)) == base - size * index);
+    }
+    const selected = S.element(@as(*volatile [2][88]u8, &matrix).*, index - 2);
+    try expect(selected[0] == 0x52 and selected[87] == 0x52);
+}

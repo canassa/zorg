@@ -1,0 +1,63 @@
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{d}\n", .{caller(7)});
+}
+fn caller(x: u32) u32 {
+    return helper(x) + helper(x + 1);
+}
+fn helper(x: u32) u32 {
+    return x * 2;
+}
+#}
+#update
+#check stdout {
+30
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{d}\n", .{caller(7)});
+}
+fn caller(x: u32) u32 {
+    return helper(x) + helper(x + 1);
+}
+fn helper(x: u32) u32 {
+    return x * 3;
+}
+#}
+#update {
+change the callee body#}
+#check stdout {
+45
+#}
+
+#write main.zig {
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+pub fn main() !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{d}\n", .{caller(7)});
+}
+fn caller(x: u32) u32 {
+    return helper(x) + helper(x + 1);
+}
+fn helper(x: u32) u32 {
+    if (x == 7) return 100;
+    return x * 3;
+}
+#}
+#update {
+change the callee body to add a branch#}
+#check stdout {
+124
+#}

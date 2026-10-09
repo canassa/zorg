@@ -183,7 +183,6 @@ test "function pointer field call on global extern struct, conditional on global
 }
 
 test "function pointer field call on global extern struct" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const S = struct {
@@ -194,4 +193,29 @@ test "function pointer field call on global extern struct" {
 
     callbacks = Callbacks{ .key_callback = S.keyCallback };
     try std.testing.expectEqual(42, callbacks.key_callback(42));
+}
+
+fn globalPointerTarget() u32 {
+    return 1234;
+}
+var global_pointer_int: u32 = 0;
+var global_fn_pointer: *const fn () u32 = globalPointerTarget;
+var global_int_pointer: *u32 = &global_pointer_int;
+threadlocal var threadlocal_int_pointer: *u32 = &global_pointer_int;
+
+test "globals initialized with only a pointer" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    try expect(global_fn_pointer() == 1234);
+    try expect(global_int_pointer == &global_pointer_int);
+}
+
+test "threadlocal initialized with only a pointer" {
+    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    try expect(threadlocal_int_pointer == &global_pointer_int);
 }

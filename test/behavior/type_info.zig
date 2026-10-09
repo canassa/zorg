@@ -369,7 +369,6 @@ test "type info: function type info" {
 }
 
 fn testFunction() !void {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
 
     const S = struct {
         export fn typeInfoFoo() callconv(.c) usize {

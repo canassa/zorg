@@ -315,7 +315,30 @@ pub fn printInstruction(dis: Disassemble, inst: aarch64.encoding.Instruction, wr
                 }),
                 else => |decoded| return writer.print("{f}", .{fmtCase(decoded, dis.case)}),
             },
-            .barriers => {},
+            .barriers => |barriers| switch (barriers.decode()) {
+                .unallocated => break :unallocated,
+                inline .dsb, .dmb, .isb => |encoded, mnemonic| {
+                    if (std.enums.tagName(@TypeOf(encoded.CRm), encoded.CRm) != null) return writer.print("{f}{s}{f}", .{
+                        fmtCase(mnemonic, dis.case),
+                        dis.mnemonic_operands_separator,
+                        fmtCase(encoded.CRm, dis.case),
+                    });
+                    return writer.print("{f}{s}#0x{x}", .{
+                        fmtCase(mnemonic, dis.case),
+                        dis.mnemonic_operands_separator,
+                        @backingInt(encoded.CRm),
+                    });
+                },
+                .clrex => |encoded| return if (encoded.CRm == 15)
+                    writer.print("{f}", .{fmtCase(.clrex, dis.case)})
+                else
+                    writer.print("{f}{s}#0x{x}", .{
+                        fmtCase(.clrex, dis.case),
+                        dis.mnemonic_operands_separator,
+                        encoded.CRm,
+                    }),
+                .sb => return writer.print("{f}", .{fmtCase(.sb, dis.case)}),
+            },
             .pstate => |pstate| {
                 const decoded = pstate.decode();
                 if (decoded == .unallocated) break :unallocated;
@@ -375,6 +398,37 @@ pub fn printInstruction(dis: Disassemble, inst: aarch64.encoding.Instruction, wr
         },
         .load_store => |load_store| switch (load_store.decode()) {
             .unallocated => break :unallocated,
+            .exclusive => |exclusive| {
+                const Mnemonic = enum { ldxrb, ldaxrb, stxrb, stlxrb, ldxrh, ldaxrh, stxrh, stlxrh, ldxr, ldaxr, stxr, stlxr };
+                const mnemonic: Mnemonic = switch (exclusive.size) {
+                    0 => if (exclusive.load)
+                        if (exclusive.ordered) .ldaxrb else .ldxrb
+                    else if (exclusive.ordered) .stlxrb else .stxrb,
+                    1 => if (exclusive.load)
+                        if (exclusive.ordered) .ldaxrh else .ldxrh
+                    else if (exclusive.ordered) .stlxrh else .stxrh,
+                    2, 3 => if (exclusive.load)
+                        if (exclusive.ordered) .ldaxr else .ldxr
+                    else if (exclusive.ordered) .stlxr else .stxr,
+                };
+                const sf: aarch64.encoding.Register.GeneralSize = if (exclusive.size == 3) .doubleword else .word;
+                if (exclusive.load) return writer.print("{f}{s}{f}{s}[{f}]", .{
+                    fmtCase(mnemonic, dis.case),
+                    dis.mnemonic_operands_separator,
+                    exclusive.Rt.decode(.{}).general(sf).fmtCase(dis.case),
+                    dis.operands_separator,
+                    exclusive.Rn.decode(.{ .sp = true }).x().fmtCase(dis.case),
+                });
+                return writer.print("{f}{s}{f}{s}{f}{s}[{f}]", .{
+                    fmtCase(mnemonic, dis.case),
+                    dis.mnemonic_operands_separator,
+                    exclusive.Rs.decode(.{}).w().fmtCase(dis.case),
+                    dis.operands_separator,
+                    exclusive.Rt.decode(.{}).general(sf).fmtCase(dis.case),
+                    dis.operands_separator,
+                    exclusive.Rn.decode(.{ .sp = true }).x().fmtCase(dis.case),
+                });
+            },
             .register_literal => {},
             .memory => {},
             .no_allocate_pair_offset => {},
@@ -1438,6 +1492,34 @@ pub const RegisterFormatter = struct {
         }
     }
 };
+
+test "exclusive atomic encoding and disassembly" {
+    const Instruction = aarch64.encoding.Instruction;
+    const cases = [_]struct { inst: Instruction, bits: u32, text: []const u8 }{
+        .{ .inst = .ldxr(.w0, .x1, 0, false), .bits = 0x085f7c20, .text = "ldxrb w0, [x1]" },
+        .{ .inst = .ldxr(.w0, .x1, 0, true), .bits = 0x085ffc20, .text = "ldaxrb w0, [x1]" },
+        .{ .inst = .stxr(.w2, .w0, .x1, 0, false), .bits = 0x08027c20, .text = "stxrb w2, w0, [x1]" },
+        .{ .inst = .stxr(.w2, .w0, .x1, 0, true), .bits = 0x0802fc20, .text = "stlxrb w2, w0, [x1]" },
+        .{ .inst = .ldxr(.w0, .x1, 1, false), .bits = 0x485f7c20, .text = "ldxrh w0, [x1]" },
+        .{ .inst = .ldxr(.w0, .x1, 1, true), .bits = 0x485ffc20, .text = "ldaxrh w0, [x1]" },
+        .{ .inst = .stxr(.w2, .w0, .x1, 1, false), .bits = 0x48027c20, .text = "stxrh w2, w0, [x1]" },
+        .{ .inst = .stxr(.w2, .w0, .x1, 1, true), .bits = 0x4802fc20, .text = "stlxrh w2, w0, [x1]" },
+        .{ .inst = .ldxr(.w0, .x1, 2, false), .bits = 0x885f7c20, .text = "ldxr w0, [x1]" },
+        .{ .inst = .ldxr(.w0, .x1, 2, true), .bits = 0x885ffc20, .text = "ldaxr w0, [x1]" },
+        .{ .inst = .stxr(.w2, .w0, .x1, 2, false), .bits = 0x88027c20, .text = "stxr w2, w0, [x1]" },
+        .{ .inst = .stxr(.w2, .w0, .x1, 2, true), .bits = 0x8802fc20, .text = "stlxr w2, w0, [x1]" },
+        .{ .inst = .ldxr(.x0, .x1, 3, false), .bits = 0xc85f7c20, .text = "ldxr x0, [x1]" },
+        .{ .inst = .ldxr(.x0, .x1, 3, true), .bits = 0xc85ffc20, .text = "ldaxr x0, [x1]" },
+        .{ .inst = .stxr(.w2, .x0, .x1, 3, false), .bits = 0xc8027c20, .text = "stxr w2, x0, [x1]" },
+        .{ .inst = .stxr(.w2, .x0, .x1, 3, true), .bits = 0xc802fc20, .text = "stlxr w2, x0, [x1]" },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.bits, @as(u32, @bitCast(case.inst)));
+        try std.testing.expectFmt(case.text, "{f}", .{case.inst});
+    }
+    try std.testing.expectEqual(@as(u32, 0xd5033bbf), @as(u32, @bitCast(Instruction.dmb(.ish))));
+    try std.testing.expectFmt("dmb ish", "{f}", .{Instruction.dmb(.ish)});
+}
 
 const aarch64 = @import("../aarch64.zig");
 const Disassemble = @This();

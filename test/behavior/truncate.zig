@@ -48,7 +48,6 @@ fn testTruncate(comptime S: type, a: S, comptime D: type, expected: D) !void {
 }
 
 test "@truncate > 128 bits" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     try testTruncate(u140, 0, u128, 0);
@@ -86,7 +85,6 @@ test "@truncate > 128 bits" {
 }
 
 test "truncate on vectors" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;

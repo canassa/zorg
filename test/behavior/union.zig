@@ -572,7 +572,6 @@ test "tagged union type" {
 }
 
 test "tagged union as return value" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
@@ -615,7 +614,6 @@ test "tagged union with all void fields but a meaningful tag" {
 }
 
 test "union(enum(u32)) with specified and unspecified tag values" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -763,7 +761,6 @@ fn Setter(comptime attr: Attribute) type {
 }
 
 test "return union init with void payload" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -911,7 +908,6 @@ test "anonymous union literal syntax" {
 }
 
 test "function call result coerces from tagged union to the tag" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -1143,7 +1139,6 @@ test "union tag is set when initiated as a temporary value at runtime" {
 }
 
 test "extern union most-aligned field is smaller" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -1302,7 +1297,6 @@ test "union field ptr - zero sized field" {
 test "packed union in packed struct" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const S = packed struct {
@@ -1497,7 +1491,6 @@ test "undefined-layout union field pointer has correct alignment" {
 }
 
 test "packed union field pointer has correct alignment" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest; // TODO
@@ -1531,7 +1524,6 @@ test "packed union field pointer has correct alignment" {
 }
 
 test "union with 128 bit integer" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
 
     const ValueTag = enum { int, other };
 
@@ -1676,7 +1668,6 @@ test "reinterpret extern union" {
 }
 
 test "reinterpret packed union" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const U = packed union {
@@ -1754,7 +1745,6 @@ test "reinterpret packed union" {
 }
 
 test "reinterpret packed union inside packed struct" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest; // TODO
 
@@ -1860,7 +1850,6 @@ test "extern union initialized via reintepreted struct field initializer" {
 }
 
 test "packed union initialized via reintepreted struct field initializer" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const bytes = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
@@ -1906,7 +1895,6 @@ test "store of comptime reinterpreted memory to extern union" {
 }
 
 test "store of comptime reinterpreted memory to packed union" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const bytes = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
@@ -1945,7 +1933,6 @@ test "union field is a pointer to an aligned version of itself" {
 }
 
 test "pass register-sized field as non-register-sized union" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
@@ -2057,7 +2044,6 @@ test "copied union field doesn't alias source" {
 }
 
 test "create union(enum) from other union(enum)" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
@@ -2290,4 +2276,201 @@ test "union with function body field" {
     y.f = U.foo;
     try std.testing.expect(y.f == U.foo);
     y.f();
+}
+
+test "assign a union whose tag has no runtime bits through a pointer" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const Literal = union(enum) {
+        number: f64,
+        boolean: bool,
+    };
+    const ExprTag = enum(u32) { literal = 33 };
+    const Expr = union(ExprTag) { literal: Literal };
+    const Frame = extern struct {
+        before: u64,
+        value: [@sizeOf(Expr)]u8 align(@alignOf(Expr)),
+        after: u64,
+    };
+    const S = struct {
+        noinline fn assign(value: *Expr) void {
+            value.* = .{ .literal = .{ .boolean = true } };
+        }
+    };
+    var frame: Frame = .{
+        .before = 0x1122334455667788,
+        .value = undefined,
+        .after = 0x8877665544332211,
+    };
+    const value: *Expr = @ptrCast(&frame.value);
+    S.assign(value);
+    const observed: *volatile Frame = &frame;
+    try expect(observed.before == 0x1122334455667788);
+    try expect(observed.after == 0x8877665544332211);
+    try expect(value.literal.boolean);
+    const tag: ExprTag = value.*;
+    try expect(tag == .literal);
+}
+
+test "decode a union whose branches group their payload words differently" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const Configuration = std.Build.Configuration;
+    const S = struct {
+        noinline fn decode(words: []const u32, end: *usize) Configuration.LazyPath {
+            return Configuration.Storage.data(words, end, Configuration.LazyPath);
+        }
+    };
+    var end: usize = 0;
+    const source = S.decode(&.{ 0, 17, 29 }, &end);
+    try expect(end == 3);
+    try expect(source == .source_path);
+    try expect(@backingInt(source.source_path.owner) == 17);
+    try expect(@backingInt(source.source_path.sub_path) == 29);
+    end = 0;
+    const relative = S.decode(&.{ 1, 43 }, &end);
+    try expect(end == 2);
+    try expect(relative == .relative);
+    try expect(@backingInt(relative.relative.sub_path) == 43);
+    end = 0;
+    const generated = S.decode(&.{ 2, 61, 73 }, &end);
+    try expect(end == 3);
+    try expect(generated == .generated);
+    try expect(@backingInt(generated.generated.index) == 61);
+    try expect(@backingInt(generated.generated.sub_path) == 73);
+}
+
+test "extract union fields from by-value unions" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        const Fragmented = union(enum) {
+            bytes: [33]u8,
+            pair: [2]u64,
+            number: u64,
+            float: f64,
+            slice: []const u8,
+        };
+        const ThreeWords = extern struct { flags: u32, owner: u32, sub_path: u32 };
+        const Path = union(enum(u8)) {
+            source: ThreeWords,
+            relative: extern struct { flags: u32, sub_path: u32 },
+            generated: ThreeWords,
+        };
+        const ByteTag = enum(u64) { byte = 13, other = 29 };
+        const TaggedByte = union(ByteTag) { byte: u8, other: u8 };
+
+        noinline fn byte(value: TaggedByte) u8 {
+            return value.byte;
+        }
+        noinline fn byteTag(value: TaggedByte) ByteTag {
+            return value;
+        }
+        noinline fn source(path: Path) ThreeWords {
+            return path.source;
+        }
+        noinline fn bytes(value: Fragmented) [33]u8 {
+            return value.bytes;
+        }
+        noinline fn pair(value: Fragmented) [2]u64 {
+            return value.pair;
+        }
+        noinline fn number(value: Fragmented) u64 {
+            return value.number;
+        }
+        noinline fn float(value: Fragmented) f64 {
+            return value.float;
+        }
+        noinline fn slice(value: Fragmented) []const u8 {
+            return value.slice;
+        }
+    };
+    try expect(S.byte(.{ .byte = 199 }) == 199);
+    try expect(S.byteTag(.{ .byte = 199 }) == .byte);
+    try expect(S.byteTag(.{ .other = 73 }) == .other);
+    const path = S.source(.{ .source = .{ .flags = 17, .owner = 29, .sub_path = 43 } });
+    try expect(path.flags == 17 and path.owner == 29 and path.sub_path == 43);
+    var original: S.Fragmented = .{ .bytes = @splat(37) };
+    const copied = S.bytes(original);
+    original.bytes[0] = 99;
+    try expect(copied[0] == 37 and copied[32] == 37 and original.bytes[0] == 99);
+    try expect(std.mem.eql(u64, &S.pair(.{ .pair = .{ 101, 203 } }), &.{ 101, 203 }));
+    try expect(S.number(.{ .number = 709 }) == 709);
+    try expect(S.float(.{ .float = -13.5 }) == -13.5);
+    try expect(std.mem.eql(u8, S.slice(.{ .slice = "fragmented" }), "fragmented"));
+}
+
+test "copy a union with a padded payload through an error union" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        const Padded = union(enum(u32)) { bytes: [6]u8, number: u32 };
+        noinline fn read(value: *const Padded, fail: bool) error{Missing}!Padded {
+            if (fail) return error.Missing;
+            return value.*;
+        }
+        noinline fn copy(out: *Padded, value: *const Padded, fail: bool) error{Missing}!void {
+            out.* = try read(value, fail);
+        }
+    };
+    const bytes: S.Padded = .{ .bytes = .{ 13, 29, 47, 61, 83, 101 } };
+    var out: S.Padded = .{ .number = 0x12345678 };
+    try S.copy(&out, &bytes, false);
+    try expect(std.mem.eql(u8, &bytes.bytes, &out.bytes));
+    const number: S.Padded = .{ .number = 0x89abcdef };
+    try S.copy(&out, &number, false);
+    try expect(out.number == number.number);
+    try std.testing.expectError(error.Missing, S.copy(&out, &bytes, true));
+    try expect(out.number == number.number);
+}
+
+test "array of union constants whose active field is smaller than the payload" {
+    const U = union(enum) {
+        none,
+        string: []const u8,
+        list: struct { items: []u32, capacity: usize, context: ?*anyopaque },
+    };
+    const S = struct {
+        fn check(unions: [3]U) !void {
+            try expect(unions[0] == .none);
+            try expect(std.mem.eql(u8, unions[1].string, "weeee"));
+            try expect(unions[2].list.items.len == 2);
+            try expect(unions[2].list.items[1] == 4);
+            try expect(unions[2].list.capacity == 2);
+        }
+    };
+    var items = [_]u32{ 3, 4 };
+    const unions = [_]U{
+        .none,
+        .{ .string = "weeee" },
+        .{ .list = .{ .items = &items, .capacity = items.len, .context = null } },
+    };
+    try S.check(unions);
+}
+
+test "union initialized with the address of a local" {
+    const U = union(enum) { a: *u32, b: *u64 };
+    const S = struct {
+        noinline fn get(u: U) u64 {
+            return switch (u) {
+                .a => |p| p.*,
+                .b => |p| p.*,
+            };
+        }
+        fn run() !void {
+            var x: u32 = 5;
+            var y: struct { pad: u32, value: u64 } = .{ .pad = 1, .value = 7 };
+            try expect(get(.{ .a = &x }) == 5);
+            try expect(get(.{ .b = &y.value }) == 7);
+        }
+    };
+    try S.run();
 }

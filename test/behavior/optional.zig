@@ -59,7 +59,6 @@ fn testNullPtrsEql() !void {
 }
 
 test "optional with zero-bit type" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     const S = struct {
@@ -359,7 +358,6 @@ test "0-bit child type coerced to optional return ptr result location" {
 }
 
 test "0-bit child type coerced to optional" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     const S = struct {
@@ -420,7 +418,6 @@ test "array of optional unaligned types" {
 }
 
 test "optional pointer to zero bit optional payload" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
@@ -517,7 +514,6 @@ test "orelse on C pointer" {
 }
 
 test "alignment of wrapping an optional payload" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
@@ -547,7 +543,6 @@ test "Optional slice size is optimized" {
 }
 
 test "Optional slice passed to function" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -590,7 +585,6 @@ test "peer type resolution in nested if expressions" {
 }
 
 test "cast slice to const slice nested in error union and optional" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
@@ -613,7 +607,6 @@ test "variable of optional of noreturn" {
 }
 
 test "copied optional doesn't alias source" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
@@ -627,7 +620,6 @@ test "copied optional doesn't alias source" {
 }
 
 test "result location initialization of optional with OPV payload" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -671,4 +663,147 @@ test "optional ptr payload alignment" {
     };
     var x: ?u32 = 10;
     try S.doTheTest(&x);
+}
+
+test "optional elements loaded from a slice in a loop define payload and flag" {
+    const Index = enum(u32) { none = std.math.maxInt(u32), _ };
+    const S = struct {
+        noinline fn sumEnum(s: []const ?Index) u64 {
+            var total: u64 = 0;
+            for (s, 0..) |temp, i| {
+                const t = temp orelse continue;
+                total += @intFromEnum(t) * (i + 1);
+            }
+            return total;
+        }
+        noinline fn sumByte(s: []const ?u8) u64 {
+            var total: u64 = 0;
+            for (s, 0..) |temp, i| {
+                const t = temp orelse continue;
+                total += @as(u64, t) * (i + 1);
+            }
+            return total;
+        }
+    };
+    var e: [4]?Index = @splat(null);
+    e[1] = @enumFromInt(101);
+    e[3] = @enumFromInt(5);
+    try expectEqual(@as(u64, 222), S.sumEnum(&e));
+    var b: [3]?u8 = @splat(null);
+    b[2] = 11;
+    try expectEqual(@as(u64, 33), S.sumByte(&b));
+}
+
+test "optional struct containing an optional field" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        const Item = struct { node: u32, report: ?u32 };
+        noinline fn lookup(input: *const ?Item) ?Item {
+            return input.*;
+        }
+        noinline fn read(input: *const ?Item) u64 {
+            const value = lookup(input) orelse return 0;
+            return (@as(u64, value.node) << 32) | (value.report orelse 0x76543210);
+        }
+    };
+    var input: ?S.Item = .{ .node = 0x12345678, .report = 0x89abcdef };
+    try expect(S.read(&input) == 0x1234567889abcdef);
+    input = .{ .node = 0xabcdef01, .report = null };
+    try expect(S.read(&input) == 0xabcdef0176543210);
+    input = null;
+    try expect(S.read(&input) == 0);
+}
+
+test "optional of a twelve-byte struct" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        const Triple = struct { a: u32, b: u32, c: u32 };
+        noinline fn lookup(input: *const ?Triple) ?Triple {
+            return input.*;
+        }
+        noinline fn sum(input: *const ?Triple) u64 {
+            const value = lookup(input) orelse return 0;
+            return @as(u64, value.a) + value.b + value.c;
+        }
+    };
+    var input: ?S.Triple = .{ .a = 0x12345678, .b = 0x89abcdef, .c = 0x13579bdf };
+    try expect(S.sum(&input) == @as(u64, 0x12345678) + 0x89abcdef + 0x13579bdf);
+    input = null;
+    try expect(S.sum(&input) == 0);
+}
+
+test "assign a zero-bit payload to an optional through a pointer" {
+    const S = struct {
+        const Empty = struct { value: void };
+        noinline fn setVoid(ptr: *?void) void {
+            ptr.* = {};
+        }
+        noinline fn setStruct(ptr: *?Empty) void {
+            ptr.* = .{ .value = {} };
+        }
+    };
+    var empty_void: ?void = null;
+    S.setVoid(&empty_void);
+    try expect(empty_void != null);
+    var empty_struct: ?S.Empty = null;
+    S.setStruct(&empty_struct);
+    try expect(empty_struct != null);
+}
+
+test "check optionals of several representations through pointers" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        noinline fn present(comptime T: type, ptr: *?T) bool {
+            if (ptr.*) |*payload| {
+                std.mem.doNotOptimizeAway(payload);
+                return true;
+            }
+            return false;
+        }
+    };
+    var number: ?u64 = null;
+    try expect(!S.present(u64, &number));
+    number = 71;
+    try expect(S.present(u64, &number));
+    var zero: ?void = null;
+    try expect(!S.present(void, &zero));
+    zero = {};
+    try expect(S.present(void, &zero));
+    var byte: u8 = 19;
+    var pointer: ?*u8 = null;
+    try expect(!S.present(*u8, &pointer));
+    pointer = &byte;
+    try expect(S.present(*u8, &pointer));
+    var slice: ?[]const u8 = null;
+    try expect(!S.present([]const u8, &slice));
+    slice = "";
+    try expect(S.present([]const u8, &slice));
+}
+
+test "optional negative small integers returned from a call" {
+    const E = enum(i8) { a, _ };
+    const S = struct {
+        fn optionalI8() ?i8 {
+            return -128;
+        }
+        fn optionalI16() ?i16 {
+            return -30000;
+        }
+        fn optionalEnum() ?E {
+            return @fromBackingInt(-128);
+        }
+    };
+    try expect(S.optionalI8().? == -128);
+    try expect(S.optionalI16().? == -30000);
+    try expect(S.optionalEnum().? == @as(E, @fromBackingInt(-128)));
+    try expect(@backingInt(S.optionalEnum().?) == -128);
 }

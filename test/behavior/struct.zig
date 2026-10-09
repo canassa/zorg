@@ -378,7 +378,6 @@ const APackedStruct = packed struct {
 test "packed struct" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
 
     var foo = APackedStruct{
         .x = 1,
@@ -400,7 +399,6 @@ const Foo96Bits = packed struct {
 };
 
 test "packed struct 24bits" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -444,7 +442,6 @@ test "packed struct 24bits" {
 
 test "runtime struct initialization of bitfield" {
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
@@ -483,7 +480,6 @@ const Bitfields = packed struct {
 };
 
 test "packed struct fields are ordered from LSB to MSB" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -502,7 +498,6 @@ test "packed struct fields are ordered from LSB to MSB" {
 }
 
 test "implicit cast packed struct field to const ptr" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest; // TODO
@@ -534,7 +529,6 @@ test "zero-bit field in packed struct" {
 }
 
 test "packed struct with non-ABI-aligned field" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -564,7 +558,6 @@ const bit_field_1 = BitField1{
 };
 
 test "bit field access" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest; // TODO
@@ -619,7 +612,6 @@ test "default struct initialization fields" {
 }
 
 test "packed array 24bits" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -686,7 +678,6 @@ const FooArrayOfAligned = packed struct {
 };
 
 test "pointer to packed struct member in a stack variable" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest; // TODO
@@ -741,7 +732,6 @@ test "packed struct with fp fields" {
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
 
     const S = packed struct {
         data0: f32,
@@ -815,7 +805,6 @@ test "non-packed struct with u128 entry in union" {
 }
 
 test "packed struct field passed to generic function" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -984,7 +973,6 @@ test "struct with 0-length union array field" {
 
 test "packed struct with undefined initializers" {
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -1053,7 +1041,6 @@ test "for loop over pointers to struct, getting field from struct pointer" {
 }
 
 test "anon init through error unions and optionals" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -1117,7 +1104,6 @@ test "anon init through error union" {
 }
 
 test "typed init through error unions and optionals" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -1177,7 +1163,6 @@ test "loading a struct pointer perfoms a copy" {
 }
 
 test "packed struct aggregate init" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
@@ -1197,7 +1182,6 @@ test "packed struct aggregate init" {
 }
 
 test "packed struct field access via pointer" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -1803,7 +1787,6 @@ test "extern struct fields are aligned to 1" {
 }
 
 test "assign to slice.len of global variable" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -2075,7 +2058,6 @@ test "anonymous struct equivalence" {
 }
 
 test "field access through mem ptr arg" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
 
     const S = struct {
@@ -2314,4 +2296,285 @@ test "struct field referencing comptime var isn't comptime" {
     comptime assert(!@typeInfo(@TypeOf(s)).@"struct".field_attrs[0].@"comptime");
     v = 1;
     comptime assert(s.v.* == 1);
+}
+
+test "struct field kept whole in one branch and split across call registers in the other" {
+    const Key = struct { wanted: u32, ctx: u8 };
+    const Pending = struct { node: u32, key: Key };
+    const Gpa = struct { a: usize, b: usize };
+    const List = struct {
+        items: []Pending,
+        capacity: usize,
+
+        noinline fn append(l: *@This(), gpa: Gpa, item: Pending) void {
+            assert(gpa.a + gpa.b == 3);
+            l.items.len += 1;
+            l.items[l.items.len - 1] = item;
+        }
+
+        inline fn add(l: *@This(), gpa: Gpa, item: Pending) void {
+            if (l.items.len < l.capacity) {
+                l.items.len += 1;
+                l.items[l.items.len - 1] = item;
+            } else l.append(gpa, item);
+        }
+
+        noinline fn newWanted(l: *@This(), gpa: Gpa, key: Key) u32 {
+            const n: u32 = @intCast(l.items.len);
+            l.add(gpa, .{ .node = n, .key = key });
+            return n;
+        }
+    };
+    var buf: [6]Pending = undefined;
+    var l: List = .{ .items = buf[0..0], .capacity = 3 };
+    var i: u32 = 0;
+    while (i < 6) : (i += 1) _ = l.newWanted(.{ .a = 1, .b = 2 }, .{ .wanted = 100 + i, .ctx = @intCast(i) });
+    for (l.items, 0..) |p, j| {
+        try expectEqual(@as(u32, @intCast(j)), p.node);
+        try expectEqual(@as(u32, @intCast(100 + j)), p.key.wanted);
+        try expectEqual(@as(u8, @intCast(j)), p.key.ctx);
+    }
+}
+
+test "large, nested and padded aggregates through calls" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        const Big = extern struct { a: u64, b: u64, c: u64 };
+        const Rule = union(enum) {
+            default,
+            undefined,
+            same_value,
+            offset: i64,
+            val_offset: i64,
+            register: u8,
+            expression: []const u8,
+            val_expression: []const u8,
+        };
+        const Result = union(enum) { empty, value: u64 };
+        const Padded = struct { value: ?u128, tail: u64 };
+        const Three = struct { a: u32, b: u32, c: u32 };
+        const Pair = extern struct { a: f32, b: f32 };
+        const Mode = union(enum) { escape_codes, custom: u64 };
+
+        noinline fn flip(input: [512]u8) [512]u8 {
+            var output = input;
+            output[1] +%= 1;
+            output[511] ^= 0x80;
+            return output;
+        }
+        noinline fn optional(value: u64) ?Big {
+            if (value == 0) return null;
+            return .{ .a = value, .b = value +% 2, .c = value +% 4 };
+        }
+        noinline fn fallible(value: u64) error{Missing}!Big {
+            if (value == 0) return error.Missing;
+            return .{ .a = value, .b = value +% 2, .c = value +% 4 };
+        }
+        noinline fn copyRules(input: [32]Rule) [32]Rule {
+            var output = input;
+            output[31] = .{ .offset = -37 };
+            return output;
+        }
+        noinline fn copyOdd(input: [17][17]u8) [17][17]u8 {
+            var output = input;
+            output[16][16] +%= 3;
+            return output;
+        }
+        noinline fn choose(value: u64) Result {
+            if (value == 0) return .empty;
+            return .{ .value = value };
+        }
+        noinline fn makePadded(value: u64) error{Missing}!Padded {
+            if (value == 0) return error.Missing;
+            return .{ .value = value, .tail = 37 };
+        }
+        noinline fn makeThree(a: u32, b: u32, c: u32) error{Missing}!Three {
+            if (a == 0) return error.Missing;
+            return .{ .a = a, .b = b, .c = c };
+        }
+        noinline fn makePair(value: f32) error{Missing}!Pair {
+            if (value == 0) return error.Missing;
+            return .{ .a = value, .b = value + 1 };
+        }
+        noinline fn mode(fail: bool) error{Canceled}!Mode {
+            if (fail) return error.Canceled;
+            return .escape_codes;
+        }
+        noinline fn fill(out: []Big, seed: u64) void {
+            @memset(out, .{ .a = seed, .b = seed +% 2, .c = seed +% 4 });
+        }
+    };
+
+    var input: [512]u8 = undefined;
+    for (&input, 0..) |*byte, index| byte.* = @as(u8, @truncate(index)) +% 5;
+    const output = S.flip(input);
+    try expect(output[0] == 5 and output[1] == 7 and output[2] == 7 and output[511] == (@as(u8, 255) +% 5) ^ 0x80);
+
+    try expect(S.optional(0) == null);
+    const big = S.optional(10).?;
+    try expect(big.a == 10 and big.b == 12 and big.c == 14);
+    try std.testing.expectError(error.Missing, S.fallible(0));
+    const fallible = try S.fallible(20);
+    try expect(fallible.a == 20 and fallible.b == 22 and fallible.c == 24);
+
+    var rules: [32]S.Rule = undefined;
+    for (&rules, 0..) |*rule, index| rule.* = .{ .offset = 100 + @as(i64, @intCast(index)) };
+    const copied_rules = S.copyRules(rules);
+    var sum: i64 = 0;
+    for (copied_rules) |rule| sum += rule.offset;
+    try expect(sum == 31 * 100 + 30 * 31 / 2 - 37);
+
+    var odd: [17][17]u8 = undefined;
+    for (&odd, 0..) |*row, row_index| {
+        for (row, 0..) |*byte, column| byte.* = @intCast(row_index + column);
+    }
+    const copied_odd = S.copyOdd(odd);
+    try expect(copied_odd[0][0] == 0 and copied_odd[16][15] == 31 and copied_odd[16][16] == 35);
+
+    try expect(S.choose(0) == .empty);
+    try expect(S.choose(9).value == 9);
+    try std.testing.expectError(error.Missing, S.makePadded(0));
+    const padded = try S.makePadded(5);
+    try expect(padded.value.? == 5 and padded.tail == 37);
+    const three = try S.makeThree(1, 2, 3);
+    try expect(three.a == 1 and three.b == 2 and three.c == 3);
+    const pair = try S.makePair(1.5);
+    try expect(pair.a == 1.5 and pair.b == 2.5);
+    try expect(try S.mode(false) == .escape_codes);
+    try std.testing.expectError(error.Canceled, S.mode(true));
+
+    var bigs: [5]S.Big = undefined;
+    S.fill(&bigs, 40);
+    for (bigs) |b| try expect(b.a == 40 and b.b == 42 and b.c == 44);
+    var maybes: [16]?S.Three = undefined;
+    @memset(&maybes, null);
+    maybes[7] = .{ .a = 1, .b = 2, .c = 3 };
+    for (maybes, 0..) |maybe, index| try expect((maybe != null) == (index == 7));
+}
+
+test "extern struct initialized with a packed field across call registers" {
+    const S = struct {
+        const Status = enum(u2) { pass, fail, skip };
+        const Flags = packed struct(u64) { status: Status, fuzz: bool, a: u30, b: u31 };
+        // `flags` is at offset 4, so the two call registers each hold half of it.
+        const Results = extern struct { index: u32, flags: Flags align(4) };
+        noinline fn check(results: Results, status: Status) !void {
+            try expect(results.index == 7);
+            try expect(results.flags.status == status);
+            try expect(!results.flags.fuzz and results.flags.a == 0 and results.flags.b == 0);
+        }
+    };
+    var index: u32 = 7;
+    var status: S.Status = .skip;
+    _ = .{ &index, &status };
+    try S.check(.{ .index = index, .flags = .{ .status = status, .fuzz = false, .a = 0, .b = 0 } }, status);
+}
+
+const ZeroSizeLastTracker = struct {
+    inline fn to(tracker: *@This(), next: u8) void {
+        _ = tracker;
+        _ = next;
+    }
+};
+
+const ZeroSizeLastInner = struct {
+    delim: u8,
+    offset: usize = 0,
+    buf: [168]u8 = undefined,
+    st: struct { st: [25]u64 = @splat(0) } = .{},
+    transition: ZeroSizeLastTracker = .{},
+};
+
+const ZeroSizeLastOuter = struct {
+    st: ZeroSizeLastInner,
+    buf: [168]u8 = undefined,
+    offset: usize = 0,
+    padded: bool = false,
+
+    const Options = struct { delim: u8 = 0x1f };
+
+    fn init(options: Options) ZeroSizeLastOuter {
+        return ZeroSizeLastOuter{ .st = .{ .delim = options.delim } };
+    }
+
+    fn hash(out: []u8, options: Options) void {
+        var st = ZeroSizeLastOuter.init(options);
+        st.offset += 1;
+        st.st.transition.to(1);
+        out[0] = @truncate(st.offset);
+        out[1] = st.st.delim;
+    }
+};
+
+test "return a struct whose last nested field has zero size" {
+    var delim: u8 = 0x1f;
+    _ = &delim;
+    const outer = ZeroSizeLastOuter.init(.{ .delim = delim });
+    try expect(outer.st.delim == 0x1f);
+    try expect(outer.st.offset == 0);
+    try expect(outer.st.st.st[24] == 0);
+    try expect(outer.offset == 0);
+    try expect(!outer.padded);
+    var out: [2]u8 = undefined;
+    ZeroSizeLastOuter.hash(&out, .{ .delim = delim });
+    try expect(out[0] == 1 and out[1] == 0x1f);
+}
+
+test "returning an extern struct keeps its padding bytes" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // copies of an extern struct value move its fields but not its padding
+
+    const S = struct {
+        const Padded = extern struct {
+            x: u32,
+            y: u32 align(128),
+        };
+
+        fn zeroed() Padded {
+            var item: Padded = undefined;
+            @memset(std.mem.asBytes(&item), 0);
+            return item;
+        }
+    };
+    var padded = S.zeroed();
+    _ = &padded;
+    for (std.mem.asBytes(&padded)) |byte| try expect(byte == 0);
+}
+
+test "union field of a struct argument copied through a tuple and a function" {
+    const Temporary = struct {
+        ty: u32,
+        value: Value,
+        const Value = union(enum) {
+            singleton: u32,
+            range: struct { base: u32, len: u32 },
+        };
+        fn withType(temp: @This(), ty: u32) @This() {
+            return .{ .ty = ty, .value = temp.value };
+        }
+    };
+    const S = struct {
+        noinline fn take(args: struct { u32, Temporary }) void {
+            _ = args;
+        }
+        noinline fn scalar(ty: u32) u32 {
+            return ty & 0xff;
+        }
+        noinline fn convert(p: *u32, ty: u32, src: Temporary) Temporary {
+            _ = p;
+            take(.{ ty, src });
+            if (scalar(ty) == scalar(src.ty)) return src.withType(ty);
+            return .{ .ty = ty, .value = .{ .singleton = 9 } };
+        }
+    };
+    var n: u32 = 0;
+    const a = S.convert(&n, 0x105, .{ .ty = 0x205, .value = .{ .singleton = 7 } });
+    try expect(a.ty == 0x105 and a.value.singleton == 7);
+    const b = S.convert(&n, 0x105, .{ .ty = 0x205, .value = .{ .range = .{ .base = 3, .len = 4 } } });
+    try expect(b.ty == 0x105 and b.value.range.base == 3 and b.value.range.len == 4);
+    const c = S.convert(&n, 0x105, .{ .ty = 0x206, .value = .{ .range = .{ .base = 3, .len = 4 } } });
+    try expect(c.ty == 0x105 and c.value.singleton == 9);
 }

@@ -230,6 +230,21 @@ pub const Feature = enum {
     /// Like `soft_f16`, but for 128-bit floating-point types.
     soft_f128,
 
+    /// Replace the following operations on scalar integers of 129 to 65535 bits with calls to
+    /// compiler_rt routines that take the integers in memory (`__mulo_limb64`, `__udivei5` and
+    /// so on): `mul`, `mul_wrap`, `mul_safe`, `mul_with_overflow`, `div_trunc`, `div_floor`,
+    /// `div_ceil`, `div_exact`, `rem`, `mod`, `bit_and`, `bit_or`, `xor`, `not`, `shl`,
+    /// `shl_exact`, `shr`, `shr_exact`, `clz`, `ctz`, `popcount`, `byte_swap`, `bit_reverse`,
+    /// `abs` of signed integers, `max` and `min`. Do the same for `shl_with_overflow` of integers
+    /// of more than 64 bits, and replace their `add_sat`, `sub_sat`, `mul_sat` and `shl_sat`
+    /// with the corresponding `*_with_overflow` and a selection of the saturated value. The
+    /// expansions use `add`, `sub`, `add_with_overflow`, `sub_with_overflow`, `cmp_*` and
+    /// `int_cast` on the same integers, which the backend must lower.
+    ///
+    /// If this feature is enabled, the following AIR instruction tags may be emitted:
+    /// * `.legalize_compiler_rt_call`
+    soft_big_int,
+
     fn scalarize(tag: Air.Inst.Tag) Feature {
         return switch (tag) {
             else => unreachable,
@@ -387,6 +402,22 @@ fn legalizeBody(l: *Legalize, body_start: usize, body_len: usize) Error!void {
             => |air_tag| {
                 const bin_op = l.air_instructions.items(.data)[@backingInt(inst)].bin_op;
                 const ty = l.typeOf(bin_op.lhs);
+                switch (air_tag) {
+                    else => {},
+                    .mul => if (l.wantSoftBigInt(ty, 128)) continue :inst l.replaceInst(
+                        inst,
+                        .block,
+                        try l.softBigIntOpBlockPayload(inst, .__mulo_limb64, bin_op.lhs, bin_op.rhs),
+                    ),
+                    .div_exact, .rem => if (l.wantSoftBigInt(ty, 128)) continue :inst l.replaceInst(
+                        inst,
+                        .block,
+                        try l.softBigIntDivBlockPayload(inst, if (air_tag == .rem) .rem else .div),
+                    ),
+                    .min, .max => if (l.wantSoftBigInt(ty, 128)) {
+                        continue :inst l.replaceInst(inst, .block, try l.softBigIntMinMaxBlockPayload(inst));
+                    },
+                }
                 switch (l.wantScalarizeOrSoftFloat(air_tag, ty)) {
                     .none => {},
                     .scalarize => continue :inst l.replaceInst(inst, .block, try l.scalarizeBlockPayload(inst, .bin_op)),
@@ -404,7 +435,17 @@ fn legalizeBody(l: *Legalize, body_start: usize, body_len: usize) Error!void {
             .div_floor_optimized,
             => |air_tag| {
                 const bin_op = l.air_instructions.items(.data)[@backingInt(inst)].bin_op;
-                switch (l.wantScalarizeOrSoftFloat(air_tag, l.typeOf(bin_op.lhs))) {
+                const ty = l.typeOf(bin_op.lhs);
+                switch (air_tag) {
+                    else => {},
+                    .div_trunc => if (l.wantSoftBigInt(ty, 128)) {
+                        continue :inst l.replaceInst(inst, .block, try l.softBigIntDivBlockPayload(inst, .div));
+                    },
+                    .div_floor => if (l.wantSoftBigInt(ty, 128)) {
+                        continue :inst l.replaceInst(inst, .block, try l.softBigIntFloorModBlockPayload(inst));
+                    },
+                }
+                switch (l.wantScalarizeOrSoftFloat(air_tag, ty)) {
                     .none => {},
                     .scalarize => continue :inst l.replaceInst(inst, .block, try l.scalarizeBlockPayload(inst, .bin_op)),
                     .soft_float => continue :inst l.replaceInst(inst, .block, try l.softFloatDivTruncFloorCeilBlockPayload(
@@ -417,7 +458,11 @@ fn legalizeBody(l: *Legalize, body_start: usize, body_len: usize) Error!void {
             },
             inline .mod, .mod_optimized => |air_tag| {
                 const bin_op = l.air_instructions.items(.data)[@backingInt(inst)].bin_op;
-                switch (l.wantScalarizeOrSoftFloat(air_tag, l.typeOf(bin_op.lhs))) {
+                const ty = l.typeOf(bin_op.lhs);
+                if (air_tag == .mod and l.wantSoftBigInt(ty, 128)) {
+                    continue :inst l.replaceInst(inst, .block, try l.softBigIntFloorModBlockPayload(inst));
+                }
+                switch (l.wantScalarizeOrSoftFloat(air_tag, ty)) {
                     .none => {},
                     .scalarize => continue :inst l.replaceInst(inst, .block, try l.scalarizeBlockPayload(inst, .bin_op)),
                     .soft_float => continue :inst l.replaceInst(inst, .block, try l.softFloatModBlockPayload(
@@ -436,9 +481,22 @@ fn legalizeBody(l: *Legalize, body_start: usize, body_len: usize) Error!void {
             .bit_and,
             .bit_or,
             .xor,
-            => |air_tag| if (l.features.has(comptime .scalarize(air_tag))) {
+            => |air_tag| {
                 const bin_op = l.air_instructions.items(.data)[@backingInt(inst)].bin_op;
-                if (l.typeOf(bin_op.lhs).isVector(zcu)) {
+                const ty = l.typeOf(bin_op.lhs);
+                switch (air_tag) {
+                    else => unreachable,
+                    .add_wrap, .sub_wrap => {},
+                    .add_sat, .sub_sat, .mul_sat => if (l.wantSoftBigInt(ty, 64)) {
+                        continue :inst l.replaceInst(inst, .block, try l.softBigIntSatBlockPayload(inst));
+                    },
+                    .mul_wrap, .bit_and, .bit_or, .xor => if (l.wantSoftBigInt(ty, 128)) continue :inst l.replaceInst(
+                        inst,
+                        .block,
+                        try l.softBigIntOpBlockPayload(inst, softBigIntFunc(air_tag), bin_op.lhs, bin_op.rhs),
+                    ),
+                }
+                if (l.features.has(comptime .scalarize(air_tag)) and ty.isVector(zcu)) {
                     continue :inst l.replaceInst(inst, .block, try l.scalarizeBlockPayload(inst, .bin_op));
                 }
             },
@@ -460,13 +518,17 @@ fn legalizeBody(l: *Legalize, body_start: usize, body_len: usize) Error!void {
                     continue :inst l.replaceInst(inst, .block, try l.scalarizeBlockPayload(inst, .bin_op));
                 }
             },
-            .mul_safe => if (l.features.has(.expand_mul_safe)) {
-                assert(!l.features.has(.scalarize_mul_safe)); // it doesn't make sense to do both
-                continue :inst l.replaceInst(inst, .block, try l.safeArithmeticBlockPayload(inst, .mul_with_overflow));
-            } else if (l.features.has(.scalarize_mul_safe)) {
+            .mul_safe => {
                 const bin_op = l.air_instructions.items(.data)[@backingInt(inst)].bin_op;
-                if (l.typeOf(bin_op.lhs).isVector(zcu)) {
-                    continue :inst l.replaceInst(inst, .block, try l.scalarizeBlockPayload(inst, .bin_op));
+                if (l.wantSoftBigInt(l.typeOf(bin_op.lhs), 128)) {
+                    continue :inst l.replaceInst(inst, .block, try l.safeArithmeticBlockPayload(inst, .mul_with_overflow));
+                } else if (l.features.has(.expand_mul_safe)) {
+                    assert(!l.features.has(.scalarize_mul_safe)); // it doesn't make sense to do both
+                    continue :inst l.replaceInst(inst, .block, try l.safeArithmeticBlockPayload(inst, .mul_with_overflow));
+                } else if (l.features.has(.scalarize_mul_safe)) {
+                    if (l.typeOf(bin_op.lhs).isVector(zcu)) {
+                        continue :inst l.replaceInst(inst, .block, try l.scalarizeBlockPayload(inst, .bin_op));
+                    }
                 }
             },
             .ptr_add, .ptr_sub => {},
@@ -474,9 +536,23 @@ fn legalizeBody(l: *Legalize, body_start: usize, body_len: usize) Error!void {
             .sub_with_overflow,
             .mul_with_overflow,
             .shl_with_overflow,
-            => |air_tag| if (l.features.has(comptime .scalarize(air_tag))) {
+            => |air_tag| {
                 const ty_pl = l.air_instructions.items(.data)[@backingInt(inst)].ty_pl;
-                if (ty_pl.ty.fieldType(0, zcu).isVector(zcu)) {
+                switch (air_tag) {
+                    else => unreachable,
+                    .add_with_overflow, .sub_with_overflow => {},
+                    .mul_with_overflow, .shl_with_overflow => {
+                        const bin = l.extraData(Air.Bin, ty_pl.payload).data;
+                        if (l.wantSoftBigInt(l.typeOf(bin.lhs), if (air_tag == .shl_with_overflow) 64 else 128)) {
+                            continue :inst l.replaceInst(
+                                inst,
+                                .block,
+                                try l.softBigIntOpBlockPayload(inst, softBigIntFunc(air_tag), bin.lhs, bin.rhs),
+                            );
+                        }
+                    },
+                }
+                if (l.features.has(comptime .scalarize(air_tag)) and ty_pl.ty.fieldType(0, zcu).isVector(zcu)) {
                     continue :inst l.replaceInst(inst, .block, try l.scalarizeOverflowBlockPayload(inst));
                 }
             },
@@ -488,12 +564,15 @@ fn legalizeBody(l: *Legalize, body_start: usize, body_len: usize) Error!void {
             .shl,
             .shl_exact,
             .shl_sat,
-            => |air_tag| if (l.features.hasAny(&.{
-                .unsplat_shift_rhs,
-                .scalarize(air_tag),
-            })) {
+            => |air_tag| {
                 const bin_op = l.air_instructions.items(.data)[@backingInt(inst)].bin_op;
-                if (l.typeOf(bin_op.rhs).isVector(zcu)) {
+                if (l.wantSoftBigInt(l.typeOf(bin_op.lhs), if (air_tag == .shl_sat) 64 else 128)) {
+                    continue :inst l.replaceInst(inst, .block, try switch (air_tag) {
+                        else => l.softBigIntOpBlockPayload(inst, softBigIntFunc(air_tag), bin_op.lhs, bin_op.rhs),
+                        .shl_sat => l.softBigIntShlSatBlockPayload(inst),
+                    });
+                }
+                if (l.features.hasAny(&.{ .unsplat_shift_rhs, .scalarize(air_tag) }) and l.typeOf(bin_op.rhs).isVector(zcu)) {
                     if (l.features.has(.unsplat_shift_rhs)) {
                         if (bin_op.rhs.toInterned()) |rhs_ip_index| switch (ip.indexToKey(rhs_ip_index)) {
                             else => {},
@@ -531,14 +610,33 @@ fn legalizeBody(l: *Legalize, body_start: usize, body_len: usize) Error!void {
             .ptr_from_int,
             .int_from_ptr,
             .trunc,
-            => |air_tag| if (l.features.has(comptime .scalarize(air_tag))) {
+            => |air_tag| {
                 const ty_op = l.air_instructions.items(.data)[@backingInt(inst)].ty_op;
-                if (ty_op.ty.isVector(zcu)) {
+                switch (air_tag) {
+                    else => {},
+                    .not, .clz, .ctz, .popcount, .byte_swap, .bit_reverse => {
+                        if (l.wantSoftBigInt(l.typeOf(ty_op.operand), 128)) continue :inst l.replaceInst(
+                            inst,
+                            .block,
+                            try l.softBigIntOpBlockPayload(inst, softBigIntFunc(air_tag), ty_op.operand, null),
+                        );
+                    },
+                }
+                if (l.features.has(comptime .scalarize(air_tag)) and ty_op.ty.isVector(zcu)) {
                     continue :inst l.replaceInst(inst, .block, try l.scalarizeBlockPayload(inst, .ty_op));
                 }
             },
             .abs => {
                 const ty_op = l.air_instructions.items(.data)[@backingInt(inst)].ty_op;
+                const operand_ty = l.typeOf(ty_op.operand);
+                // The absolute value of an unsigned integer is the integer.
+                if (l.wantSoftBigInt(operand_ty, 128) and operand_ty.isSignedInt(zcu)) {
+                    continue :inst l.replaceInst(
+                        inst,
+                        .block,
+                        try l.softBigIntOpBlockPayload(inst, .__abs_limb64, ty_op.operand, null),
+                    );
+                }
                 switch (l.wantScalarizeOrSoftFloat(.abs, ty_op.ty)) {
                     .none => {},
                     .scalarize => continue :inst l.replaceInst(inst, .block, try l.scalarizeBlockPayload(inst, .ty_op)),
@@ -646,12 +744,14 @@ fn legalizeBody(l: *Legalize, body_start: usize, body_len: usize) Error!void {
                     .div_ceil_optimized => .expand_div_ceil_optimized,
                     else => unreachable,
                 };
+                const bin_op = l.air_instructions.items(.data)[@backingInt(inst)].bin_op;
 
-                if (l.features.has(expand_feature)) {
+                if (air_tag == .div_ceil and l.wantSoftBigInt(l.typeOf(bin_op.lhs), 128)) {
+                    continue :inst l.replaceInst(inst, .block, try l.divCeilBlockPayload(inst, air_tag));
+                } else if (l.features.has(expand_feature)) {
                     assert(!l.features.has(.scalarize(air_tag))); // it doesn't make sense to do both
                     continue :inst l.replaceInst(inst, .block, try l.divCeilBlockPayload(inst, air_tag));
                 } else {
-                    const bin_op = l.air_instructions.items(.data)[@backingInt(inst)].bin_op;
                     switch (l.wantScalarizeOrSoftFloat(air_tag, l.typeOf(bin_op.lhs))) {
                         .none => {},
                         .scalarize => continue :inst l.replaceInst(inst, .block, try l.scalarizeBlockPayload(inst, .bin_op)),
@@ -1051,7 +1151,7 @@ fn scalarizeBlockPayload(l: *Legalize, orig_inst: Air.Inst.Index, form: Scalariz
         .array => true,
         else => unreachable,
     };
-    const res_len = res_ty.arrayLen(zcu);
+    const res_len = res_ty.arrayLenIncludingSentinel(zcu);
     const res_elem_ty = res_ty.childType(zcu);
 
     if (result_is_array) {
@@ -1711,7 +1811,7 @@ fn scalarizeBitcastBlockPayload(l: *Legalize, orig_inst: Air.Inst.Index) Error!?
             l,
             .store,
             index_ptr,
-            .fromValue(try pt.intValue(.usize, operand_ty.arrayLen(zcu) - 1)),
+            .fromValue(try pt.intValue(.usize, operand_ty.arrayLenIncludingSentinel(zcu) - 1)),
         );
         _ = uint_block.addBinOp(l, .store, result_ptr, .fromValue(try pt.intValue(uint_ty, 0)));
 
@@ -1861,7 +1961,7 @@ fn scalarizeBitcastBlockPayload(l: *Legalize, orig_inst: Air.Inst.Index) Error!?
             else => unreachable,
         }
 
-        const is_end_val = loop.block.addBinOp(l, .cmp_eq, index_val, .fromValue(try pt.intValue(.usize, dest_ty.arrayLen(zcu) - 1))).toRef();
+        const is_end_val = loop.block.addBinOp(l, .cmp_eq, index_val, .fromValue(try pt.intValue(.usize, dest_ty.arrayLenIncludingSentinel(zcu) - 1))).toRef();
 
         var condbr: CondBr = .init(l, is_end_val, &loop.block, .{});
 
@@ -3989,6 +4089,410 @@ inline fn wantScalarizeOrSoftFloat(
         return if (is_vec) .scalarize else .soft_float;
     }
     return .none;
+}
+
+/// Whether `soft_big_int` expands an operation on operands of type `ty`, for an operation that
+/// it expands on integers of more than `min_bits` bits. `inline` to propagate potentially
+/// comptime-known return value.
+inline fn wantSoftBigInt(l: *const Legalize, ty: Type, min_bits: u16) bool {
+    if (!l.features.has(.soft_big_int)) return false;
+    const zcu = l.pt.zcu;
+    if (ty.zigTypeTag(zcu) != .int) return false;
+    const bits = ty.intInfo(zcu).bits;
+    return bits > min_bits and bits <= std.math.maxInt(u16);
+}
+
+/// The compiler_rt routine of a `soft_big_int` expansion that is one call.
+fn softBigIntFunc(comptime air_tag: Air.Inst.Tag) Air.CompilerRtFunc {
+    return switch (air_tag) {
+        else => comptime unreachable,
+        .mul, .mul_wrap, .mul_with_overflow => .__mulo_limb64,
+        .shl, .shl_exact, .shl_with_overflow => .__shlo_limb64,
+        .shr, .shr_exact => .__shr_limb64,
+        .bit_and => .__and_limb64,
+        .bit_or => .__or_limb64,
+        .xor => .__xor_limb64,
+        .not => .__not_limb64,
+        .byte_swap => .__byteswap_limb64,
+        .bit_reverse => .__bitreverse_limb64,
+        .clz => .__clz_limb64,
+        .ctz => .__ctz_limb64,
+        .popcount => .__popcount_limb64,
+    };
+}
+
+/// Stores `operand` in a new local; returns a pointer to it.
+fn softBigIntSpill(l: *Legalize, b: *Block, operand: Air.Inst.Ref) Error!Air.Inst.Ref {
+    const ptr = b.addTy(l, .alloc, try l.pt.singleMutPtrType(l.typeOf(operand))).toRef();
+    _ = b.addBinOp(l, .store, ptr, operand);
+    return ptr;
+}
+
+/// One call of a `__*_limb64` routine for the operation `orig_inst`, with `lhs`, and `rhs` or
+/// the shift amount if there is one. The result is loaded from memory, or converted from the
+/// returned count, and an overflow bit is returned in a tuple with it.
+fn softBigIntOpBlockPayload(
+    l: *Legalize,
+    orig_inst: Air.Inst.Index,
+    func: Air.CompilerRtFunc,
+    lhs: Air.Inst.Ref,
+    rhs: ?Air.Inst.Ref,
+) Error!Air.Inst.Data {
+    const pt = l.pt;
+    const zcu = pt.zcu;
+    const operand_ty = l.typeOf(lhs);
+    const info = operand_ty.intInfo(zcu);
+    const result_ty = l.typeOfIndex(orig_inst);
+    const is_tuple = result_ty.zigTypeTag(zcu) == .@"struct";
+    const value_ty = if (is_tuple) result_ty.fieldType(0, zcu) else result_ty;
+
+    var inst_buf: [12]Air.Inst.Index = undefined;
+    var main_block: Block = .init(&inst_buf);
+    try l.air_instructions.ensureUnusedCapacity(zcu.gpa, inst_buf.len);
+
+    const signed: Air.Inst.Ref = if (info.signedness == .signed) .bool_true else .bool_false;
+    const bits: Air.Inst.Ref = .fromValue(try pt.intValue(.u16, info.bits));
+    const lhs_ptr = try l.softBigIntSpill(&main_block, lhs);
+    const out_ptr = switch (func) {
+        else => main_block.addTy(l, .alloc, try pt.singleMutPtrType(value_ty)).toRef(),
+        .__clz_limb64, .__ctz_limb64, .__popcount_limb64 => undefined,
+    };
+    var args_buf: [5]Air.Inst.Ref = undefined;
+    const args: []const Air.Inst.Ref = switch (func) {
+        .__mulo_limb64 => args: {
+            args_buf = .{ out_ptr, lhs_ptr, try l.softBigIntSpill(&main_block, rhs.?), signed, bits };
+            break :args &args_buf;
+        },
+        .__shlo_limb64, .__shr_limb64 => args: {
+            const amount = rhs.?;
+            const amount_ty = l.typeOf(amount);
+            // The amount of `shl`, `shl_exact`, `shr` and `shr_exact` is coerced to
+            // `std.math.Log2Int` of the lhs type by AstGen (`typeof_log2_int_type`), and that of
+            // `shl_with_overflow` by `Sema.zirOverflowArithmetic`; `shl_sat` reaches here through
+            // `softBigIntShlSatBlockPayload`, which casts its amount the same way. The lhs has at
+            // most 65535 bits.
+            assert(amount_ty.intInfo(zcu).signedness == .unsigned and amount_ty.intInfo(zcu).bits <= 16);
+            args_buf = .{
+                out_ptr,
+                lhs_ptr,
+                if (amount_ty.toIntern() == .u16_type) amount else main_block.addTyOp(l, .int_cast, .u16, amount).toRef(),
+                signed,
+                bits,
+            };
+            break :args &args_buf;
+        },
+        .__and_limb64, .__or_limb64, .__xor_limb64 => args: {
+            args_buf[0..4].* = .{ out_ptr, lhs_ptr, try l.softBigIntSpill(&main_block, rhs.?), bits };
+            break :args args_buf[0..4];
+        },
+        .__not_limb64, .__bitreverse_limb64, .__byteswap_limb64 => args: {
+            args_buf[0..4].* = .{ out_ptr, lhs_ptr, signed, bits };
+            break :args args_buf[0..4];
+        },
+        .__abs_limb64 => args: {
+            args_buf[0..3].* = .{ out_ptr, lhs_ptr, bits };
+            break :args args_buf[0..3];
+        },
+        .__clz_limb64, .__ctz_limb64, .__popcount_limb64 => args: {
+            args_buf[0..2].* = .{ lhs_ptr, bits };
+            break :args args_buf[0..2];
+        },
+        else => unreachable,
+    };
+    const call_inst = try main_block.addCompilerRtCall(l, func, args);
+    const result: Air.Inst.Ref = switch (func) {
+        .__clz_limb64, .__ctz_limb64, .__popcount_limb64 => main_block.addTyOp(l, .int_cast, result_ty, call_inst.toRef()).toRef(),
+        else => result: {
+            const value = main_block.addTyOp(l, .load, value_ty, out_ptr).toRef();
+            if (!is_tuple) break :result value;
+            const overflow = main_block.addBitCast(l, .u1, call_inst.toRef());
+            const elements_index: u32 = @intCast(l.air_extra.items.len);
+            try l.air_extra.appendSlice(zcu.gpa, &.{ @backingInt(value), @backingInt(overflow) });
+            break :result main_block.add(l, .{
+                .tag = .aggregate_init,
+                .data = .{ .ty_pl = .{ .ty = result_ty, .payload = elements_index } },
+            }).toRef();
+        },
+    };
+    main_block.addBr(l, orig_inst, result);
+    _ = main_block.stealRemainingCapacity();
+    return .{ .ty_pl = .{
+        .ty = result_ty,
+        .payload = try l.addBlockBody(main_block.body()),
+    } };
+}
+
+/// Ends `b` with a `br` of the value that a saturating operation of type `ty` saturates to on
+/// overflow: the maximum of an unsigned integer; of a signed one the minimum when `negative` is
+/// true at runtime, else the maximum. Returns the unused capacity of `b`.
+fn softBigIntBrLimit(l: *Legalize, b: *Block, orig_inst: Air.Inst.Index, ty: Type, negative: ?Air.Inst.Ref) Error![]Air.Inst.Index {
+    const pt = l.pt;
+    const max: Air.Inst.Ref = .fromValue(try ty.maxInt(pt, ty));
+    const is_negative = negative orelse {
+        b.addBr(l, orig_inst, max);
+        return b.stealRemainingCapacity();
+    };
+    var condbr: CondBr = .init(l, is_negative, b, .{});
+    condbr.then_block = .init(b.stealRemainingCapacity());
+    condbr.then_block.addBr(l, orig_inst, .fromValue(try ty.minInt(pt, ty)));
+    condbr.else_block = .init(condbr.then_block.stealRemainingCapacity());
+    condbr.else_block.addBr(l, orig_inst, max);
+    const unused = condbr.else_block.stealRemainingCapacity();
+    try condbr.finish(l);
+    return unused;
+}
+
+/// `add_sat`, `sub_sat` and `mul_sat` as the `*_with_overflow` operation, saturating when it
+/// overflows: unsigned towards the maximum (or zero for `sub_sat`), signed towards the sign of
+/// the exact result.
+fn softBigIntSatBlockPayload(l: *Legalize, orig_inst: Air.Inst.Index) Error!Air.Inst.Data {
+    const pt = l.pt;
+    const zcu = pt.zcu;
+    const tag = l.air_instructions.items(.tag)[@backingInt(orig_inst)];
+    const bin_op = l.air_instructions.items(.data)[@backingInt(orig_inst)].bin_op;
+    const ty = l.typeOf(bin_op.lhs);
+    const zero: Air.Inst.Ref = .fromValue(try pt.intValue(ty, 0));
+
+    var inst_buf: [16]Air.Inst.Index = undefined;
+    var main_block: Block = .init(&inst_buf);
+    try l.air_instructions.ensureUnusedCapacity(zcu.gpa, inst_buf.len);
+
+    const tuple = main_block.add(l, .{
+        .tag = switch (tag) {
+            else => unreachable,
+            .add_sat => .add_with_overflow,
+            .sub_sat => .sub_with_overflow,
+            .mul_sat => .mul_with_overflow,
+        },
+        .data = .{ .ty_pl = .{
+            .ty = try pt.overflowArithmeticTupleType(ty),
+            .payload = try l.addExtra(Air.Bin, .{ .lhs = bin_op.lhs, .rhs = bin_op.rhs }),
+        } },
+    }).toRef();
+    const overflow = try l.softBigIntTupleField(&main_block, tuple, 1, .u1);
+    const overflowed = main_block.addCmpScalar(l, .eq, overflow, .one_u1, false).toRef();
+    var condbr: CondBr = .init(l, overflowed, &main_block, .{ .true = .unlikely });
+    condbr.then_block = .init(main_block.stealRemainingCapacity());
+    condbr.else_block = .init(switch (ty.intInfo(zcu).signedness) {
+        .unsigned => if (tag == .sub_sat) unused: {
+            condbr.then_block.addBr(l, orig_inst, zero);
+            break :unused condbr.then_block.stealRemainingCapacity();
+        } else try l.softBigIntBrLimit(&condbr.then_block, orig_inst, ty, null),
+        .signed => unused: {
+            // A sum or difference overflows towards the sign of the lhs, a product towards
+            // the sign of its exact value.
+            const lhs_negative = condbr.then_block.addCmpScalar(l, .lt, bin_op.lhs, zero, false).toRef();
+            const negative = if (tag != .mul_sat) lhs_negative else negative: {
+                const rhs_negative = condbr.then_block.addCmpScalar(l, .lt, bin_op.rhs, zero, false).toRef();
+                break :negative condbr.then_block.addCmpScalar(l, .neq, lhs_negative, rhs_negative, false).toRef();
+            };
+            break :unused try l.softBigIntBrLimit(&condbr.then_block, orig_inst, ty, negative);
+        },
+    });
+    condbr.else_block.addBr(l, orig_inst, try l.softBigIntTupleField(&condbr.else_block, tuple, 0, ty));
+    _ = condbr.else_block.stealRemainingCapacity();
+    try condbr.finish(l);
+    return .{ .ty_pl = .{
+        .ty = ty,
+        .payload = try l.addBlockBody(main_block.body()),
+    } };
+}
+
+/// `shl_sat`: an amount less than the bit width is a `shl_with_overflow` that saturates when it
+/// overflows; any other amount saturates every nonzero lhs. Unsigned integers saturate to the
+/// maximum, signed ones towards the sign of the lhs.
+fn softBigIntShlSatBlockPayload(l: *Legalize, orig_inst: Air.Inst.Index) Error!Air.Inst.Data {
+    const pt = l.pt;
+    const zcu = pt.zcu;
+    const bin_op = l.air_instructions.items(.data)[@backingInt(orig_inst)].bin_op;
+    const ty = l.typeOf(bin_op.lhs);
+    const info = ty.intInfo(zcu);
+    const amount_ty = l.typeOf(bin_op.rhs);
+    const zero: Air.Inst.Ref = .fromValue(try pt.intValue(ty, 0));
+
+    var inst_buf: [24]Air.Inst.Index = undefined;
+    var main_block: Block = .init(&inst_buf);
+    try l.air_instructions.ensureUnusedCapacity(zcu.gpa, inst_buf.len);
+
+    const negative: ?Air.Inst.Ref = switch (info.signedness) {
+        .unsigned => null,
+        .signed => main_block.addCmpScalar(l, .lt, bin_op.lhs, zero, false).toRef(),
+    };
+    // A u8 amount of a u300, for one, is always in range.
+    const in_range: Air.Inst.Ref = if (amount_ty.intInfo(zcu).bits < 16 and
+        (@as(u64, 1) << @intCast(amount_ty.intInfo(zcu).bits)) <= info.bits)
+        .bool_true
+    else
+        main_block.addCmpScalar(l, .lt, bin_op.rhs, .fromValue(try pt.intValue(amount_ty, info.bits)), false).toRef();
+    var range_br: CondBr = .init(l, in_range, &main_block, .{});
+    range_br.then_block = .init(main_block.stealRemainingCapacity());
+    {
+        const b = &range_br.then_block;
+        const tuple = b.add(l, .{
+            .tag = .shl_with_overflow,
+            .data = .{ .ty_pl = .{
+                .ty = try pt.overflowArithmeticTupleType(ty),
+                .payload = try l.addExtra(Air.Bin, .{
+                    .lhs = bin_op.lhs,
+                    .rhs = rhs: {
+                        const shift_ty = try pt.smallestUnsignedInt(info.bits - 1);
+                        if (amount_ty.toIntern() == shift_ty.toIntern()) break :rhs bin_op.rhs;
+                        break :rhs b.addTyOp(l, .int_cast, shift_ty, bin_op.rhs).toRef();
+                    },
+                }),
+            } },
+        }).toRef();
+        const overflow = try l.softBigIntTupleField(b, tuple, 1, .u1);
+        const overflowed = b.addCmpScalar(l, .eq, overflow, .one_u1, false).toRef();
+        var overflow_br: CondBr = .init(l, overflowed, b, .{ .true = .unlikely });
+        overflow_br.then_block = .init(b.stealRemainingCapacity());
+        overflow_br.else_block = .init(try l.softBigIntBrLimit(&overflow_br.then_block, orig_inst, ty, negative));
+        overflow_br.else_block.addBr(l, orig_inst, try l.softBigIntTupleField(&overflow_br.else_block, tuple, 0, ty));
+        range_br.else_block = .init(overflow_br.else_block.stealRemainingCapacity());
+        try overflow_br.finish(l);
+    }
+    {
+        const b = &range_br.else_block;
+        const is_zero = b.addCmpScalar(l, .eq, bin_op.lhs, zero, false).toRef();
+        var zero_br: CondBr = .init(l, is_zero, b, .{});
+        zero_br.then_block = .init(b.stealRemainingCapacity());
+        zero_br.then_block.addBr(l, orig_inst, zero);
+        zero_br.else_block = .init(zero_br.then_block.stealRemainingCapacity());
+        _ = try l.softBigIntBrLimit(&zero_br.else_block, orig_inst, ty, negative);
+        try zero_br.finish(l);
+    }
+    try range_br.finish(l);
+    return .{ .ty_pl = .{
+        .ty = ty,
+        .payload = try l.addBlockBody(main_block.body()),
+    } };
+}
+
+fn softBigIntTupleField(l: *Legalize, b: *Block, tuple: Air.Inst.Ref, index: u32, ty: Type) Error!Air.Inst.Ref {
+    return b.add(l, .{
+        .tag = .agg_field_val,
+        .data = .{ .ty_pl = .{
+            .ty = ty,
+            .payload = try l.addExtra(Air.StructField, .{ .struct_operand = tuple, .field_index = index }),
+        } },
+    }).toRef();
+}
+
+/// A truncating division (`.div`) or remainder (`.rem`) through `__udivei5` and friends, which
+/// take the operands extended to their ABI size.
+fn softBigIntDivBlockPayload(l: *Legalize, orig_inst: Air.Inst.Index, op: enum { div, rem }) Error!Air.Inst.Data {
+    const pt = l.pt;
+    const zcu = pt.zcu;
+    const bin_op = l.air_instructions.items(.data)[@backingInt(orig_inst)].bin_op;
+    const ty = l.typeOf(bin_op.lhs);
+    const info = ty.intInfo(zcu);
+    const size = ty.abiSize(zcu);
+
+    var inst_buf: [12]Air.Inst.Index = undefined;
+    var main_block: Block = .init(&inst_buf);
+    try l.air_instructions.ensureUnusedCapacity(zcu.gpa, inst_buf.len);
+
+    const extended_ty = try pt.intType(info.signedness, @intCast(8 * size));
+    const lhs = if (extended_ty.toIntern() == ty.toIntern()) bin_op.lhs else main_block.addTyOp(l, .int_cast, extended_ty, bin_op.lhs).toRef();
+    const rhs = if (extended_ty.toIntern() == ty.toIntern()) bin_op.rhs else main_block.addTyOp(l, .int_cast, extended_ty, bin_op.rhs).toRef();
+    const lhs_ptr = try l.softBigIntSpill(&main_block, lhs);
+    const rhs_ptr = try l.softBigIntSpill(&main_block, rhs);
+    const out_ptr = main_block.addTy(l, .alloc, try pt.singleMutPtrType(extended_ty)).toRef();
+    const scratch_ty = try pt.arrayType(.{ .len = @divExact(2 * size, 8), .child = .u64_type });
+    const scratch_ptr = main_block.addTy(l, .alloc, try pt.singleMutPtrType(scratch_ty)).toRef();
+    _ = try main_block.addCompilerRtCall(l, switch (info.signedness) {
+        .unsigned => switch (op) {
+            .div => .__udivei5,
+            .rem => .__umodei5,
+        },
+        .signed => switch (op) {
+            .div => .__divei5,
+            .rem => .__modei5,
+        },
+    }, &.{ out_ptr, lhs_ptr, rhs_ptr, scratch_ptr, .fromValue(try pt.intValue(.usize, info.bits)) });
+    const extended_result = main_block.addTyOp(l, .load, extended_ty, out_ptr).toRef();
+    main_block.addBr(l, orig_inst, if (extended_ty.toIntern() == ty.toIntern())
+        extended_result
+    else
+        main_block.addTyOp(l, .int_cast, ty, extended_result).toRef());
+    _ = main_block.stealRemainingCapacity();
+    return .{ .ty_pl = .{
+        .ty = ty,
+        .payload = try l.addBlockBody(main_block.body()),
+    } };
+}
+
+/// `div_floor` and `mod`. Of unsigned integers they are the truncating quotient and remainder.
+/// Of signed integers, when the remainder is nonzero and its sign differs from the divisor's,
+/// the quotient is one less than the truncating one and the modulus is the remainder plus the
+/// divisor.
+fn softBigIntFloorModBlockPayload(l: *Legalize, orig_inst: Air.Inst.Index) Error!Air.Inst.Data {
+    const pt = l.pt;
+    const zcu = pt.zcu;
+    const tag = l.air_instructions.items(.tag)[@backingInt(orig_inst)];
+    const bin_op = l.air_instructions.items(.data)[@backingInt(orig_inst)].bin_op;
+    const ty = l.typeOf(bin_op.lhs);
+    if (ty.intInfo(zcu).signedness == .unsigned)
+        return l.softBigIntDivBlockPayload(orig_inst, if (tag == .mod) .rem else .div);
+    const zero: Air.Inst.Ref = .fromValue(try pt.intValue(ty, 0));
+
+    var inst_buf: [12]Air.Inst.Index = undefined;
+    var main_block: Block = .init(&inst_buf);
+    try l.air_instructions.ensureUnusedCapacity(zcu.gpa, inst_buf.len);
+
+    const rem = main_block.addBinOp(l, .rem, bin_op.lhs, bin_op.rhs).toRef();
+    const rem_nonzero = main_block.addCmpScalar(l, .neq, rem, zero, false).toRef();
+    const rem_negative = main_block.addCmpScalar(l, .lt, rem, zero, false).toRef();
+    const rhs_negative = main_block.addCmpScalar(l, .lt, bin_op.rhs, zero, false).toRef();
+    const signs_differ = main_block.addCmpScalar(l, .neq, rem_negative, rhs_negative, false).toRef();
+    const adjust = main_block.addBinOp(l, .bit_and, rem_nonzero, signs_differ).toRef();
+    var condbr: CondBr = .init(l, adjust, &main_block, .{});
+    condbr.then_block = .init(main_block.stealRemainingCapacity());
+    condbr.then_block.addBr(l, orig_inst, switch (tag) {
+        else => unreachable,
+        .div_floor => condbr.then_block.addBinOp(l, .sub, condbr.then_block.addBinOp(l, .div_trunc, bin_op.lhs, bin_op.rhs).toRef(), .fromValue(try pt.intValue(ty, 1))).toRef(),
+        .mod => condbr.then_block.addBinOp(l, .add, rem, bin_op.rhs).toRef(),
+    });
+    condbr.else_block = .init(condbr.then_block.stealRemainingCapacity());
+    condbr.else_block.addBr(l, orig_inst, switch (tag) {
+        else => unreachable,
+        .div_floor => condbr.else_block.addBinOp(l, .div_trunc, bin_op.lhs, bin_op.rhs).toRef(),
+        .mod => rem,
+    });
+    _ = condbr.else_block.stealRemainingCapacity();
+    try condbr.finish(l);
+    return .{ .ty_pl = .{
+        .ty = ty,
+        .payload = try l.addBlockBody(main_block.body()),
+    } };
+}
+
+/// `max` and `min` as a comparison that selects an operand.
+fn softBigIntMinMaxBlockPayload(l: *Legalize, orig_inst: Air.Inst.Index) Error!Air.Inst.Data {
+    const zcu = l.pt.zcu;
+    const tag = l.air_instructions.items(.tag)[@backingInt(orig_inst)];
+    const bin_op = l.air_instructions.items(.data)[@backingInt(orig_inst)].bin_op;
+    const ty = l.typeOf(bin_op.lhs);
+
+    var inst_buf: [4]Air.Inst.Index = undefined;
+    var main_block: Block = .init(&inst_buf);
+    try l.air_instructions.ensureUnusedCapacity(zcu.gpa, inst_buf.len);
+
+    const lhs_wins = main_block.addCmpScalar(l, switch (tag) {
+        else => unreachable,
+        .max => .gt,
+        .min => .lt,
+    }, bin_op.lhs, bin_op.rhs, false).toRef();
+    var condbr: CondBr = .init(l, lhs_wins, &main_block, .{});
+    condbr.then_block = .init(main_block.stealRemainingCapacity());
+    condbr.then_block.addBr(l, orig_inst, bin_op.lhs);
+    condbr.else_block = .init(condbr.then_block.stealRemainingCapacity());
+    condbr.else_block.addBr(l, orig_inst, bin_op.rhs);
+    try condbr.finish(l);
+    return .{ .ty_pl = .{
+        .ty = ty,
+        .payload = try l.addBlockBody(main_block.body()),
+    } };
 }
 
 /// `inline` to propagate potentially comptime-known return value.

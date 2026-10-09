@@ -469,10 +469,16 @@ pub fn flush(
             error.ResolveFailed => return error.AlreadyReported,
             else => |e| return e,
         };
+        // Debug sections are not atoms; patch their symbol addresses now that every
+        // symbol has its final address.
+        if (zo.dwarf) |*dwarf| dwarf.resolveRelocs() catch |err|
+            return diags.fail("failed to resolve debug info relocations: {t}", .{err});
     }
     try self.writeSectionsAndUpdateLinkeditSizes();
 
     try self.writeSectionsToFile();
+    self.orderZigSegmentFileOffsets() catch |err|
+        return diags.fail("failed to order Zig segment file offsets: {t}", .{err});
     try self.allocateLinkeditSegment();
     self.writeLinkeditSectionsToFile() catch |err| switch (err) {
         error.OutOfMemory, error.AlreadyReported => |e| return e,
@@ -1634,6 +1640,12 @@ fn getSegmentProt(segname: []const u8) macho.vm_prot_t {
 fn getSegmentRank(segname: []const u8) u8 {
     if (mem.eql(u8, segname, "__PAGEZERO")) return 0x0;
     if (mem.eql(u8, segname, "__LINKEDIT")) return 0xf;
+    // The incremental Zig segments are placed at increasing fixed addresses (see
+    // `initMetadata`); dyld rejects segment load commands that are out of address order.
+    if (mem.eql(u8, segname, "__TEXT_ZIG")) return 0xa;
+    if (mem.eql(u8, segname, "__CONST_ZIG")) return 0xb;
+    if (mem.eql(u8, segname, "__DATA_ZIG")) return 0xc;
+    if (mem.eql(u8, segname, "__BSS_ZIG")) return 0xd;
     if (mem.find(u8, segname, "ZIG")) |_| return 0xe;
     if (mem.startsWith(u8, segname, "__TEXT")) return 0x1;
     if (mem.startsWith(u8, segname, "__DATA_CONST")) return 0x2;
@@ -2239,6 +2251,36 @@ fn allocateSyntheticSymbols(self: *MachO) void {
                 sym.out_n_sect = self.objc_stubs_sect_index.?;
             }
         }
+    }
+}
+
+/// Growing a Zig section may move its contents to the end of the file, but dyld
+/// requires segment file offsets to increase in load command (address) order.
+/// When that order is violated, move all Zig segments past the end of the file.
+fn orderZigSegmentFileOffsets(self: *MachO) !void {
+    var end: u64 = 0;
+    var ordered = true;
+    for (self.segments.items, 0..) |seg, seg_index| {
+        const seg_id: u8 = @intCast(seg_index);
+        if (seg_id == self.linkedit_seg_index or seg.filesize == 0) continue;
+        if (self.isZigSegment(seg_id) and seg.fileoff < end) ordered = false;
+        end = @max(end, seg.fileoff + seg.filesize);
+    }
+    if (ordered) return;
+
+    const page_size = self.getPageSize();
+    var fileoff = mem.alignForward(u64, end, page_size);
+    const slice = self.sections.slice();
+    for (self.segments.items, 0..) |*seg, seg_id| {
+        if (!self.isZigSegment(@intCast(seg_id)) or seg.filesize == 0) continue;
+        log.debug("moving segment '{s}' from 0x{x} to 0x{x}", .{ seg.segName(), seg.fileoff, fileoff });
+        try self.copyRangeAll(seg.fileoff, fileoff, seg.filesize);
+        for (slice.items(.header), slice.items(.segment_id)) |*header, sect_seg_id| {
+            if (sect_seg_id != seg_id or header.isZerofill()) continue;
+            header.offset = @intCast(fileoff + (header.offset - seg.fileoff));
+        }
+        seg.fileoff = fileoff;
+        fileoff = mem.alignForward(u64, fileoff + seg.filesize, page_size);
     }
 }
 

@@ -776,7 +776,7 @@ pub fn updateFunc(
     };
     const code = aw.written();
 
-    const sect_index = try self.getNavOutputSection(macho_file, zcu, func.owner_nav, code);
+    const sect_index = try self.getNavOutputSection(macho_file, zcu, func.owner_nav, code, true);
     const old_rva, const old_alignment = blk: {
         const atom = self.symbols.items[sym_index].getAtom(macho_file).?;
         break :blk .{ atom.value, atom.alignment };
@@ -885,7 +885,9 @@ pub fn updateNav(
         };
         const code = aw.written();
 
-        const sect_index = try self.getNavOutputSection(macho_file, zcu, nav_index, code);
+        // All-zero bytes still need file contents when relocations fill them in.
+        const has_relocs = self.symbols.items[sym_index].getAtom(macho_file).?.getRelocs(macho_file).len > 0;
+        const sect_index = try self.getNavOutputSection(macho_file, zcu, nav_index, code, has_relocs);
         if (isThreadlocal(macho_file, nav_index))
             try self.updateTlv(macho_file, zcu, nav_index, sym_index, sect_index, code)
         else
@@ -924,7 +926,7 @@ fn updateNavCode(
         .none => switch (mod.optimize_mode) {
             .debug, .safe, .fast => target_util.defaultFunctionAlignment(target),
             .small => target_util.minFunctionAlignment(target),
-        },
+        }.maxStrict(Type.fromInterned(nav.resolved.?.type).abiAlignment(zcu)),
         else => |a| a.maxStrict(target_util.minFunctionAlignment(target)),
     };
 
@@ -1010,6 +1012,18 @@ fn updateTlv(
         sect_index,
         code,
     );
+
+    // Relocations in the initializer were recorded against the variable's
+    // own atom, which becomes the descriptor; move them to the initializer.
+    {
+        const gpa = zcu.gpa;
+        const nav_atom = self.symbols.items[sym_index].getAtom(macho_file).?;
+        const init_atom = self.symbols.items[init_sym_index].getAtom(macho_file).?;
+        const relocs = try gpa.dupe(Relocation, nav_atom.getRelocs(macho_file));
+        defer gpa.free(relocs);
+        nav_atom.freeRelocs(macho_file);
+        for (relocs) |reloc| try init_atom.addReloc(macho_file, reloc);
+    }
 
     // 2. Create TLV descriptor
     try self.createTlvDescriptor(macho_file, sym_index, init_sym_index, nav.fqn.toSlice(ip));
@@ -1125,6 +1139,7 @@ fn getNavOutputSection(
     zcu: *Zcu,
     nav_index: InternPool.Nav.Index,
     code: []const u8,
+    has_relocs: bool,
 ) error{OutOfMemory}!u8 {
     _ = self;
     const ip = &zcu.intern_pool;
@@ -1132,7 +1147,7 @@ fn getNavOutputSection(
     const nav_val: Value = .fromInterned(nav.resolved.?.value);
     if (ip.isFunctionType(nav_val.typeOf(zcu).toIntern())) return macho_file.zig_text_sect_index.?;
     if (nav.resolved.?.@"threadlocal" and macho_file.base.comp.config.any_non_single_threaded) {
-        for (code) |byte| {
+        if (!has_relocs) for (code) |byte| {
             if (byte != 0) break;
         } else return macho_file.getSectionByName("__DATA", "__thread_bss") orelse try macho_file.addSection(
             "__DATA",
@@ -1151,7 +1166,7 @@ fn getNavOutputSection(
             .debug, .safe => macho_file.zig_data_sect_index.?,
             .fast, .small => macho_file.zig_bss_sect_index.?,
         };
-    for (code) |byte| {
+    if (!has_relocs) for (code) |byte| {
         if (byte != 0) break;
     } else return macho_file.zig_bss_sect_index.?;
     return macho_file.zig_data_sect_index.?;

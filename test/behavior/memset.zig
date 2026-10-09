@@ -123,7 +123,6 @@ test "memset with 1-byte array element" {
 }
 
 test "memset with large array element, runtime known" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
@@ -239,4 +238,45 @@ test "@memset array of booleans" {
         var y: [1]bool = undefined;
     };
     @memset(&S.y, S.x);
+}
+
+test "@memset keeps the runtime slice length" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        const Item = extern struct { a: u64, b: u32, c: u8 };
+        noinline fn fill(comptime T: type, slice: []T, value: T) []T {
+            @memset(slice, value);
+            return slice;
+        }
+        fn check(comptime T: type, value: T) !void {
+            var storage: [7]T = undefined;
+            var count: usize = 0;
+            const runtime_count: *volatile usize = &count;
+            for ([_]usize{ 0, 1, 7 }) |length| {
+                runtime_count.* = length;
+                const result = fill(T, storage[0..runtime_count.*], value);
+                try expect(result.ptr == &storage and result.len == length);
+                for (result) |element| try expect(std.meta.eql(element, value));
+            }
+        }
+        noinline fn allocate(allocator: std.mem.Allocator, length: usize) ![]?Item {
+            const result = try allocator.alloc(?Item, length);
+            @memset(result, null);
+            return result;
+        }
+    };
+    var buffer: [1024]u8 align(16) = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buffer);
+    var count: usize = 7;
+    const runtime_count: *volatile usize = &count;
+    const allocated = try S.allocate(fba.allocator(), runtime_count.*);
+    try expect(allocated.len == 7);
+    for (allocated) |item| try expect(item == null);
+    try S.check(u16, 0x1234);
+    try S.check(u32, 0x12345678);
+    try S.check(u64, 0x123456789abcdef0);
+    try S.check(S.Item, .{ .a = 0x123456789abcdef0, .b = 0x31415926, .c = 0x81 });
 }

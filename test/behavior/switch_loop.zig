@@ -4,7 +4,6 @@ const assert = std.debug.assert;
 const expect = std.testing.expect;
 
 test "simple switch loop" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -27,7 +26,6 @@ test "simple switch loop" {
 }
 
 test "switch loop with ranges" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -47,7 +45,6 @@ test "switch loop with ranges" {
 }
 
 test "switch loop on enum" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -70,7 +67,6 @@ test "switch loop on enum" {
 }
 
 test "switch loop with error set" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -93,7 +89,6 @@ test "switch loop with error set" {
 }
 
 test "switch loop on tagged union" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
@@ -125,7 +120,6 @@ test "switch loop on tagged union" {
 }
 
 test "switch loop dispatching instructions" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest; // TODO
@@ -175,7 +169,6 @@ test "switch loop dispatching instructions" {
 }
 
 test "switch loop with pointer capture" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -221,7 +214,6 @@ test "unanalyzed continue with operand" {
 }
 
 test "switch loop on larger than pointer integer" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
     var entry: @Int(.unsigned, @bitSizeOf(usize) + 1) = undefined;
@@ -242,7 +234,6 @@ test "switch loop on larger than pointer integer" {
 }
 
 test "switch loop on non-exhaustive enum" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
 
@@ -265,7 +256,6 @@ test "switch loop on non-exhaustive enum" {
 }
 
 test "switch loop with discarded tag capture" {
-    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
 
     const S = struct {
         const U = union(enum) {
@@ -588,4 +578,150 @@ test "switch loop on large types" {
     };
     try S.doTheTest(0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FF00, 0xFFFF_FFFF_FFFF_FFFF_FFFF_4550);
     try comptime S.doTheTest(0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FF00, 0xFFFF_FFFF_FFFF_FFFF_FFFF_4550);
+}
+
+test "nested labeled switch dispatch with ranges and negative values" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        noinline fn dispatch(initial: i32) u32 {
+            var count: u32 = 0;
+            return state: switch (initial) {
+                -9 => {
+                    count += 1;
+                    continue :state 1;
+                },
+                1...3 => |value| {
+                    count += @intCast(value);
+                    continue :state value + 1;
+                },
+                4 => inner: switch (count) {
+                    6, 7 => continue :inner 12,
+                    12 => break :state count + 100,
+                    else => break :state 99,
+                },
+                else => 77,
+            };
+        }
+    };
+    try expect(S.dispatch(-9) == 107);
+    try expect(S.dispatch(1) == 106);
+    try expect(S.dispatch(3) == 99);
+    try expect(S.dispatch(99) == 77);
+}
+
+test "dense labeled switch dispatch on bytes and enum states" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const Counts = struct { idents: u32 = 0, numbers: u32 = 0, puncts: u32 = 0, spaces: u32 = 0, other: u32 = 0 };
+    const S = struct {
+        const State = enum { start, ident, number, punct, space, other, done };
+        /// Byte-level redispatch: `continue :byte` on dense byte cases.
+        noinline fn countBytes(input: []const u8) Counts {
+            var counts: Counts = .{};
+            var index: usize = 0;
+            byte: switch (if (input.len > 0) input[0] else 0) {
+                'a'...'z', 'A'...'Z', '_' => {
+                    counts.idents += 1;
+                    index += 1;
+                    continue :byte if (index < input.len) input[index] else 0;
+                },
+                '0'...'9' => {
+                    counts.numbers += 1;
+                    index += 1;
+                    continue :byte if (index < input.len) input[index] else 0;
+                },
+                '+', '-', '*', '/', '(', ')', '=', ';' => {
+                    counts.puncts += 1;
+                    index += 1;
+                    continue :byte if (index < input.len) input[index] else 0;
+                },
+                ' ', '\t', '\n' => {
+                    counts.spaces += 1;
+                    index += 1;
+                    continue :byte if (index < input.len) input[index] else 0;
+                },
+                0 => if (index >= input.len) break :byte else {
+                    counts.other += 1;
+                    index += 1;
+                    continue :byte if (index < input.len) input[index] else 0;
+                },
+                else => {
+                    counts.other += 1;
+                    index += 1;
+                    continue :byte if (index < input.len) input[index] else 0;
+                },
+            }
+            return counts;
+        }
+        /// Token-level state machine: `continue :state` on dense enum cases.
+        noinline fn countTokens(input: []const u8) Counts {
+            var counts: Counts = .{};
+            var index: usize = 0;
+            state: switch (State.start) {
+                .start => {
+                    if (index >= input.len) continue :state .done;
+                    continue :state switch (input[index]) {
+                        'a'...'z', 'A'...'Z', '_' => .ident,
+                        '0'...'9' => .number,
+                        '+', '-', '*', '/', '(', ')', '=', ';' => .punct,
+                        ' ', '\t', '\n' => .space,
+                        else => .other,
+                    };
+                },
+                .ident => {
+                    counts.idents += 1;
+                    while (index < input.len) : (index += 1) switch (input[index]) {
+                        'a'...'z', 'A'...'Z', '_', '0'...'9' => {},
+                        else => break,
+                    };
+                    continue :state .start;
+                },
+                .number => {
+                    counts.numbers += 1;
+                    while (index < input.len and input[index] >= '0' and input[index] <= '9') index += 1;
+                    continue :state .start;
+                },
+                .punct => {
+                    counts.puncts += 1;
+                    index += 1;
+                    continue :state .start;
+                },
+                .space => {
+                    counts.spaces += 1;
+                    index += 1;
+                    continue :state .start;
+                },
+                .other => {
+                    counts.other += 1;
+                    index += 1;
+                    continue :state .start;
+                },
+                .done => {},
+            }
+            return counts;
+        }
+    };
+    const input = "let x1 = (foo_bar + 42) * 7;\n\tz = x1 / 3 - y; # done @ \x00!";
+    var bytes: Counts = .{};
+    for (input) |byte| switch (byte) {
+        'a'...'z', 'A'...'Z', '_' => bytes.idents += 1,
+        '0'...'9' => bytes.numbers += 1,
+        '+', '-', '*', '/', '(', ')', '=', ';' => bytes.puncts += 1,
+        ' ', '\t', '\n' => bytes.spaces += 1,
+        else => bytes.other += 1,
+    };
+    try expect(std.meta.eql(S.countBytes(input), bytes));
+    try expect(std.meta.eql(S.countBytes(""), Counts{}));
+    const tokens = S.countTokens(input);
+    try expect(tokens.idents == 7);
+    try expect(tokens.numbers == 3);
+    try expect(tokens.puncts == 10);
+    try expect(tokens.spaces == 19);
+    try expect(tokens.other == 4);
+    try expect(std.meta.eql(S.countTokens(""), Counts{}));
 }

@@ -4,6 +4,12 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const DW = std.dwarf;
+// Unknown extended opcodes must be skipped. Do not use lo_user: readelf
+// recognizes it as HP_source_file_correlation and decodes the padding bytes.
+const line_padding_opcode = DW.LNE.hi_user;
+
+/// Encoding emitted in the CIE and used to lay out generated FDE address fields.
+pub const eh_frame_pointer_encoding: DW.EH.PE = .{ .type = .sdata4, .rel = .pcrel };
 const Zir = std.zig.Zir;
 const assert = std.debug.assert;
 const log = std.log.scoped(.dwarf);
@@ -59,7 +65,7 @@ pub const UpdateError = error{
     Io.File.ReadPositionalError ||
     Io.File.WritePositionalError;
 
-pub const RelocError = Io.File.PWriteError;
+pub const RelocError = Io.File.WritePositionalError;
 
 pub const AddressSize = enum(u8) {
     @"32" = 4,
@@ -127,6 +133,13 @@ const DebugFrame = struct {
                 break :len uleb128Bytes(1) + sleb128Bytes(-8) + uleb128Bytes(Register.rip.dwarfNum()) +
                     1 + uleb128Bytes(Register.rsp.dwarfNum()) + sleb128Bytes(-1) +
                     1 + uleb128Bytes(1);
+            },
+            .aarch64, .aarch64_be => len: {
+                dev.checkAny(&.{ .llvm_backend, .aarch64_backend });
+                const Register = @import("../codegen/aarch64/encoding.zig").Register;
+                break :len uleb128Bytes(1) + sleb128Bytes(-8) + uleb128Bytes(Register.Alias.lr.dwarfNum()) +
+                    1 + uleb128Bytes(Register.Alias.sp.dwarfNum()) + uleb128Bytes(0) +
+                    1 + uleb128Bytes(Register.Alias.lr.dwarfNum());
             },
             else => unreachable,
         });
@@ -466,10 +479,19 @@ pub const Section = struct {
         if (dwarf.bin_file.cast(.elf)) |elf_file| {
             const zo = elf_file.zigObjectPtr().?;
             const atom = zo.symbol(sec.index).atom(elf_file).?;
+            const old_value = atom.value;
+            const old_len = sec.len;
             atom.size = len;
             atom.alignment = sec.alignment;
             sec.len = len;
             try zo.allocateAtom(atom, false, elf_file);
+            // Once the output section holds other inputs after this atom, growing it moves it
+            // within the section, and `allocateAtom` does not move contents.
+            if (atom.value != old_value) {
+                const base = elf_file.sections.items(.shdr)[atom.output_section_index].sh_offset;
+                const file = elf_file.base.file.?;
+                try link.File.copyRangeAll2(elf_file.base.comp.io, file, file, base + @as(u64, @intCast(old_value)), atom.offset(elf_file), old_len);
+            }
         } else if (dwarf.bin_file.cast(.macho)) |macho_file| {
             const header = if (macho_file.d_sym) |*d_sym| header: {
                 try d_sym.growSection(@intCast(sec.index), len, true, macho_file);
@@ -636,7 +658,10 @@ const Unit = struct {
     fn trim(unit: *Unit) void {
         const len = unit.getEntry(unit.first.unwrap() orelse return).off;
         if (len == 0) return;
-        for (unit.entries.items) |*entry| entry.off -= len;
+        // An entry without contents has no position yet.
+        for (unit.entries.items) |*entry| {
+            if (entry.len > 0) entry.off -= len;
+        }
         unit.off += len;
         unit.len -= len;
     }
@@ -711,7 +736,7 @@ const Unit = struct {
                 .gt => op_len_bytes += 1,
             };
             assert(fw.end == extended_op_bytes + op_len_bytes);
-            fw.writeByte(DW.LNE.padding) catch unreachable;
+            fw.writeByte(line_padding_opcode) catch unreachable;
             assert(fw.end >= unit.trailer_len and fw.end <= len);
             return dwarf.getFile().?.writePositionalAll(io, fw.buffered(), sec.off(dwarf) + start);
         }
@@ -762,10 +787,15 @@ const Unit = struct {
             }
             tw.splatByteAll(DW.CFA.nop, unit.trailer_len - tw.end) catch unreachable;
             break :fill DW.CFA.nop;
-        } else if (sec == &dwarf.debug_info.section) fill: {
+        } else if (sec == &dwarf.debug_info.section) {
+            // End the DIE tree after the padding, so consumers do not interpret
+            // the unused section capacity as additional end-of-children markers.
+            const padding: u8 = @intCast(try dwarf.refAbbrevCode(.pad_1));
+            tw.splatByteAll(padding, len - unit.trailer_len) catch unreachable;
             for (0..2) |_| tw.writeUleb128(@backingInt(AbbrevCode.null)) catch unreachable;
             assert(uleb128Bytes(@backingInt(AbbrevCode.null)) == 1);
-            break :fill @backingInt(AbbrevCode.null);
+            assert(tw.end == len);
+            return dwarf.getFile().?.writePositionalAll(io, trailer_aw.written(), sec.off(dwarf) + start);
         } else if (sec == &dwarf.debug_rnglists.section) fill: {
             tw.writeByte(DW.RLE.end_of_list) catch unreachable;
             break :fill DW.RLE.end_of_list;
@@ -929,7 +959,7 @@ const Entry = struct {
                     .gt => op_len_bytes += 1,
                 };
                 assert(fw.end == extended_op_bytes + op_len_bytes);
-                if (len > 2) fw.writeByte(DW.LNE.padding) catch unreachable;
+                if (len > 2) fw.writeByte(line_padding_opcode) catch unreachable;
             },
         } else assert(!sec.pad_entries_to_ideal and len == 0);
         assert(fw.end <= len);
@@ -1054,7 +1084,7 @@ const Entry = struct {
         for (entry.cross_entry_relocs.items) |reloc| {
             try dwarf.resolveReloc(
                 entry_off + reloc.source_off,
-                unit.off + unit.header_len + unit.getEntry(reloc.target_entry).assertNonEmpty(unit, sec, dwarf).off + reloc.target_off,
+                unit.off + unit.header_len + unit.getEntry(reloc.target_entry.unwrap().?).assertNonEmpty(unit, sec, dwarf).off + reloc.target_off,
                 dwarf.sectionOffsetBytes(),
             );
         }
@@ -1083,41 +1113,19 @@ const Entry = struct {
                 dwarf.sectionOffsetBytes(),
             );
         }
-        if (sec == &dwarf.debug_frame.section) switch (DebugFrame.format(dwarf)) {
+        // ELF output turns these into relocations of the Zig object instead
+        // (see `Elf.ZigObject.flush`); only Mach-O resolves them in place.
+        if (sec == &dwarf.debug_frame.section) switch (dwarf.debug_frame.header.format) {
             .none, .debug_frame => {},
-            .eh_frame => return if (dwarf.bin_file.cast(.elf)) |elf_file| {
-                const zo = elf_file.zigObjectPtr().?;
-                const shndx = zo.symbol(sec.index).atom(elf_file).?.output_section_index;
-                const entry_addr: i64 = @intCast(entry_off - sec.off(dwarf) + elf_file.shdrs.items[shndx].sh_addr);
-                for (entry.external_relocs.items) |reloc| {
-                    const symbol = zo.symbol(reloc.target_sym);
-                    try dwarf.resolveReloc(
-                        entry_off + reloc.source_off,
-                        @bitCast((symbol.address(.{}, elf_file) + @as(i64, @intCast(reloc.target_off))) -
-                            (entry_addr + reloc.source_off + 4)),
-                        4,
-                    );
-                }
-            } else unreachable,
+            .eh_frame => unreachable,
         };
-        if (dwarf.bin_file.cast(.elf)) |elf_file| {
-            const zo = elf_file.zigObjectPtr().?;
-            for (entry.external_relocs.items) |reloc| {
-                const symbol = zo.symbol(reloc.target_sym);
-                try dwarf.resolveReloc(
-                    entry_off + reloc.source_off,
-                    @bitCast(symbol.address(.{}, elf_file) + @as(i64, @intCast(reloc.target_off)) -
-                        if (symbol.flags.is_tls) elf_file.dtpAddress() else 0),
-                    @backingInt(dwarf.address_size),
-                );
-            }
-        } else if (dwarf.bin_file.cast(.macho)) |macho_file| {
+        if (dwarf.bin_file.cast(.macho)) |macho_file| {
             const zo = macho_file.getZigObject().?;
             for (entry.external_relocs.items) |reloc| {
-                const ref = zo.getSymbolRef(reloc.target_sym, macho_file);
+                const ref = zo.getSymbolRef(@backingInt(reloc.target_sym), macho_file);
                 try dwarf.resolveReloc(
                     entry_off + reloc.source_off,
-                    ref.getSymbol(macho_file).?.getAddress(.{}, macho_file) + @as(i64, @intCast(reloc.target_off)),
+                    ref.getSymbol(macho_file).?.getAddress(.{}, macho_file) +% reloc.target_off,
                     @backingInt(dwarf.address_size),
                 );
             }
@@ -1793,9 +1801,17 @@ pub const WipNav = struct {
         const diw = &wip_nav.debug_info.writer;
         const block = try wip_nav.blocks.addOne(dwarf.gpa);
 
+        // The call is in the source of the current function, which need not be in the file of
+        // the function being compiled.
+        const call_file = zcu.navFileScopeIndex(zcu.funcInfo(wip_nav.func).owner_nav);
+        const mod_info = dwarf.getModInfo(wip_nav.unit);
+        try mod_info.dirs.put(dwarf.gpa, try dwarf.getUnit(zcu.fileByIndex(call_file).mod.?), {});
+        const call_file_gop = try mod_info.files.getOrPut(dwarf.gpa, call_file);
+
         block.abbrev_code = @intCast(diw.end);
         try wip_nav.abbrevCode(.inlined_func);
         try wip_nav.refNav(zcu.funcInfo(func).owner_nav);
+        try diw.writeUleb128(call_file_gop.index);
         try diw.writeUleb128(zcu.navSrcLine(zcu.funcInfo(wip_nav.func).owner_nav) + line + 1);
         try diw.writeUleb128(column + 1);
         block.low_pc_off = code_off;
@@ -2331,6 +2347,21 @@ pub fn init(lf: *link.File, format: DW.Format) Dwarf {
                     .initial_instructions = &.{
                         .{ .def_cfa = .{ .reg = Register.rsp.dwarfNum(), .off = 8 } },
                         .{ .offset = .{ .reg = Register.rip.dwarfNum(), .off = -8 } },
+                    },
+                };
+            } else if ((target.cpu.arch == .aarch64 or target.cpu.arch == .aarch64_be) and target.ofmt == .elf) header: {
+                // Mach-O has no linker-managed frame section for the Zig object; like x86_64,
+                // unwinding there relies on the mandatory frame records.
+                dev.checkAny(&.{ .llvm_backend, .aarch64_backend });
+                const Register = @import("../codegen/aarch64/encoding.zig").Register;
+                break :header .{
+                    .format = .eh_frame,
+                    .code_alignment_factor = 1,
+                    .data_alignment_factor = -8,
+                    .return_address_register = Register.Alias.lr.dwarfNum(),
+                    .initial_instructions = comptime &.{
+                        .{ .def_cfa = .{ .reg = Register.Alias.sp.dwarfNum(), .off = 0 } },
+                        .{ .same_value = Register.Alias.lr.dwarfNum() },
                     },
                 };
             } else .{
@@ -4787,41 +4818,63 @@ fn flushWriterError(dwarf: *Dwarf, pt: Zcu.PerThread) (UpdateError || Writer.Err
         const target = &dwarf.bin_file.comp.root_mod.resolved_target.result;
         switch (dwarf.debug_frame.header.format) {
             .none => {},
-            .debug_frame => unreachable,
-            .eh_frame => switch (target.cpu.arch) {
-                .x86_64 => {
-                    dev.checkAny(&.{ .llvm_backend, .x86_64_backend });
-                    const Register = @import("../codegen/x86_64/bits.zig").Register;
-                    for (dwarf.debug_frame.section.units.items) |*unit| {
-                        header_aw.clearRetainingCapacity();
-                        try header_aw.ensureTotalCapacity(unit.header_len);
-                        const unit_len = unit.header_len - dwarf.unitLengthBytes();
-                        switch (dwarf.format) {
-                            .@"32" => hw.writeInt(u32, @intCast(unit_len), dwarf.endian) catch unreachable,
-                            .@"64" => {
-                                hw.writeInt(u32, std.math.maxInt(u32), dwarf.endian) catch unreachable;
-                                hw.writeInt(u64, unit_len, dwarf.endian) catch unreachable;
-                            },
-                        }
-                        hw.splatByteAll(0, 4) catch unreachable;
-                        hw.writeByte(1) catch unreachable;
-                        hw.writeAll("zR\x00") catch unreachable;
-                        hw.writeUleb128(dwarf.debug_frame.header.code_alignment_factor) catch unreachable;
-                        hw.writeSleb128(dwarf.debug_frame.header.data_alignment_factor) catch unreachable;
-                        hw.writeUleb128(dwarf.debug_frame.header.return_address_register) catch unreachable;
-                        hw.writeUleb128(1) catch unreachable;
-                        hw.writeByte(@bitCast(@as(DW.EH.PE, .{ .type = .sdata4, .rel = .pcrel }))) catch unreachable;
-                        hw.writeByte(DW.CFA.def_cfa_sf) catch unreachable;
-                        hw.writeUleb128(Register.rsp.dwarfNum()) catch unreachable;
-                        hw.writeSleb128(-1) catch unreachable;
-                        hw.writeByte(@as(u8, DW.CFA.offset) + Register.rip.dwarfNum()) catch unreachable;
-                        hw.writeUleb128(1) catch unreachable;
-                        hw.splatByteAll(DW.CFA.nop, unit.header_len - hw.end) catch unreachable;
-                        try unit.replaceHeader(&dwarf.debug_frame.section, dwarf, header_aw.written());
-                        try unit.writeTrailer(&dwarf.debug_frame.section, dwarf);
+            .debug_frame, .eh_frame => |format| {
+                for (dwarf.debug_frame.section.units.items) |*unit| {
+                    header_aw.clearRetainingCapacity();
+                    try header_aw.ensureTotalCapacity(unit.header_len);
+                    const unit_len = unit.header_len - dwarf.unitLengthBytes();
+                    switch (dwarf.format) {
+                        .@"32" => hw.writeInt(u32, @intCast(unit_len), dwarf.endian) catch unreachable,
+                        .@"64" => {
+                            hw.writeInt(u32, std.math.maxInt(u32), dwarf.endian) catch unreachable;
+                            hw.writeInt(u64, unit_len, dwarf.endian) catch unreachable;
+                        },
                     }
-                },
-                else => unreachable,
+                    switch (format) {
+                        .eh_frame => {
+                            hw.splatByteAll(0, 4) catch unreachable;
+                            hw.writeByte(1) catch unreachable;
+                            hw.writeAll("zR\x00") catch unreachable;
+                        },
+                        .debug_frame => {
+                            hw.splatByteAll(0xff, dwarf.sectionOffsetBytes()) catch unreachable;
+                            hw.writeByte(4) catch unreachable;
+                            hw.writeAll("\x00" ++ .{ @backingInt(dwarf.address_size), 0 }) catch unreachable;
+                        },
+                        .none => unreachable,
+                    }
+                    hw.writeUleb128(dwarf.debug_frame.header.code_alignment_factor) catch unreachable;
+                    hw.writeSleb128(dwarf.debug_frame.header.data_alignment_factor) catch unreachable;
+                    hw.writeUleb128(dwarf.debug_frame.header.return_address_register) catch unreachable;
+                    if (format == .eh_frame) {
+                        hw.writeUleb128(1) catch unreachable;
+                        hw.writeByte(@bitCast(eh_frame_pointer_encoding)) catch unreachable;
+                    }
+                    switch (target.cpu.arch) {
+                        .x86_64 => {
+                            dev.checkAny(&.{ .llvm_backend, .x86_64_backend });
+                            const Register = @import("../codegen/x86_64/bits.zig").Register;
+                            hw.writeByte(DW.CFA.def_cfa_sf) catch unreachable;
+                            hw.writeUleb128(Register.rsp.dwarfNum()) catch unreachable;
+                            hw.writeSleb128(-1) catch unreachable;
+                            hw.writeByte(@as(u8, DW.CFA.offset) + Register.rip.dwarfNum()) catch unreachable;
+                            hw.writeUleb128(1) catch unreachable;
+                        },
+                        .aarch64, .aarch64_be => {
+                            dev.checkAny(&.{ .llvm_backend, .aarch64_backend });
+                            const Register = @import("../codegen/aarch64/encoding.zig").Register;
+                            hw.writeByte(DW.CFA.def_cfa) catch unreachable;
+                            hw.writeUleb128(Register.Alias.sp.dwarfNum()) catch unreachable;
+                            hw.writeUleb128(0) catch unreachable;
+                            hw.writeByte(DW.CFA.same_value) catch unreachable;
+                            hw.writeUleb128(Register.Alias.lr.dwarfNum()) catch unreachable;
+                        },
+                        else => unreachable,
+                    }
+                    hw.splatByteAll(DW.CFA.nop, unit.header_len - hw.end) catch unreachable;
+                    try unit.replaceHeader(&dwarf.debug_frame.section, dwarf, header_aw.written());
+                    try unit.writeTrailer(&dwarf.debug_frame.section, dwarf);
+                }
             },
         }
         dwarf.debug_frame.section.dirty = false;
@@ -5088,7 +5141,11 @@ pub fn resolveRelocs(dwarf: *Dwarf) RelocError!void {
         &dwarf.debug_loclists.section,
         &dwarf.debug_rnglists.section,
         &dwarf.debug_str.section,
-    }) |sec| try sec.resolveRelocs(dwarf);
+    }) |sec| {
+        // Without a frame format the section has no output location.
+        if (sec == &dwarf.debug_frame.section and dwarf.debug_frame.header.format == .none) continue;
+        try sec.resolveRelocs(dwarf);
+    }
 }
 
 fn DeclValEnum(comptime T: type) type {
@@ -6084,6 +6141,7 @@ const AbbrevCode = enum {
             .tag = .inlined_subroutine,
             .attrs = &.{
                 .{ .abstract_origin, .ref_addr },
+                .{ .call_file, .udata },
                 .{ .call_line, .udata },
                 .{ .call_column, .udata },
                 .{ .low_pc, .addr },
@@ -6095,6 +6153,7 @@ const AbbrevCode = enum {
             .children = true,
             .attrs = &.{
                 .{ .abstract_origin, .ref_addr },
+                .{ .call_file, .udata },
                 .{ .call_line, .udata },
                 .{ .call_column, .udata },
                 .{ .low_pc, .addr },

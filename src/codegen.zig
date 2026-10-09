@@ -98,6 +98,17 @@ pub fn wantsLiveness(pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) bool {
     };
 }
 
+/// Whether the backend wants `Air.Inline` to inline calls before code generation. Backends that
+/// inline on their own (LLVM) or leave it to another compiler (C) do not.
+pub fn wantsInlining(pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) bool {
+    const zcu = pt.zcu;
+    const target = &zcu.navFileScope(nav_index).mod.?.resolved_target.result;
+    return switch (target_util.zigBackend(target, zcu.comp.config.use_llvm)) {
+        else => false,
+        .stage2_aarch64 => true,
+    };
+}
+
 /// Every code generation backend has a different MIR representation. However, we want to pass
 /// MIR from codegen to the linker *regardless* of which backend is in use. So, we use this: a
 /// union of all MIR types. The active tag is known from the backend in use; see `AnyMir.tag`.

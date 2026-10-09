@@ -15,6 +15,7 @@ const Value = @import("Value.zig");
 const Zcu = @import("Zcu.zig");
 const print = @import("Air/print.zig");
 
+pub const Inline = @import("Air/Inline.zig");
 pub const Legalize = @import("Air/Legalize.zig");
 pub const Liveness = @import("Air/Liveness.zig");
 pub const Verify = @import("Air/Verify.zig");

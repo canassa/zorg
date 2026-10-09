@@ -176,6 +176,10 @@ debug_compiler_runtime_libs: ?std.lang.Optimize,
 debug_compile_errors: bool,
 /// Do not check this field directly. Instead, use the `debugIncremental` wrapper function.
 debug_incremental: bool,
+/// `--debug-auto-inline`. Always `null` without debug extensions.
+debug_auto_inline: ?Air.Inline.Override,
+/// `--debug-inline-stats`. Always `false` without debug extensions.
+debug_inline_stats: bool,
 alloc_failure_occurred: bool = false,
 last_update_was_cache_hit: bool = false,
 
@@ -1561,6 +1565,8 @@ pub const CreateOptions = struct {
     debug_compiler_runtime_libs: ?std.lang.Optimize = null,
     debug_compile_errors: bool = false,
     debug_incremental: bool = false,
+    debug_auto_inline: ?Air.Inline.Override = null,
+    debug_inline_stats: bool = false,
     /// Normally when you create a `Compilation`, Zig will automatically build
     /// and link in required dependencies, such as compiler-rt and libc. When
     /// building such dependencies themselves, this flag must be set to avoid
@@ -2134,6 +2140,8 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
             .debug_compiler_runtime_libs = options.debug_compiler_runtime_libs,
             .debug_compile_errors = options.debug_compile_errors,
             .debug_incremental = options.debug_incremental,
+            .debug_auto_inline = options.debug_auto_inline,
+            .debug_inline_stats = options.debug_inline_stats,
             .root_name = root_name,
             .sysroot = sysroot,
             .windows_libs = .empty,
@@ -2291,6 +2299,7 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
                 hash.add(options.skip_linker_dependencies);
                 hash.add(options.emit_h != .no);
                 hash.add(error_limit);
+                hashDebugAutoInline(&hash, options.debug_auto_inline);
 
                 // Here we put the root source file path name, but *not* with addFile.
                 // We want the hash to be the same regardless of the contents of the
@@ -3012,6 +3021,14 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
             std.debug.print("generic instances for '{s}:0x{x}':\n", .{ comp.root_name, @intFromPtr(zcu) });
             zcu.intern_pool.dumpGenericInstances(gpa);
         }
+
+        if (build_options.enable_debug_extensions and comp.debug_inline_stats) {
+            var buffer: [4096]u8 = undefined;
+            const stderr = try comp.io.lockStderr(&buffer, null);
+            defer comp.io.unlockStderr();
+            zcu.inline_stats.print(zcu, &stderr.file_writer.interface) catch {};
+            stderr.file_writer.interface.flush() catch {};
+        }
     }
 
     if (comp.link_depfile) |depfile_path| if (comp.bin_file) |lf| {
@@ -3353,6 +3370,21 @@ fn renameTmpIntoCache(
 /// anything from the link cache manifest.
 pub const link_hash_implementation_version = 14;
 
+/// The inliner setting changes the generated code, so it is part of the cache hash.
+fn hashDebugAutoInline(hash: *Cache.HashHelper, debug_auto_inline: ?Air.Inline.Override) void {
+    hash.add(debug_auto_inline != null);
+    switch (debug_auto_inline orelse return) {
+        .off => hash.add(false),
+        .on => |mode| {
+            hash.add(true);
+            switch (mode) {
+                .threshold => |threshold| hash.add(threshold),
+                .all => hash.add(@as(u32, std.math.maxInt(u32))),
+            }
+        },
+    }
+}
+
 fn addNonIncrementalStuffToCacheManifest(comp: *Compilation, man: *Cache.Manifest) !void {
     comptime assert(link_hash_implementation_version == 14);
 
@@ -3368,6 +3400,7 @@ fn addNonIncrementalStuffToCacheManifest(comp: *Compilation, man: *Cache.Manifes
         man.hash.add(comp.skip_linker_dependencies);
         //man.hash.add(zcu.emit_h != .no);
         man.hash.add(zcu.error_limit);
+        hashDebugAutoInline(&man.hash, comp.debug_auto_inline);
     } else {
         cache_helpers.addModule(&man.hash, comp.root_mod);
     }
@@ -3558,6 +3591,7 @@ const Header = extern struct {
         type_layout_deps_len: u32,
         struct_defaults_deps_len: u32,
         func_ies_deps_len: u32,
+        func_air_deps_len: u32,
         source_file_deps_len: u32,
         embed_file_deps_len: u32,
         namespace_deps_len: u32,
@@ -3608,6 +3642,7 @@ pub fn saveState(comp: *Compilation) !void {
                 .type_layout_deps_len = @intCast(ip.type_layout_deps.count()),
                 .struct_defaults_deps_len = @intCast(ip.struct_defaults_deps.count()),
                 .func_ies_deps_len = @intCast(ip.func_ies_deps.count()),
+                .func_air_deps_len = @intCast(ip.func_air_deps.count()),
                 .source_file_deps_len = @intCast(ip.source_file_deps.count()),
                 .embed_file_deps_len = @intCast(ip.embed_file_deps.count()),
                 .namespace_deps_len = @intCast(ip.namespace_deps.count()),
@@ -3631,7 +3666,7 @@ pub fn saveState(comp: *Compilation) !void {
             },
         });
 
-        try bufs.ensureTotalCapacityPrecise(26 + 9 * pt_headers.items.len);
+        try bufs.ensureTotalCapacityPrecise(28 + 9 * pt_headers.items.len);
         addBuf(&bufs, mem.asBytes(&header));
         addBuf(&bufs, @ptrCast(pt_headers.items));
 
@@ -3647,6 +3682,8 @@ pub fn saveState(comp: *Compilation) !void {
         addBuf(&bufs, @ptrCast(ip.struct_defaults_deps.values()));
         addBuf(&bufs, @ptrCast(ip.func_ies_deps.keys()));
         addBuf(&bufs, @ptrCast(ip.func_ies_deps.values()));
+        addBuf(&bufs, @ptrCast(ip.func_air_deps.keys()));
+        addBuf(&bufs, @ptrCast(ip.func_air_deps.values()));
         addBuf(&bufs, @ptrCast(ip.source_file_deps.keys()));
         addBuf(&bufs, @ptrCast(ip.source_file_deps.values()));
         addBuf(&bufs, @ptrCast(ip.embed_file_deps.keys()));

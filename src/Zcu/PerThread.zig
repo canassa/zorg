@@ -347,6 +347,7 @@ pub fn update(
 
             error.AnalysisFail => {},
         };
+        try pt.finishDeferredFuncBodies();
     }
 }
 fn workerUpdateBuiltinFile(comp: *Compilation, file: *Zcu.File) void {
@@ -2225,6 +2226,12 @@ pub fn ensureFuncBodyUpToDate(
         return;
     }
 
+    // The AIR from the previous analysis must not be inlined into anything analyzed meanwhile.
+    const old_air_hash: ?u64 = if (zcu.inline_cache.fetchSwapRemove(func_index)) |kv| hash: {
+        defer kv.value.destroy(gpa);
+        break :hash kv.value.hash;
+    } else null;
+
     if (zcu.comp.debugIncremental()) {
         const info = try zcu.incremental_debug_state.getUnitInfo(gpa, anal_unit);
         info.last_update_gen = zcu.generation;
@@ -2238,7 +2245,7 @@ pub fn ensureFuncBodyUpToDate(
     );
     defer unit_tracking.end(zcu);
 
-    const ies_outdated, const new_failed = if (pt.analyzeFuncBody(func_index, reason)) |result|
+    const ies_outdated, const new_failed = if (pt.analyzeFuncBody(func_index, reason, old_air_hash)) |result|
         .{ prev_failed or result.ies_outdated, false }
     else |err| switch (err) {
         // We consider the IES to be outdated if the function previously succeeded analysis; in this case,
@@ -2263,6 +2270,8 @@ pub fn ensureFuncBodyUpToDate(
         } else {
             try zcu.markPoDependeeUpToDate(.{ .func_ies = func_index });
         }
+        // After a successful analysis, `analyzeFuncBody` signals the AIR.
+        if (new_failed) try pt.signalFuncAir(func_index, old_air_hash);
     }
 
     if (new_failed) return error.AnalysisFail;
@@ -2272,6 +2281,8 @@ fn analyzeFuncBody(
     pt: Zcu.PerThread,
     func_index: InternPool.Index,
     reason: ?*const Zcu.DependencyReason,
+    /// See `signalFuncAir`.
+    old_air_hash: ?u64,
 ) Zcu.SemaError!struct { ies_outdated: bool } {
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
@@ -2295,18 +2306,77 @@ fn analyzeFuncBody(
     tracy_trace.addTextFmt("func_ip_index={d}", .{func_index});
 
     var air = try pt.analyzeFuncBodyInner(func_index, reason);
-    var air_owned = true;
-    defer if (air_owned) air.deinit(gpa);
+    errdefer air.deinit(gpa);
 
     const ies_outdated = !func.analysisUnordered(ip).inferred_error_set or
         func.resolvedErrorSetUnordered(ip) != old_resolved_ies;
 
+    // Inlining needs the callees analyzed first, which `inlineCalls` does only at the root of
+    // analysis: inside another unit's analysis that could report a dependency loop that the usual
+    // order does not have. There, and to bound the recursion of `inlineCalls`, the rest waits for
+    // the root (`finishDeferredFuncBodies`).
+    if (pt.inlineMode(func.owner_nav) != null and
+        (zcu.analysis_in_progress.count() != 0 or zcu.inline_depth >= max_inline_depth))
+    {
+        try zcu.inline_deferred.append(gpa, .{ .func = func_index, .air = air, .old_air_hash = old_air_hash });
+        return .{ .ies_outdated = ies_outdated };
+    }
+    try pt.finishFuncBody(func_index, air, old_air_hash);
+    return .{ .ies_outdated = ies_outdated };
+}
+
+/// Finishes the functions that `analyzeFuncBody` deferred, in analysis order. Called at the root
+/// of analysis.
+pub fn finishDeferredFuncBodies(pt: Zcu.PerThread) (Allocator.Error || Io.Cancelable)!void {
+    const zcu = pt.zcu;
+    assert(zcu.analysis_in_progress.count() == 0);
+    while (zcu.inline_deferred.items.len > 0) {
+        const deferred = zcu.inline_deferred.orderedRemove(0);
+        try pt.finishFuncBody(deferred.func, deferred.air, deferred.old_air_hash);
+    }
+}
+
+/// Finishes `func_index` if `analyzeFuncBody` deferred it.
+fn finishDeferredFuncBody(pt: Zcu.PerThread, func_index: InternPool.Index) (Allocator.Error || Io.Cancelable)!void {
+    const zcu = pt.zcu;
+    for (zcu.inline_deferred.items, 0..) |deferred, index| {
+        if (deferred.func != func_index) continue;
+        _ = zcu.inline_deferred.orderedRemove(index);
+        return pt.finishFuncBody(deferred.func, deferred.air, deferred.old_air_hash);
+    }
+}
+
+/// Signals the dependers of `func_index`'s inlinable AIR, whose hash was `old_air_hash` before
+/// the function was analyzed again, mirroring its IES: they are outdated if the AIR changed.
+fn signalFuncAir(pt: Zcu.PerThread, func_index: InternPool.Index, old_air_hash: ?u64) Allocator.Error!void {
+    const zcu = pt.zcu;
+    const new_air_hash: ?u64 = if (zcu.inline_cache.get(func_index)) |cached| cached.hash else null;
+    if (old_air_hash != new_air_hash) {
+        try zcu.markDependeeOutdated(.marked_po, .{ .func_air = func_index });
+    } else {
+        try zcu.markPoDependeeUpToDate(.{ .func_air = func_index });
+    }
+}
+
+/// After the analysis of `func_index`: inlines calls in `air`, caches it for its callers, and
+/// starts its codegen. Takes ownership of `air`.
+fn finishFuncBody(pt: Zcu.PerThread, func_index: InternPool.Index, air_arg: Air, old_air_hash: ?u64) (Allocator.Error || Io.Cancelable)!void {
+    const zcu = pt.zcu;
+    const gpa = zcu.gpa;
     const comp = zcu.comp;
+    const func = zcu.funcInfo(func_index);
+
+    var air = air_arg;
+    var air_owned = true;
+    defer if (air_owned) air.deinit(gpa);
 
     const dump_air = build_options.enable_debug_extensions and comp.verbose_air;
     const dump_llvm_ir = build_options.enable_debug_extensions and (comp.verbose_llvm_ir != null or comp.verbose_llvm_bc != null);
 
     if (comp.bin_file != null or zcu.llvm_object != null or dump_air or dump_llvm_ir) {
+        if (pt.inlineMode(func.owner_nav)) |mode| try pt.inlineCalls(func_index, &air, mode);
+        try pt.signalFuncAir(func_index, old_air_hash);
+
         zcu.codegen_prog_node.increaseEstimatedTotalItems(1);
         comp.link_prog_node.increaseEstimatedTotalItems(1);
 
@@ -2321,9 +2391,74 @@ fn analyzeFuncBody(
         if (disown_air) air_owned = false;
 
         try comp.link_queue.enqueueZcu(comp, pt.tid, .{ .link_func = codegen_task });
+    } else try pt.signalFuncAir(func_index, old_air_hash);
+}
+
+/// How `Air.Inline` should run on the functions of `nav`'s module, or `null` if it should not.
+fn inlineMode(pt: Zcu.PerThread, nav: InternPool.Nav.Index) ?Air.Inline.Mode {
+    const zcu = pt.zcu;
+    if (!codegen.wantsInlining(pt, nav)) return null;
+    if (zcu.comp.debug_auto_inline) |override| return switch (override) {
+        .off => null,
+        .on => |mode| mode,
+    };
+    return switch (zcu.navFileScope(nav).mod.?.optimize_mode) {
+        // Inlining makes stepping through code in a debugger confusing.
+        .debug => null,
+        .safe, .fast, .small => .{ .threshold = Air.Inline.default_threshold },
+    };
+}
+
+/// The deepest that `inlineCalls` analyzes callees ahead of their callers, which bounds its
+/// recursion.
+const max_inline_depth = 32;
+
+/// Runs `Air.Inline` on `air`, the AIR of `func_index`, and caches the result for its callers.
+fn inlineCalls(pt: Zcu.PerThread, func_index: InternPool.Index, air: *Air, mode: Air.Inline.Mode) (Allocator.Error || Io.Cancelable)!void {
+    const zcu = pt.zcu;
+    const comp = zcu.comp;
+    const gpa = zcu.gpa;
+    const ip = &zcu.intern_pool;
+    const stats = if (build_options.enable_debug_extensions and comp.debug_inline_stats) &zcu.inline_stats else null;
+
+    // Analyze the direct callees first, so that their AIR is cached, as resolving an inferred
+    // error set does. `analyzeFuncBody` only gets here at the root of analysis. A callee whose
+    // analysis already happened (recursion) is not analyzed again, and without a cache entry yet
+    // it is simply not inlined.
+    assert(zcu.analysis_in_progress.count() == 0 and zcu.inline_depth < max_inline_depth);
+    {
+        const callees = try Air.Inline.directCallees(gpa, ip, air, mode);
+        defer gpa.free(callees);
+        const reason: Zcu.DependencyReason = .{
+            .src = zcu.navSrcLoc(zcu.funcInfo(func_index).owner_nav),
+            .type_layout_reason = undefined,
+        };
+        zcu.inline_depth += 1;
+        defer zcu.inline_depth -= 1;
+        for (callees) |callee| {
+            if (callee == func_index or zcu.inline_cache.contains(callee)) continue;
+            pt.ensureFuncBodyUpToDate(callee, &reason) catch |err| switch (err) {
+                // The callee's own analysis reports it.
+                error.AnalysisFail => {},
+                error.OutOfMemory, error.Canceled => |e| return e,
+            };
+            // The callee may have been analyzed inside another unit's analysis (now or before)
+            // and wait for the root: finish it here, unless that is too deep.
+            if (zcu.inline_depth < max_inline_depth) try pt.finishDeferredFuncBody(callee);
+        }
     }
 
-    return .{ .ies_outdated = ies_outdated };
+    var inlined: std.ArrayList(InternPool.Index) = .empty;
+    defer inlined.deinit(gpa);
+    try Air.Inline.run(pt, func_index, air, &zcu.inline_cache, mode, stats, &inlined);
+    if (comp.config.incremental) {
+        const unit: AnalUnit = .wrap(.{ .func = func_index });
+        for (inlined.items) |callee| try pt.addDependency(unit, .{ .func_air = callee });
+    }
+    if (try Air.Inline.cache(pt, func_index, air, mode, stats)) |cached| {
+        errdefer cached.destroy(gpa);
+        try zcu.inline_cache.putNoClobber(gpa, func_index, cached);
+    }
 }
 
 /// The given file has been modified on this incremental update, so if it has a populated root

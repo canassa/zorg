@@ -51,6 +51,9 @@ nav_ty_deps: std.array_hash_map.Auto(Nav.Index, DepEntry.Index),
 /// Dependencies on a function's inferred error set. Key is the function body, not the IES.
 /// Value is index into `dep_entries` of the first dependency on this function's IES.
 func_ies_deps: std.array_hash_map.Auto(Index, DepEntry.Index),
+/// Dependencies on the AIR of a function that `Air.Inline` copied into its callers. Key is the
+/// function body. Value is index into `dep_entries` of the first dependency on this function's AIR.
+func_air_deps: std.array_hash_map.Auto(Index, DepEntry.Index),
 /// Dependencies on the resolved layout of a `struct`, `union`, or `enum` type.
 /// Value is index into `dep_entries` of the first dependency on this type's layout.
 type_layout_deps: std.array_hash_map.Auto(Index, DepEntry.Index),
@@ -115,6 +118,7 @@ pub const empty: InternPool = .{
     .nav_val_deps = .empty,
     .nav_ty_deps = .empty,
     .func_ies_deps = .empty,
+    .func_air_deps = .empty,
     .type_layout_deps = .empty,
     .struct_defaults_deps = .empty,
     .source_file_deps = .empty,
@@ -749,6 +753,8 @@ pub const Dependee = union(enum) {
     nav_ty: Nav.Index,
     /// Index is the function, not its IES.
     func_ies: Index,
+    /// The AIR of a function, as cached for `Air.Inline`. Index is the function.
+    func_air: Index,
     type_layout: Index,
     struct_defaults: Index,
     source_file: FileIndex,
@@ -803,6 +809,7 @@ pub fn dependencyIterator(ip: *const InternPool, dependee: Dependee) DependencyI
         .nav_val => |x| ip.nav_val_deps.get(x),
         .nav_ty => |x| ip.nav_ty_deps.get(x),
         .func_ies => |x| ip.func_ies_deps.get(x),
+        .func_air => |x| ip.func_air_deps.get(x),
         .type_layout => |x| ip.type_layout_deps.get(x),
         .struct_defaults => |x| ip.struct_defaults_deps.get(x),
         .source_file => |x| ip.source_file_deps.get(x),
@@ -878,6 +885,7 @@ pub fn addDependency(ip: *InternPool, gpa: Allocator, depender: AnalUnit, depend
                 .nav_val => ip.nav_val_deps,
                 .nav_ty => ip.nav_ty_deps,
                 .func_ies => ip.func_ies_deps,
+                .func_air => ip.func_air_deps,
                 .type_layout => ip.type_layout_deps,
                 .struct_defaults => ip.struct_defaults_deps,
                 .source_file => ip.source_file_deps,
@@ -6378,6 +6386,7 @@ pub fn deinit(ip: *InternPool, gpa: Allocator, io: Io) void {
     ip.nav_val_deps.deinit(gpa);
     ip.nav_ty_deps.deinit(gpa);
     ip.func_ies_deps.deinit(gpa);
+    ip.func_air_deps.deinit(gpa);
     ip.type_layout_deps.deinit(gpa);
     ip.struct_defaults_deps.deinit(gpa);
     ip.source_file_deps.deinit(gpa);
@@ -10604,6 +10613,7 @@ fn dumpDependencyStatsFallible(ip: *const InternPool, w: *Io.Writer) !void {
     const nav_val_deps_len = ip.nav_val_deps.count();
     const nav_ty_deps_len = ip.nav_ty_deps.count();
     const func_ies_deps_len = ip.func_ies_deps.count();
+    const func_air_deps_len = ip.func_air_deps.count();
     const type_layout_deps_len = ip.type_layout_deps.count();
     const struct_defaults_deps_len = ip.struct_defaults_deps.count();
     const source_file_deps_len = ip.source_file_deps.count();
@@ -10615,6 +10625,7 @@ fn dumpDependencyStatsFallible(ip: *const InternPool, w: *Io.Writer) !void {
     const nav_val_deps_size = nav_val_deps_len * 8;
     const nav_ty_deps_size = nav_ty_deps_len * 8;
     const func_ies_deps_size = func_ies_deps_len * 8;
+    const func_air_deps_size = func_air_deps_len * 8;
     const type_layout_deps_size = type_layout_deps_len * 8;
     const struct_defaults_deps_size = struct_defaults_deps_len * 8;
     const source_file_deps_size = source_file_deps_len * 8;
@@ -10629,6 +10640,7 @@ fn dumpDependencyStatsFallible(ip: *const InternPool, w: *Io.Writer) !void {
         \\  {d} nav_val: {d} bytes
         \\  {d} nav_ty: {d} bytes
         \\  {d} func_ies: {d} bytes
+        \\  {d} func_air: {d} bytes
         \\  {d} type_layout: {d} bytes
         \\  {d} struct_defaults: {d} bytes
         \\  {d} source_file: {d} bytes
@@ -10638,7 +10650,7 @@ fn dumpDependencyStatsFallible(ip: *const InternPool, w: *Io.Writer) !void {
         \\
     , .{
         dep_entries_size + src_hash_deps_size + nav_val_deps_size + nav_ty_deps_size +
-            func_ies_deps_size + type_layout_deps_size + struct_defaults_deps_size + source_file_deps_size +
+            func_ies_deps_size + func_air_deps_size + type_layout_deps_size + struct_defaults_deps_size + source_file_deps_size +
             embed_file_deps_size + namespace_deps_size + namespace_name_deps_size,
         dep_entries_len,
         dep_entries_size,
@@ -10650,6 +10662,8 @@ fn dumpDependencyStatsFallible(ip: *const InternPool, w: *Io.Writer) !void {
         nav_ty_deps_size,
         func_ies_deps_len,
         func_ies_deps_size,
+        func_air_deps_len,
+        func_air_deps_size,
         type_layout_deps_len,
         type_layout_deps_size,
         struct_defaults_deps_len,

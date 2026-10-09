@@ -323,7 +323,7 @@ fn handleCommand(zcu: *Zcu, w: *Io.Writer, cmd_str: []const u8, arg_str: []const
             switch (dependee) {
                 .src_hash, .namespace, .namespace_name, .source_file, .embed_file => try w.print("{f}", .{zcu.fmtDependee(dependee)}),
                 .nav_val, .nav_ty => |nav| try w.print("{t} {d}", .{ dependee, @backingInt(nav) }),
-                .type_layout, .struct_defaults, .func_ies => |ip_index| try w.print("{t} {d}", .{ dependee, @backingInt(ip_index) }),
+                .type_layout, .struct_defaults, .func_ies, .func_air => |ip_index| try w.print("{t} {d}", .{ dependee, @backingInt(ip_index) }),
                 .memoized_state => |stage| try w.print("memoized_state {s}", .{@tagName(stage)}),
             }
             try w.writeByte('\n');

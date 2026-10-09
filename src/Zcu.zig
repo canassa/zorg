@@ -346,10 +346,33 @@ cur_analysis_timer: ?Compilation.Timer = null,
 
 codegen_task_pool: CodegenTaskPool,
 
+/// The AIR of every function that `Air.Inline` may inline, keyed by function. Only the thread
+/// doing semantic analysis touches it: the inliner runs on a function's AIR before its codegen
+/// task starts, so codegen never reads an entry, and an entry is destroyed only when its function
+/// is analyzed again or the `Zcu` is destroyed.
+inline_cache: std.array_hash_map.Auto(InternPool.Index, *Air.Inline.Cached) = .empty,
+/// How deeply `Zcu.PerThread.inlineCalls` is analyzing callees ahead of their callers.
+inline_depth: u32 = 0,
+/// Functions whose inlining and codegen wait until analysis is back at its root, where their
+/// callees can be analyzed first (see `Zcu.PerThread.analyzeFuncBody`). In analysis order.
+inline_deferred: std.ArrayList(DeferredFuncBody) = .empty,
+/// Populated with `--debug-inline-stats`.
+inline_stats: if (build_options.enable_debug_extensions) Air.Inline.Stats else void =
+    if (build_options.enable_debug_extensions) .{} else {},
+
 generation: u32 = 0,
 
 /// Only access from the Sema thread.
 anon_name_counter: u32,
+
+/// The AIR of a function analyzed while another unit's analysis was in progress, whose inlining
+/// and codegen `Zcu.PerThread.finishDeferredFuncBodies` does.
+pub const DeferredFuncBody = struct {
+    func: InternPool.Index,
+    air: Air,
+    /// The hash of the function's cached AIR from its previous analysis, see `Zcu.PerThread.signalFuncAir`.
+    old_air_hash: ?u64,
+};
 
 pub const DependencyReason = struct {
     src: LazySrcLoc,
@@ -2928,6 +2951,12 @@ pub fn deinit(zcu: *Zcu) void {
         zcu.local_zir_cache.handle.close(io);
         zcu.global_zir_cache.handle.close(io);
 
+        for (zcu.inline_cache.values()) |cached| cached.destroy(gpa);
+        zcu.inline_cache.deinit(gpa);
+        for (zcu.inline_deferred.items) |*deferred| deferred.air.deinit(gpa);
+        zcu.inline_deferred.deinit(gpa);
+        if (build_options.enable_debug_extensions) zcu.inline_stats.deinit(gpa);
+
         for (zcu.failed_analysis.values()) |value| value.destroy(gpa);
         for (zcu.failed_codegen.values()) |value| value.destroy(gpa);
         for (zcu.failed_types.values()) |value| value.destroy(gpa);
@@ -3324,28 +3353,38 @@ fn markPoDependeeUpToDateInner(zcu: *Zcu, dependee: InternPool.Dependee) !void {
             .nav_ty => |nav| try zcu.markPoDependeeUpToDateInner(.{ .nav_ty = nav }),
             .type_layout => |ty| try zcu.markPoDependeeUpToDateInner(.{ .type_layout = ty }),
             .struct_defaults => |ty| try zcu.markPoDependeeUpToDateInner(.{ .struct_defaults = ty }),
-            .func => |func| try zcu.markPoDependeeUpToDateInner(.{ .func_ies = func }),
+            .func => |func| {
+                try zcu.markPoDependeeUpToDateInner(.{ .func_ies = func });
+                try zcu.markPoDependeeUpToDateInner(.{ .func_air = func });
+            },
             .memoized_state => |stage| try zcu.markPoDependeeUpToDateInner(.{ .memoized_state = stage }),
         }
     }
 }
 
 /// Given a AnalUnit which is newly outdated or PO, mark all AnalUnits which may
-/// in turn be PO, due to a dependency on the original AnalUnit's tyval or IES.
+/// in turn be PO, due to a dependency on the original AnalUnit's tyval, IES or AIR.
 ///
 /// Assumes that `zcu.outdated_lock` is already held exclusively.
 fn markTransitiveDependersPotentiallyOutdated(zcu: *Zcu, maybe_outdated: AnalUnit) Allocator.Error!void {
+    switch (maybe_outdated.unwrap()) {
+        .@"comptime" => {}, // analysis of a comptime decl can't outdate any dependencies
+        .nav_val => |nav| try zcu.markDependersPotentiallyOutdated(.{ .nav_val = nav }),
+        .nav_ty => |nav| try zcu.markDependersPotentiallyOutdated(.{ .nav_ty = nav }),
+        .type_layout => |ty| try zcu.markDependersPotentiallyOutdated(.{ .type_layout = ty }),
+        .struct_defaults => |ty| try zcu.markDependersPotentiallyOutdated(.{ .struct_defaults = ty }),
+        .func => |func_index| {
+            try zcu.markDependersPotentiallyOutdated(.{ .func_ies = func_index });
+            try zcu.markDependersPotentiallyOutdated(.{ .func_air = func_index });
+        },
+        .memoized_state => |stage| try zcu.markDependersPotentiallyOutdated(.{ .memoized_state = stage }),
+    }
+}
+
+/// Assumes that `zcu.outdated_lock` is already held exclusively.
+fn markDependersPotentiallyOutdated(zcu: *Zcu, dependee: InternPool.Dependee) Allocator.Error!void {
     const gpa = zcu.comp.gpa;
     const ip = &zcu.intern_pool;
-    const dependee: InternPool.Dependee = switch (maybe_outdated.unwrap()) {
-        .@"comptime" => return, // analysis of a comptime decl can't outdate any dependencies
-        .nav_val => |nav| .{ .nav_val = nav },
-        .nav_ty => |nav| .{ .nav_ty = nav },
-        .type_layout => |ty| .{ .type_layout = ty },
-        .struct_defaults => |ty| .{ .struct_defaults = ty },
-        .func => |func_index| .{ .func_ies = func_index },
-        .memoized_state => |stage| .{ .memoized_state = stage },
-    };
     deps_log.debug("potentially outdated dependee: {f}", .{zcu.fmtDependee(dependee)});
     var it = ip.dependencyIterator(dependee);
     while (it.next()) |po| {
@@ -4613,6 +4652,10 @@ fn formatDependee(data: FormatDependee, writer: *Io.Writer) Io.Writer.Error!void
         .func_ies => |ip_index| {
             const fqn = ip.getNav(ip.indexToKey(ip_index).func.owner_nav).fqn;
             return writer.print("func_ies('{f}')", .{fqn.fmt(ip)});
+        },
+        .func_air => |ip_index| {
+            const fqn = ip.getNav(ip.indexToKey(ip_index).func.owner_nav).fqn;
+            return writer.print("func_air('{f}')", .{fqn.fmt(ip)});
         },
         .source_file => |file| {
             const file_path = zcu.fileByIndex(file).path;

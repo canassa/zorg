@@ -30,6 +30,7 @@ const wasi_libc = @import("libs/wasi_libc.zig");
 const target_util = @import("target.zig");
 const crash_report = @import("crash_report.zig");
 const Zcu = @import("Zcu.zig");
+const Air = @import("Air.zig");
 const mingw = @import("libs/mingw.zig");
 const dev = @import("dev.zig");
 const Module = @import("Module.zig");
@@ -807,6 +808,9 @@ const compile_usage =
     \\  --debug-rt[=mode]            Build compiler runtime libraries with [mode] optimization
     \\                               (debug if [=mode] is omitted)
     \\  --debug-incremental          Enable incremental compilation debug features
+    \\  --debug-auto-inline=[t]      Inline calls of callees costing up to [t], 'all' eligible
+    \\                               callees, or 'off', in every optimization mode
+    \\  --debug-inline-stats         Print what the automatic inliner did with each function
     \\
 ;
 
@@ -934,6 +938,8 @@ fn buildOutputType(
     var listen: Listen = .none;
     var debug_compile_errors = false;
     var debug_incremental = false;
+    var debug_auto_inline: ?Air.Inline.Override = null;
+    var debug_inline_stats = false;
     var verbose_link = (native_os != .wasi or builtin.link_libc) and
         EnvVar.ZIG_VERBOSE_LINK.isSet(environ_map);
     var verbose_cc = (native_os != .wasi or builtin.link_libc) and
@@ -1484,6 +1490,19 @@ fn buildOutputType(
                             debug_incremental = true;
                         } else {
                             warn("Zig was compiled without debug extensions. --debug-incremental has no effect.", .{});
+                        }
+                    } else if (mem.cutPrefix(u8, arg, "--debug-auto-inline=")) |rest| {
+                        if (build_options.enable_debug_extensions) {
+                            debug_auto_inline = Air.Inline.Override.parse(rest) orelse
+                                fatal("expected a threshold, 'all' or 'off' after --debug-auto-inline=, found '{s}'", .{rest});
+                        } else {
+                            warn("Zig was compiled without debug extensions. --debug-auto-inline has no effect.", .{});
+                        }
+                    } else if (mem.eql(u8, arg, "--debug-inline-stats")) {
+                        if (build_options.enable_debug_extensions) {
+                            debug_inline_stats = true;
+                        } else {
+                            warn("Zig was compiled without debug extensions. --debug-inline-stats has no effect.", .{});
                         }
                     } else if (mem.eql(u8, arg, "-fincremental")) {
                         dev.check(.incremental);
@@ -3746,6 +3765,8 @@ fn buildOutputType(
         .subsystem = subsystem,
         .debug_compile_errors = debug_compile_errors,
         .debug_incremental = debug_incremental,
+        .debug_auto_inline = debug_auto_inline,
+        .debug_inline_stats = debug_inline_stats,
         .enable_link_snapshots = enable_link_snapshots,
         .install_name = install_name,
         .entitlements = if (entitlements) |p| .initCwd(p) else null,

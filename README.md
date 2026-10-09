@@ -37,7 +37,10 @@ can compile Zig itself.
 
 * The self-hosted AArch64 backend can compile Zig itself (self-hosting).
 * Many bug fixes in the AArch64 backend, each covered by a behavior test.
-* Optimizations for the generated code (see below).
+* Faster compiled binaries: from 32% of LLVM's speed to 51% (see below).
+
+The speed numbers come from running a Zorg-compiled version of
+[Beni](https://github.com/canassa/beni) against an LLVM-compiled one on the same workload.
 
 ## Why
 

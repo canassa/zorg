@@ -44,6 +44,9 @@ function_starts_cmd: macho.linkedit_data_command = .{ .cmd = .FUNCTION_STARTS },
 data_in_code_cmd: macho.linkedit_data_command = .{ .cmd = .DATA_IN_CODE },
 uuid_cmd: macho.uuid_command = .{ .uuid = @splat(0) },
 codesig_cmd: macho.linkedit_data_command = .{ .cmd = .CODE_SIGNATURE },
+/// The length the output file was last extended to by `extendFile`, which `flush` cuts back to
+/// the end of the last segment.
+extended_file_len: u64 = 0,
 
 pagezero_seg_index: ?u8 = null,
 text_seg_index: ?u8 = null,
@@ -505,6 +508,16 @@ pub fn flush(
         self.getLinkeditSegment().filesize,
         self.getPageSize(),
     );
+
+    // The file may extend past its contents (`extendFile`); the UUID and the code signature
+    // cover the file up to the end of the last segment.
+    {
+        var file_len: u64 = 0;
+        for (self.segments.items) |seg| file_len = @max(file_len, seg.fileoff + seg.filesize);
+        self.base.file.?.setLength(io, file_len) catch |err|
+            return diags.fail("failed to set the output file length: {t}", .{err});
+        self.extended_file_len = file_len;
+    }
 
     const ncmds, const sizeofcmds, const uuid_cmd_offset = self.writeLoadCommands() catch |err| switch (err) {
         error.WriteFailed => unreachable,
@@ -3069,10 +3082,18 @@ fn detectAllocCollision(self: *MachO, start: u64, size: u64) !?u64 {
         }
     }
 
-    const comp = self.base.comp;
-    const io = comp.io;
-    if (at_end) try self.base.file.?.setLength(io, end);
+    if (at_end) try self.extendFile(end);
     return null;
+}
+
+/// Makes the output file at least `len` bytes long. Sections grow in many small steps and every
+/// change of the file's length is a costly system call, so the file grows in larger steps here;
+/// `flush` sets its final length.
+fn extendFile(self: *MachO, len: u64) !void {
+    if (len <= self.extended_file_len) return;
+    const new_len = padToIdeal(len);
+    try self.base.file.?.setLength(self.base.comp.io, new_len);
+    self.extended_file_len = new_len;
 }
 
 fn detectAllocCollisionVirtual(self: *MachO, start: u64, size: u64) ?u64 {
@@ -3418,9 +3439,6 @@ fn growSectionNonRelocatable(self: *MachO, sect_index: u8, needed_size: u64) !vo
     const seg_id = self.sections.items(.segment_id)[sect_index];
     const seg = &self.segments.items[seg_id];
 
-    const comp = self.base.comp;
-    const io = comp.io;
-
     if (!sect.isZerofill()) {
         const allocated_size = self.allocatedSize(sect.offset);
         if (needed_size > allocated_size) {
@@ -3442,7 +3460,7 @@ fn growSectionNonRelocatable(self: *MachO, sect_index: u8, needed_size: u64) !vo
 
             sect.offset = @intCast(new_offset);
         } else if (sect.offset + allocated_size == std.math.maxInt(u64)) {
-            try self.base.file.?.setLength(io, sect.offset + needed_size);
+            try self.extendFile(sect.offset + needed_size);
         }
         seg.filesize = needed_size;
     }

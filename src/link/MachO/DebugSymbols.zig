@@ -23,6 +23,9 @@ const padToIdeal = MachO.padToIdeal;
 io: Io,
 allocator: Allocator,
 file: ?Io.File,
+/// The length the file was last extended to by `extendFile`, which `flush` cuts back to the end
+/// of the last segment.
+extended_file_len: u64 = 0,
 
 symtab_cmd: macho.symtab_command = .{},
 uuid_cmd: macho.uuid_command = .{ .uuid = @splat(0) },
@@ -145,7 +148,7 @@ pub fn growSection(
 
         sect.offset = @intCast(new_offset);
     } else if (sect.offset + allocated_size == std.math.maxInt(u64)) {
-        try self.file.?.setLength(io, sect.offset + needed_size);
+        try self.extendFile(sect.offset + needed_size);
     }
 
     sect.size = needed_size;
@@ -169,7 +172,6 @@ pub fn markDirty(self: *DebugSymbols, sect_index: u8, macho_file: *MachO) void {
 }
 
 fn detectAllocCollision(self: *DebugSymbols, start: u64, size: u64) !?u64 {
-    const io = self.io;
     var at_end = true;
     const end = start + padToIdeal(size);
 
@@ -182,8 +184,16 @@ fn detectAllocCollision(self: *DebugSymbols, start: u64, size: u64) !?u64 {
         }
     }
 
-    if (at_end) try self.file.?.setLength(io, end);
+    if (at_end) try self.extendFile(end);
     return null;
+}
+
+/// Like `MachO.extendFile`, for the dSYM file.
+fn extendFile(self: *DebugSymbols, len: u64) !void {
+    if (len <= self.extended_file_len) return;
+    const new_len = MachO.padToIdeal(len);
+    try self.file.?.setLength(self.io, new_len);
+    self.extended_file_len = new_len;
 }
 
 fn findFreeSpace(self: *DebugSymbols, object_size: u64, min_alignment: u64) !u64 {
@@ -215,6 +225,12 @@ pub fn flush(self: *DebugSymbols, macho_file: *MachO) !void {
 
     self.finalizeDwarfSegment(macho_file);
     try self.writeLinkeditSegmentData(macho_file);
+    {
+        var file_len: u64 = 0;
+        for (self.segments.items) |seg| file_len = @max(file_len, seg.fileoff + seg.filesize);
+        try self.file.?.setLength(io, file_len);
+        self.extended_file_len = file_len;
+    }
 
     // Write load commands
     const ncmds, const sizeofcmds = try self.writeLoadCommands(macho_file);

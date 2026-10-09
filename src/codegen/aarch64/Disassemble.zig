@@ -1282,7 +1282,7 @@ pub fn printInstruction(dis: Disassemble, inst: aarch64.encoding.Instruction, wr
                     .size = group.Q,
                     .elem_size = switch (decoded) {
                         .unallocated => break :unallocated,
-                        .addp => group.size,
+                        .sshl, .add, .addp, .ushl, .sub => group.size,
                         .@"and", .bic, .orr, .orn, .eor, .bsl, .bit, .bif => .byte,
                     },
                 });
@@ -1303,6 +1303,35 @@ pub fn printInstruction(dis: Disassemble, inst: aarch64.encoding.Instruction, wr
                     Rn.fmtCase(dis.case),
                     dis.operands_separator,
                     Rm.fmtCase(dis.case),
+                });
+            },
+            .simd_shift_by_immediate => |simd_shift_by_immediate| {
+                const decoded = simd_shift_by_immediate.decode();
+                if (decoded == .unallocated) break :unallocated;
+                const group = simd_shift_by_immediate.group;
+                const elem_size: aarch64.encoding.Instruction.DataProcessingVector.Size = switch (@clz(group.immh)) {
+                    0 => .double,
+                    1 => .single,
+                    2 => .half,
+                    3 => .byte,
+                    else => unreachable,
+                };
+                if (elem_size == .double and group.Q == .double) break :unallocated;
+                const arrangement: aarch64.encoding.Register.Arrangement = .wrap(.{ .size = group.Q, .elem_size = elem_size });
+                const esize = @as(u8, 8) << @backingInt(elem_size);
+                const imm = @as(u8, group.immh) << 3 | group.immb;
+                return writer.print("{f}{s}{f}{s}{f}{s}#{d}", .{
+                    fmtCase(decoded, dis.case),
+                    dis.mnemonic_operands_separator,
+                    group.Rd.decode(.{ .V = true }).vector(arrangement).fmtCase(dis.case),
+                    dis.operands_separator,
+                    group.Rn.decode(.{ .V = true }).vector(arrangement).fmtCase(dis.case),
+                    dis.operands_separator,
+                    switch (decoded) {
+                        .unallocated => unreachable,
+                        .shl => imm - esize,
+                        .sshr, .ushr => 2 * esize - imm,
+                    },
                 });
             },
             .simd_modified_immediate => |simd_modified_immediate| {

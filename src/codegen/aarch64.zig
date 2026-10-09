@@ -92,6 +92,7 @@ pub fn legalizeFeatures(_: *const std.Target) *const Air.Legalize.Features {
         .expand_array_splat,
         .expand_array_to_vector,
         .soft_big_int,
+        .keep_simd_int_vectors,
     });
 }
 

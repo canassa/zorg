@@ -7031,6 +7031,7 @@ pub const Instruction = packed union {
         simd_two_register_miscellaneous: SimdTwoRegisterMiscellaneous,
         simd_across_lanes: SimdAcrossLanes,
         simd_three_same: SimdThreeSame,
+        simd_shift_by_immediate: SimdShiftByImmediate,
         simd_modified_immediate: SimdModifiedImmediate,
         convert_float_fixed: ConvertFloatFixed,
         convert_float_integer: ConvertFloatInteger,
@@ -9784,6 +9785,8 @@ pub const Instruction = packed union {
         /// Advanced SIMD three same
         pub const SimdThreeSame = packed union {
             group: @This().Group,
+            sshl: Sshl,
+            add: Add,
             addp: Addp,
             @"and": And,
             bic: Bic,
@@ -9793,6 +9796,8 @@ pub const Instruction = packed union {
             bsl: Bsl,
             bit: Bit,
             bif: Bif,
+            ushl: Ushl,
+            sub: Sub,
 
             pub const Group = packed struct {
                 Rd: Register.Encoded,
@@ -9804,6 +9809,36 @@ pub const Instruction = packed union {
                 size: Size,
                 decoded24: u5 = 0b01110,
                 U: std.lang.Signedness,
+                Q: Q,
+                decoded31: u1 = 0b0,
+            };
+
+            /// SSHL
+            pub const Sshl = packed struct {
+                Rd: Register.Encoded,
+                Rn: Register.Encoded,
+                decoded10: u1 = 0b1,
+                opcode: u5 = 0b01000,
+                Rm: Register.Encoded,
+                decoded21: u1 = 0b1,
+                size: Size,
+                decoded24: u5 = 0b01110,
+                U: std.lang.Signedness = .signed,
+                Q: Q,
+                decoded31: u1 = 0b0,
+            };
+
+            /// C7.2.2 ADD (vector)
+            pub const Add = packed struct {
+                Rd: Register.Encoded,
+                Rn: Register.Encoded,
+                decoded10: u1 = 0b1,
+                opcode: u5 = 0b10000,
+                Rm: Register.Encoded,
+                decoded21: u1 = 0b1,
+                size: Size,
+                decoded24: u5 = 0b01110,
+                U: std.lang.Signedness = .signed,
                 Q: Q,
                 decoded31: u1 = 0b0,
             };
@@ -9943,8 +9978,40 @@ pub const Instruction = packed union {
                 decoded31: u1 = 0b0,
             };
 
+            /// USHL
+            pub const Ushl = packed struct {
+                Rd: Register.Encoded,
+                Rn: Register.Encoded,
+                decoded10: u1 = 0b1,
+                opcode: u5 = 0b01000,
+                Rm: Register.Encoded,
+                decoded21: u1 = 0b1,
+                size: Size,
+                decoded24: u5 = 0b01110,
+                U: std.lang.Signedness = .unsigned,
+                Q: Q,
+                decoded31: u1 = 0b0,
+            };
+
+            /// SUB (vector)
+            pub const Sub = packed struct {
+                Rd: Register.Encoded,
+                Rn: Register.Encoded,
+                decoded10: u1 = 0b1,
+                opcode: u5 = 0b10000,
+                Rm: Register.Encoded,
+                decoded21: u1 = 0b1,
+                size: Size,
+                decoded24: u5 = 0b01110,
+                U: std.lang.Signedness = .unsigned,
+                Q: Q,
+                decoded31: u1 = 0b0,
+            };
+
             pub const Decoded = union(enum) {
                 unallocated,
+                sshl: Sshl,
+                add: Add,
                 addp: Addp,
                 @"and": And,
                 bic: Bic,
@@ -9954,11 +10021,15 @@ pub const Instruction = packed union {
                 bsl: Bsl,
                 bit: Bit,
                 bif: Bif,
+                ushl: Ushl,
+                sub: Sub,
             };
             pub fn decode(inst: @This()) @This().Decoded {
                 return switch (inst.group.U) {
                     .signed => switch (inst.group.opcode) {
                         else => .unallocated,
+                        0b01000 => .{ .sshl = inst.sshl },
+                        0b10000 => .{ .add = inst.add },
                         0b10111 => .{ .addp = inst.addp },
                         0b00011 => switch (inst.group.size) {
                             .byte => .{ .@"and" = inst.@"and" },
@@ -9969,6 +10040,8 @@ pub const Instruction = packed union {
                     },
                     .unsigned => switch (inst.group.opcode) {
                         else => .unallocated,
+                        0b01000 => .{ .ushl = inst.ushl },
+                        0b10000 => .{ .sub = inst.sub },
                         0b00011 => switch (inst.group.size) {
                             .byte => .{ .eor = inst.eor },
                             .half => .{ .bsl = inst.bsl },
@@ -9977,6 +10050,105 @@ pub const Instruction = packed union {
                         },
                     },
                 };
+            }
+        };
+
+        /// Advanced SIMD shift by immediate
+        pub const SimdShiftByImmediate = packed union {
+            group: @This().Group,
+            sshr: Sshr,
+            shl: Shl,
+            ushr: Ushr,
+
+            pub const Group = packed struct {
+                Rd: Register.Encoded,
+                Rn: Register.Encoded,
+                decoded10: u1 = 0b1,
+                opcode: u5,
+                immb: u3,
+                immh: u4,
+                decoded23: u6 = 0b011110,
+                U: std.lang.Signedness,
+                Q: Q,
+                decoded31: u1 = 0b0,
+            };
+
+            /// SSHR
+            pub const Sshr = packed struct {
+                Rd: Register.Encoded,
+                Rn: Register.Encoded,
+                decoded10: u1 = 0b1,
+                opcode: u5 = 0b00000,
+                immb: u3,
+                immh: u4,
+                decoded23: u6 = 0b011110,
+                U: std.lang.Signedness = .signed,
+                Q: Q,
+                decoded31: u1 = 0b0,
+            };
+
+            /// SHL
+            pub const Shl = packed struct {
+                Rd: Register.Encoded,
+                Rn: Register.Encoded,
+                decoded10: u1 = 0b1,
+                opcode: u5 = 0b01010,
+                immb: u3,
+                immh: u4,
+                decoded23: u6 = 0b011110,
+                U: std.lang.Signedness = .signed,
+                Q: Q,
+                decoded31: u1 = 0b0,
+            };
+
+            /// USHR
+            pub const Ushr = packed struct {
+                Rd: Register.Encoded,
+                Rn: Register.Encoded,
+                decoded10: u1 = 0b1,
+                opcode: u5 = 0b00000,
+                immb: u3,
+                immh: u4,
+                decoded23: u6 = 0b011110,
+                U: std.lang.Signedness = .unsigned,
+                Q: Q,
+                decoded31: u1 = 0b0,
+            };
+
+            pub const Decoded = union(enum) {
+                unallocated,
+                sshr: Sshr,
+                shl: Shl,
+                ushr: Ushr,
+            };
+            pub fn decode(inst: @This()) @This().Decoded {
+                return switch (inst.group.U) {
+                    .signed => switch (inst.group.opcode) {
+                        else => .unallocated,
+                        0b00000 => .{ .sshr = inst.sshr },
+                        0b01010 => .{ .shl = inst.shl },
+                    },
+                    .unsigned => switch (inst.group.opcode) {
+                        else => .unallocated,
+                        0b00000 => .{ .ushr = inst.ushr },
+                    },
+                };
+            }
+
+            /// The element size and the `immh:immb` field of a shift of `arrangement` by `shift`.
+            pub fn encodeShift(arrangement: Register.Arrangement, direction: enum { left, right }, shift: u7) struct { u4, u3 } {
+                const esize = @as(u8, 8) << @backingInt(arrangement.elemSize());
+                const imm: u8 = switch (direction) {
+                    .left => imm: {
+                        assert(shift < esize);
+                        break :imm esize + shift;
+                    },
+                    .right => imm: {
+                        assert(shift >= 1 and shift <= esize);
+                        break :imm 2 * esize - shift;
+                    },
+                };
+                return .{ @intCast(imm >> 3), @truncate(imm) };
             }
         };
 
@@ -11312,6 +11484,7 @@ pub const Instruction = packed union {
             simd_two_register_miscellaneous: SimdTwoRegisterMiscellaneous,
             simd_across_lanes: SimdAcrossLanes,
             simd_three_same: SimdThreeSame,
+            simd_shift_by_immediate: SimdShiftByImmediate,
             simd_modified_immediate: SimdModifiedImmediate,
             convert_float_fixed: ConvertFloatFixed,
             convert_float_integer: ConvertFloatInteger,
@@ -11358,6 +11531,8 @@ pub const Instruction = packed union {
                     .{ .simd_three_same = inst.simd_three_same }
                 else if (inst.group.op1 == 0b10 and inst.group.op2 == 0b0000 and inst.group.op3 & 0b000000001 == 0b000000001)
                     .{ .simd_modified_immediate = inst.simd_modified_immediate }
+                else if (inst.group.op1 == 0b10 and inst.group.op2 != 0b0000 and inst.group.op3 & 0b000000001 == 0b000000001)
+                    .{ .simd_shift_by_immediate = inst.simd_shift_by_immediate }
                 else
                     .unallocated,
                 0b0001, 0b0011, 0b1001, 0b1011 => switch (@as(u1, @truncate(inst.group.op1 >> 1))) {
@@ -11486,6 +11661,7 @@ pub const Instruction = packed union {
     /// C6.2.3 ADD (extended register)
     /// C6.2.4 ADD (immediate)
     /// C6.2.5 ADD (shifted register)
+    /// C7.2.2 ADD (vector)
     pub fn add(d: Register, n: Register, form: union(enum) {
         extended_register_explicit: struct {
             register: Register,
@@ -11499,6 +11675,20 @@ pub const Instruction = packed union {
         shifted_register_explicit: struct { register: Register, shift: DataProcessingRegister.Shift.Op, amount: u6 },
         shifted_register: struct { register: Register, shift: DataProcessingRegister.Shift = .none },
     }) Instruction {
+        if (d.format == .vector) {
+            const arrangement = d.format.vector;
+            const m = form.register;
+            assert(arrangement != .@"1d" and n.format.vector == arrangement and m.format.vector == arrangement);
+            return .{ .data_processing_vector = .{ .simd_three_same = .{
+                .add = .{
+                    .Rd = d.alias.encode(.{ .V = true }),
+                    .Rn = n.alias.encode(.{ .V = true }),
+                    .Rm = m.alias.encode(.{ .V = true }),
+                    .size = arrangement.elemSize(),
+                    .Q = arrangement.size(),
+                },
+            } } };
+        }
         const sf = d.format.general;
         assert(n.format.general == sf);
         form: switch (form) {
@@ -15784,6 +15974,21 @@ pub const Instruction = packed union {
             .sevl = .{},
         } } };
     }
+    /// SHL
+    pub fn shl(d: Register, n: Register, shift: u7) Instruction {
+        const arrangement = d.format.vector;
+        assert(arrangement != .@"1d" and n.format.vector == arrangement);
+        const immh, const immb = DataProcessingVector.SimdShiftByImmediate.encodeShift(arrangement, .left, shift);
+        return .{ .data_processing_vector = .{ .simd_shift_by_immediate = .{
+            .shl = .{
+                .Rd = d.alias.encode(.{ .V = true }),
+                .Rn = n.alias.encode(.{ .V = true }),
+                .immb = immb,
+                .immh = immh,
+                .Q = arrangement.size(),
+            },
+        } } };
+    }
     /// C6.2.282 SMADDL
     pub fn smaddl(d: Register, n: Register, m: Register, a: Register) Instruction {
         assert(d.format.general == .doubleword and n.format.general == .word and m.format.general == .word and a.format.general == .doubleword);
@@ -15911,6 +16116,35 @@ pub const Instruction = packed union {
                 .Rd = d.alias.encode(.{ .V = true }),
                 .Rn = n.alias.encode(.{ .V = true }),
                 .size = arrangement.elemSize(),
+                .Q = arrangement.size(),
+            },
+        } } };
+    }
+    /// SSHL
+    pub fn sshl(d: Register, n: Register, m: Register) Instruction {
+        const arrangement = d.format.vector;
+        assert(arrangement != .@"1d" and n.format.vector == arrangement and m.format.vector == arrangement);
+        return .{ .data_processing_vector = .{ .simd_three_same = .{
+            .sshl = .{
+                .Rd = d.alias.encode(.{ .V = true }),
+                .Rn = n.alias.encode(.{ .V = true }),
+                .Rm = m.alias.encode(.{ .V = true }),
+                .size = arrangement.elemSize(),
+                .Q = arrangement.size(),
+            },
+        } } };
+    }
+    /// SSHR
+    pub fn sshr(d: Register, n: Register, shift: u7) Instruction {
+        const arrangement = d.format.vector;
+        assert(arrangement != .@"1d" and n.format.vector == arrangement);
+        const immh, const immb = DataProcessingVector.SimdShiftByImmediate.encodeShift(arrangement, .right, shift);
+        return .{ .data_processing_vector = .{ .simd_shift_by_immediate = .{
+            .sshr = .{
+                .Rd = d.alias.encode(.{ .V = true }),
+                .Rn = n.alias.encode(.{ .V = true }),
+                .immb = immb,
+                .immh = immh,
                 .Q = arrangement.size(),
             },
         } } };
@@ -16232,6 +16466,7 @@ pub const Instruction = packed union {
     /// C6.2.356 SUB (extended register)
     /// C6.2.357 SUB (immediate)
     /// C6.2.358 SUB (shifted register)
+    /// SUB (vector)
     pub fn sub(d: Register, n: Register, form: union(enum) {
         extended_register_explicit: struct {
             register: Register,
@@ -16245,6 +16480,20 @@ pub const Instruction = packed union {
         shifted_register_explicit: struct { register: Register, shift: DataProcessingRegister.Shift.Op, amount: u6 },
         shifted_register: struct { register: Register, shift: DataProcessingRegister.Shift = .none },
     }) Instruction {
+        if (d.format == .vector) {
+            const arrangement = d.format.vector;
+            const m = form.register;
+            assert(arrangement != .@"1d" and n.format.vector == arrangement and m.format.vector == arrangement);
+            return .{ .data_processing_vector = .{ .simd_three_same = .{
+                .sub = .{
+                    .Rd = d.alias.encode(.{ .V = true }),
+                    .Rn = n.alias.encode(.{ .V = true }),
+                    .Rm = m.alias.encode(.{ .V = true }),
+                    .size = arrangement.elemSize(),
+                    .Q = arrangement.size(),
+                },
+            } } };
+        }
         const sf = d.format.general;
         assert(n.format.general == sf);
         form: switch (form) {
@@ -16671,6 +16920,35 @@ pub const Instruction = packed union {
                 .Rd = d.alias.encode(.{}),
                 .Rn = n.alias.encode(.{}),
                 .Rm = m.alias.encode(.{}),
+            },
+        } } };
+    }
+    /// USHL
+    pub fn ushl(d: Register, n: Register, m: Register) Instruction {
+        const arrangement = d.format.vector;
+        assert(arrangement != .@"1d" and n.format.vector == arrangement and m.format.vector == arrangement);
+        return .{ .data_processing_vector = .{ .simd_three_same = .{
+            .ushl = .{
+                .Rd = d.alias.encode(.{ .V = true }),
+                .Rn = n.alias.encode(.{ .V = true }),
+                .Rm = m.alias.encode(.{ .V = true }),
+                .size = arrangement.elemSize(),
+                .Q = arrangement.size(),
+            },
+        } } };
+    }
+    /// USHR
+    pub fn ushr(d: Register, n: Register, shift: u7) Instruction {
+        const arrangement = d.format.vector;
+        assert(arrangement != .@"1d" and n.format.vector == arrangement);
+        const immh, const immb = DataProcessingVector.SimdShiftByImmediate.encodeShift(arrangement, .right, shift);
+        return .{ .data_processing_vector = .{ .simd_shift_by_immediate = .{
+            .ushr = .{
+                .Rd = d.alias.encode(.{ .V = true }),
+                .Rn = n.alias.encode(.{ .V = true }),
+                .immb = immb,
+                .immh = immh,
+                .Q = arrangement.size(),
             },
         } } };
     }

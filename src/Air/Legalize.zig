@@ -245,6 +245,14 @@ pub const Feature = enum {
     /// * `.legalize_compiler_rt_call`
     soft_big_int,
 
+    /// Exempt SIMD integer vectors, vectors of at least two 8, 16, 32 or 64 bit integers that
+    /// are 64 or 128 bits in total (one SIMD register), from `scalarize_add`, `scalarize_add_wrap`,
+    /// `scalarize_sub`, `scalarize_sub_wrap` and `scalarize_not`, and from `scalarize_shl`,
+    /// `scalarize_shl_exact`, `scalarize_shr` and `scalarize_shr_exact` when the shift amount is
+    /// a splat, which is then replaced by its scalar as `unsplat_shift_rhs` does. The backend
+    /// lowers these operations on the whole vector.
+    keep_simd_int_vectors,
+
     fn scalarize(tag: Air.Inst.Tag) Feature {
         return switch (tag) {
             else => unreachable,
@@ -496,7 +504,10 @@ fn legalizeBody(l: *Legalize, body_start: usize, body_len: usize) Error!void {
                         try l.softBigIntOpBlockPayload(inst, softBigIntFunc(air_tag), bin_op.lhs, bin_op.rhs),
                     ),
                 }
-                if (l.features.has(comptime .scalarize(air_tag)) and ty.isVector(zcu)) {
+                if (l.features.has(comptime .scalarize(air_tag)) and ty.isVector(zcu) and !switch (air_tag) {
+                    else => false,
+                    .add_wrap, .sub_wrap => l.keepSimdIntVector(ty),
+                }) {
                     continue :inst l.replaceInst(inst, .block, try l.scalarizeBlockPayload(inst, .bin_op));
                 }
             },
@@ -573,7 +584,9 @@ fn legalizeBody(l: *Legalize, body_start: usize, body_len: usize) Error!void {
                     });
                 }
                 if (l.features.hasAny(&.{ .unsplat_shift_rhs, .scalarize(air_tag) }) and l.typeOf(bin_op.rhs).isVector(zcu)) {
-                    if (l.features.has(.unsplat_shift_rhs)) {
+                    if (l.features.has(.unsplat_shift_rhs) or
+                        (air_tag != .shl_sat and l.keepSimdIntVector(l.typeOf(bin_op.lhs))))
+                    {
                         if (bin_op.rhs.toInterned()) |rhs_ip_index| switch (ip.indexToKey(rhs_ip_index)) {
                             else => {},
                             .aggregate => |aggregate| switch (aggregate.storage) {
@@ -622,7 +635,10 @@ fn legalizeBody(l: *Legalize, body_start: usize, body_len: usize) Error!void {
                         );
                     },
                 }
-                if (l.features.has(comptime .scalarize(air_tag)) and ty_op.ty.isVector(zcu)) {
+                if (l.features.has(comptime .scalarize(air_tag)) and ty_op.ty.isVector(zcu) and !switch (air_tag) {
+                    else => false,
+                    .not => l.keepSimdIntVector(ty_op.ty),
+                }) {
                     continue :inst l.replaceInst(inst, .block, try l.scalarizeBlockPayload(inst, .ty_op));
                 }
             },
@@ -4083,12 +4099,34 @@ inline fn wantScalarizeOrSoftFloat(
         else => .{ false, ty },
     };
 
-    if (is_vec and l.features.has(.scalarize(air_tag))) return .scalarize;
+    if (is_vec and l.features.has(.scalarize(air_tag)) and !switch (air_tag) {
+        else => false,
+        .add, .sub => l.keepSimdIntVector(ty),
+    }) return .scalarize;
 
     if (l.wantSoftFloatScalar(scalar_ty)) {
         return if (is_vec) .scalarize else .soft_float;
     }
     return .none;
+}
+
+/// Whether `keep_simd_int_vectors` exempts an operation on vectors of type `ty` from
+/// scalarization.
+fn keepSimdIntVector(l: *const Legalize, ty: Type) bool {
+    if (!l.features.has(.keep_simd_int_vectors)) return false;
+    const zcu = l.pt.zcu;
+    if (!ty.isVector(zcu)) return false;
+    const elem_ty = ty.childType(zcu);
+    if (!elem_ty.isInt(zcu)) return false;
+    const elem_bits = elem_ty.intInfo(zcu).bits;
+    const len = ty.vectorLen(zcu);
+    return switch (elem_bits) {
+        8, 16, 32, 64 => len >= 2 and switch (len * elem_bits) {
+            64, 128 => true,
+            else => false,
+        },
+        else => false,
+    };
 }
 
 /// Whether `soft_big_int` expands an operation on operands of type `ty`, for an operation that

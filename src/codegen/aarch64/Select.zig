@@ -1745,11 +1745,25 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
             if (air.next()) |next_air_tag| continue :air_tag next_air_tag;
         },
         .not => |air_tag| {
-            if (isel.live_values.fetchRemove(air.inst_index)) |res_vi| {
+            if (isel.live_values.fetchRemove(air.inst_index)) |res_vi| unused: {
                 defer res_vi.value.deref(isel);
 
                 const ty_op = air.data(air.inst_index).ty_op;
                 const ty = ty_op.ty;
+                if (ty.isVector(zcu)) {
+                    const arrangement = isel.simdIntArrangement(ty) orelse
+                        return isel.fail("bad {t} {f}", .{ air_tag, isel.fmtType(ty) });
+                    const bytes: Register.Arrangement = switch (arrangement.size()) {
+                        .double => .@"8b",
+                        .quad => .@"16b",
+                    };
+                    const res_def = try isel.defVector(res_vi.value) orelse break :unused;
+                    defer res_def.finish(isel);
+                    const src_mat = try (try isel.use(ty_op.operand)).matReg(isel);
+                    try isel.emit(.not(res_def.ra.vector(bytes), src_mat.ra.vector(bytes)));
+                    try src_mat.finish(isel);
+                    break :unused;
+                }
                 const int_info: std.lang.Type.Int = int_info: {
                     if (ty_op.ty.ip_index == .bool_type) break :int_info .{ .signedness = .unsigned, .bits = 1 };
                     if (!ty.isAbiInt(zcu)) return isel.fail("bad {t} {f}", .{ air_tag, isel.fmtType(ty) });
@@ -4280,6 +4294,18 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
                 const vector_ty = ty_op.ty;
                 const elem_ty = vector_ty.childType(zcu);
                 if (elem_ty.bitSize(zcu) == 0) break :unused;
+                if (isel.simdIntArrangement(vector_ty)) |arrangement| {
+                    const vector_def = try isel.defVector(vector_vi.value) orelse break :unused;
+                    defer vector_def.finish(isel);
+                    const vector_ra = vector_def.ra;
+                    const elem_mat = try (try isel.use(ty_op.operand)).matReg(isel);
+                    try isel.emit(.dup(vector_ra.vector(arrangement), switch (arrangement.elemSize()) {
+                        .byte, .half, .single => elem_mat.ra.w(),
+                        .double => elem_mat.ra.x(),
+                    }));
+                    try elem_mat.finish(isel);
+                    break :unused;
+                }
                 try vector_vi.value.defAddr(isel, vector_ty, .{}) orelse break :unused;
                 const ptr_ra = try isel.allocIntReg();
                 defer if (isel.live_registers.get(ptr_ra) == .allocating) isel.freeReg(ptr_ra);
@@ -5563,6 +5589,26 @@ fn selectAddSub(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag) !voi
 
         const bin_op = isel.air.instructions.items(.data)[@backingInt(inst)].bin_op;
         const ty = isel.air.typeOf(bin_op.lhs, ip);
+        if (ty.isVector(zcu)) {
+            const arrangement = isel.simdIntArrangement(ty) orelse
+                return isel.fail("bad {t} {f}", .{ air_tag, isel.fmtType(ty) });
+            const res_def = try isel.defVector(res_vi) orelse break :unused;
+            defer res_def.finish(isel);
+            const res_ra = res_def.ra;
+            const lhs_mat = try (try isel.use(bin_op.lhs)).matReg(isel);
+            const rhs_mat = try (try isel.use(bin_op.rhs)).matReg(isel);
+            const res_reg = res_ra.vector(arrangement);
+            const lhs_reg = lhs_mat.ra.vector(arrangement);
+            const rhs_reg = rhs_mat.ra.vector(arrangement);
+            try isel.emit(switch (air_tag) {
+                else => unreachable,
+                .add, .add_wrap => .add(res_reg, lhs_reg, .{ .register = rhs_reg }),
+                .sub, .sub_wrap => .sub(res_reg, lhs_reg, .{ .register = rhs_reg }),
+            });
+            try rhs_mat.finish(isel);
+            try lhs_mat.finish(isel);
+            break :unused;
+        }
         if (!ty.isRuntimeFloat()) try res_vi.addOrSubtract(isel, ty, try isel.use(bin_op.lhs), switch (air_tag) {
             else => unreachable,
             .add, .add_safe, .add_wrap => .add,
@@ -7037,7 +7083,8 @@ fn selectBitwise(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag, bef
     }
 }
 
-/// Shifts of integers of at most 128 bits.
+/// Shifts of integers of at most 128 bits, and of SIMD integer vectors by a
+/// scalar (`Legalize.Feature.keep_simd_int_vectors`).
 fn selectShift(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag) !void {
     const zcu = isel.pt.zcu;
     const ip = &zcu.intern_pool;
@@ -7046,6 +7093,73 @@ fn selectShift(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag) !void
 
         const bin_op = isel.air.instructions.items(.data)[@backingInt(inst)].bin_op;
         const ty = isel.air.typeOf(bin_op.lhs, ip);
+        if (ty.isVector(zcu)) {
+            const arrangement = isel.simdIntArrangement(ty) orelse
+                return isel.fail("bad {t} {f}", .{ air_tag, isel.fmtType(ty) });
+            if (isel.air.typeOf(bin_op.rhs, ip).isVector(zcu))
+                return isel.fail("bad {t} {f} by a vector", .{ air_tag, isel.fmtType(ty) });
+            const signedness = ty.childType(zcu).intInfo(zcu).signedness;
+            const res_def = try isel.defVector(res_vi.value) orelse break :unused;
+            defer res_def.finish(isel);
+            const res_reg = res_def.ra.vector(arrangement);
+            const lhs_mat = try (try isel.use(bin_op.lhs)).matReg(isel);
+            const lhs_reg = lhs_mat.ra.vector(arrangement);
+            const rhs_vi = try isel.use(bin_op.rhs);
+            if (isel.constantImmediate(rhs_vi)) |amount| {
+                // The amount is less than the element size by its type.
+                try isel.emit(switch (air_tag) {
+                    else => unreachable,
+                    .shl, .shl_exact => .shl(res_reg, lhs_reg, @intCast(amount)),
+                    .shr, .shr_exact => if (amount == 0) .shl(res_reg, lhs_reg, 0) else switch (signedness) {
+                        .signed => .sshr(res_reg, lhs_reg, @intCast(amount)),
+                        .unsigned => .ushr(res_reg, lhs_reg, @intCast(amount)),
+                    },
+                });
+            } else {
+                // A register shift by a negative amount shifts right.
+                const amount_mat = try rhs_vi.matReg(isel);
+                const amount_ra = try isel.allocVecReg();
+                defer isel.freeReg(amount_ra);
+                const amount_reg = amount_ra.vector(arrangement);
+                try isel.emit(switch (signedness) {
+                    .signed => .sshl(res_reg, lhs_reg, amount_reg),
+                    .unsigned => .ushl(res_reg, lhs_reg, amount_reg),
+                });
+                switch (air_tag) {
+                    else => unreachable,
+                    .shl, .shl_exact => {},
+                    .shr, .shr_exact => try isel.emit(.neg(amount_reg, amount_reg)),
+                }
+                // Only the low byte of each lane counts: clear the bits
+                // above the amount's type.
+                const mask_ra = try isel.allocIntReg();
+                defer isel.freeReg(mask_ra);
+                const elem_bits = ty.childType(zcu).intInfo(zcu).bits;
+                const amount_bits: u6 = std.math.log2_int(u16, elem_bits);
+                switch (elem_bits) {
+                    else => unreachable,
+                    8, 16, 32 => {
+                        try isel.emit(.dup(amount_reg, mask_ra.w()));
+                        try isel.emit(.@"and"(mask_ra.w(), amount_mat.ra.w(), .{ .immediate = .{
+                            .N = .word,
+                            .immr = 0,
+                            .imms = amount_bits - 1,
+                        } }));
+                    },
+                    64 => {
+                        try isel.emit(.dup(amount_reg, mask_ra.x()));
+                        try isel.emit(.@"and"(mask_ra.x(), amount_mat.ra.x(), .{ .immediate = .{
+                            .N = .doubleword,
+                            .immr = 0,
+                            .imms = amount_bits - 1,
+                        } }));
+                    },
+                }
+                try amount_mat.finish(isel);
+            }
+            try lhs_mat.finish(isel);
+            break :unused;
+        }
         if (!ty.isAbiInt(zcu)) return isel.fail("bad {t} {f}", .{ air_tag, isel.fmtType(ty) });
         const int_info = ty.intInfo(zcu);
         switch (int_info.bits) {
@@ -10806,6 +10920,30 @@ fn vectorBitwise(
         else => unreachable, // Sema only permits bitwise operations on integers and bools.
     }
     if (ty.bitSize(isel.pt.zcu) == 0) return;
+    // A vector of 8 or 16 bytes lives in one vector register.
+    switch (ty.abiSize(isel.pt.zcu)) {
+        else => {},
+        8, 16 => |size| {
+            const arrangement: Register.Arrangement = if (size == 8) .@"8b" else .@"16b";
+            const dst_def = try isel.defVector(dst_vi) orelse return;
+            defer dst_def.finish(isel);
+            const dst_ra = dst_def.ra;
+            const lhs_mat = try (try isel.use(lhs_ref)).matReg(isel);
+            const rhs_mat = try (try isel.use(rhs_ref)).matReg(isel);
+            const dst_reg = dst_ra.vector(arrangement);
+            const lhs_reg = lhs_mat.ra.vector(arrangement);
+            const rhs_reg = rhs_mat.ra.vector(arrangement);
+            try isel.emit(switch (air_tag) {
+                .bit_and => .@"and"(dst_reg, lhs_reg, .{ .register = rhs_reg }),
+                .bit_or => .orr(dst_reg, lhs_reg, .{ .register = rhs_reg }),
+                .xor => .eor(dst_reg, lhs_reg, .{ .register = rhs_reg }),
+                else => unreachable,
+            });
+            try rhs_mat.finish(isel);
+            try lhs_mat.finish(isel);
+            return;
+        },
+    }
     _ = try dst_vi.defAddr(isel, ty, .{});
     var scratch: [6]Register.Alias = undefined;
     var allocated: usize = 0;
@@ -10848,6 +10986,52 @@ fn vectorBitwise(
     try rhs_vi.address(isel, 0, rhs);
     isel.freeReg(lhs);
     try lhs_vi.address(isel, 0, lhs);
+}
+
+/// The register that defines a vector of 8 or 16 bytes, which lives in one
+/// vector register.
+const VectorDef = struct {
+    ra: Register.Alias,
+    /// `ra` is a temporary that the parts of the vector are defined from.
+    temporary: bool,
+
+    /// Call after emitting the instructions that compute `ra`.
+    fn finish(def: VectorDef, isel: *Select) void {
+        if (def.temporary) isel.freeReg(def.ra);
+    }
+};
+
+/// Defines `vi`, a vector of 8 or 16 bytes, from the register returned, which
+/// the caller computes the vector into, or returns null when it is unused.
+/// When uses have split the vector into parts, such as the lanes of an array
+/// it is cast to, the parts are extracted from a temporary register.
+fn defVector(isel: *Select, vi: Value.Index) !?VectorDef {
+    if (vi.parts(isel).only() != null) return .{ .ra = try vi.defReg(isel) orelse return null, .temporary = false };
+    const ra = try isel.allocVecReg();
+    try vi.defLiveIn(isel, ra, comptime &.initFill(.free));
+    return .{ .ra = ra, .temporary = true };
+}
+
+/// The arrangement of a SIMD integer vector (`Legalize.Feature.keep_simd_int_vectors`),
+/// which lives in one vector register, or null for any other vector type.
+fn simdIntArrangement(isel: *Select, ty: ZigType) ?Register.Arrangement {
+    const zcu = isel.pt.zcu;
+    const elem_ty = ty.childType(zcu);
+    if (!elem_ty.isInt(zcu)) return null;
+    const len = ty.vectorLen(zcu);
+    const elem_size: codegen.aarch64.encoding.Instruction.DataProcessingVector.Size = switch (elem_ty.intInfo(zcu).bits) {
+        else => return null,
+        8 => .byte,
+        16 => .half,
+        32 => .single,
+        64 => .double,
+    };
+    if (len < 2) return null;
+    return switch (len * elem_ty.intInfo(zcu).bits) {
+        else => null,
+        64 => .wrap(.{ .size = .double, .elem_size = elem_size }),
+        128 => .wrap(.{ .size = .quad, .elem_size = elem_size }),
+    };
 }
 
 /// Picks the first alternative of a comma-separated inline asm constraint that

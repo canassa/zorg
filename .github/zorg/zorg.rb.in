@@ -1,0 +1,63 @@
+# Rendered by .github/workflows/release.yml in canassa/zorg; do not edit in the tap.
+class Zorg < Formula
+  desc "Zig compiler fork with a self-hosted AArch64 backend"
+  homepage "https://github.com/canassa/zorg"
+  version "@VERSION@"
+  license "MIT"
+
+  on_macos do
+    depends_on arch: :arm64
+
+    url "https://github.com/canassa/zorg/releases/download/@TAG@/zorg-aarch64-macos-@VERSION@.tar.xz"
+    sha256 "@SHA_AARCH64_MACOS@"
+  end
+  on_linux do
+    on_arm do
+      url "https://github.com/canassa/zorg/releases/download/@TAG@/zorg-aarch64-linux-@VERSION@.tar.xz"
+      sha256 "@SHA_AARCH64_LINUX@"
+    end
+    on_intel do
+      url "https://github.com/canassa/zorg/releases/download/@TAG@/zorg-x86_64-linux-@VERSION@.tar.xz"
+      sha256 "@SHA_X86_64_LINUX@"
+    end
+  end
+
+  livecheck do
+    url :stable
+    strategy :github_latest
+  end
+
+  # Keep the bundled std, libc and headers exactly as shipped.
+  skip_clean "libexec"
+
+  def install
+    # Flat tarball: zorg, lib/, LICENSE, README.md. zorg resolves the symlink
+    # to libexec/zorg and finds libexec/lib.
+    libexec.install Dir["*"]
+    bin.install_symlink libexec/"zorg"
+  end
+
+  test do
+    ENV["ZORG_GLOBAL_CACHE_DIR"] = (testpath/"cache").to_s
+    assert_equal version.to_s.sub("-zorg.", "+zorg."), shell_output("#{bin}/zorg version").strip
+    assert_match "#{libexec}/lib", shell_output("#{bin}/zorg env")
+
+    (testpath/"hello.zig").write <<~ZIG
+      const std = @import("std");
+      pub fn main(init: std.process.Init) !void {
+          try std.Io.File.stdout().writeStreamingAll(init.io, "Hello, world!");
+      }
+    ZIG
+    system bin/"zorg", "build-exe", "hello.zig", "-fllvm"
+    assert_equal "Hello, world!", shell_output("./hello")
+    if Hardware::CPU.arm?
+      system bin/"zorg", "build-exe", "hello.zig", "-fno-llvm", "--name", "hello-self"
+      assert_equal "Hello, world!", shell_output("./hello-self")
+    end
+
+    ENV.delete "CPATH"
+    (testpath/"hello.c").write "#include <stdio.h>\nint main(void) { fputs(\"hi\", stdout); return 0; }\n"
+    system bin/"zorg", "cc", "hello.c", "-o", "hello-c"
+    assert_equal "hi", shell_output("./hello-c")
+  end
+end

@@ -1,0 +1,242 @@
+name: release
+
+# Builds zorg release tarballs, smoke-tests them natively and publishes a
+# GitHub Release. A tag v<base>-zorg.<n> publishes a release; the nightly
+# schedule and manual runs publish a rolling "nightly" pre-release.
+
+on:
+  push:
+    tags: ['v*-zorg.*']
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ZIG_BOOT_VERSION: 0.17.0
+  # Upstream's 0.17 CI toolchain bundles (LLVM, LLD and Clang 22, static).
+  # ziglang.org publishes no checksums for them; these were pinned on 2026-10-11.
+  DEPS_VERSION: 0.17.0-dev.203+073889523
+
+jobs:
+  meta:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tagver: ${{ steps.v.outputs.tagver }}
+      nightly: ${{ steps.v.outputs.nightly }}
+      skip: ${{ steps.v.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # the nightly version comes from git describe
+      - id: v
+        run: |
+          base=$(sed -nE 's/^const zig_version: std\.SemanticVersion = \.\{ \.major = ([0-9]+), \.minor = ([0-9]+), \.patch = ([0-9]+) \};/\1.\2.\3/p' build.zig)
+          [[ "$base" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::cannot read zig_version from build.zig"; exit 1; }
+          skip=false
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag=${GITHUB_REF#refs/tags/}
+            tagver=${tag#v}
+            [[ "$tagver" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-zorg\.([0-9]+)$ ]] || { echo "::error::bad tag $tag, want v<x.y.z>-zorg.<n>"; exit 1; }
+            [[ "${BASH_REMATCH[1]}" == "$base" ]] || { echo "::error::tag base ${BASH_REMATCH[1]} != build.zig $base"; exit 1; }
+            version="${BASH_REMATCH[1]}+zorg.${BASH_REMATCH[2]}"
+            nightly=false
+          else
+            d=$(git describe --match '*.*.*' --exclude '*zorg*' --tags --abbrev=9) # 0.17.0-66-g5421ee674
+            IFS=- read -r _ height commit <<<"$d"
+            version="$base-dev.$height+zorg.${commit#g}"
+            tagver=nightly
+            nightly=true
+            # Do not rebuild a nightly for a commit that already has one.
+            if [[ "$GITHUB_EVENT_NAME" == schedule && "$(git rev-parse -q --verify 'refs/tags/nightly^{commit}' || true)" == "$GITHUB_SHA" ]]; then
+              skip=true
+            fi
+          fi
+          echo "version=$version tagver=$tagver nightly=$nightly skip=$skip"
+          { echo "version=$version"; echo "tagver=$tagver"; echo "nightly=$nightly"; echo "skip=$skip"; } >>"$GITHUB_OUTPUT"
+
+  build:
+    needs: meta
+    if: needs.meta.outputs.skip != 'true'
+    # Every target is cross-compiled here: building the compiler needs up to
+    # 8 GB (build.zig max_rss), more than the hosted macOS runners have.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: aarch64-macos-none, arch: aarch64, os: macos, deps_sha256: 96190b42c11b9f4d7ee49d34280fbc34070692646d526e408a9f75296c2128a6 }
+          - { target: x86_64-linux-musl, arch: x86_64, os: linux, deps_sha256: a88f904d5a7d60348bcd1189792ccb201ca80c49fd2497c3215381413fe330af }
+          - { target: aarch64-linux-musl, arch: aarch64, os: linux, deps_sha256: 012f9b49d830c567038a6af9e3fa184e53739077a3be20e4a12434b621ea9e90 }
+    env:
+      NAME: zorg-${{ matrix.arch }}-${{ matrix.os }}-${{ needs.meta.outputs.tagver }}
+      BOOT_NAME: zig-x86_64-linux-0.17.0
+      BOOT_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+      DEPS_NAME: zig+llvm+lld+clang-${{ matrix.target }}-0.17.0-dev.203+073889523
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v4
+        with:
+          path: ~/deps
+          key: deps-${{ env.DEPS_NAME }}-${{ env.BOOT_NAME }}
+      - name: fetch toolchain
+        run: |
+          mkdir -p ~/deps && cd ~/deps
+          if [ ! -d "$BOOT_NAME" ]; then
+            curl -fsSLO "https://ziglang.org/download/$ZIG_BOOT_VERSION/$BOOT_NAME.tar.xz"
+            echo "$BOOT_SHA256  $BOOT_NAME.tar.xz" | sha256sum -c
+            tar xf "$BOOT_NAME.tar.xz" && rm "$BOOT_NAME.tar.xz"
+          fi
+          if [ ! -d "$DEPS_NAME" ]; then
+            curl -fsSLO "https://ziglang.org/deps/$DEPS_NAME.tar.xz"
+            echo "${{ matrix.deps_sha256 }}  $DEPS_NAME.tar.xz" | sha256sum -c
+            tar xf "$DEPS_NAME.tar.xz" && rm "$DEPS_NAME.tar.xz"
+          fi
+      - name: build
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          # The bootstrap compiler is upstream zig and reads ZIG_*; the build
+          # runner is compiled from zorg's std and reads ZORG_*.
+          export ZIG_LIB_DIR="$PWD/lib" ZIG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/zgc" ZORG_GLOBAL_CACHE_DIR="$RUNNER_TEMP/zgc"
+          ~/deps/"$BOOT_NAME"/zig build \
+            --prefix "out/$NAME" --search-prefix ~/deps/"$DEPS_NAME" \
+            -Dflat -Dstatic-llvm -Dno-langref -Doptimize=ReleaseFast -Dstrip \
+            -Dtarget=${{ matrix.target }} -Dcpu=baseline \
+            -Dversion-string="$VERSION"
+          test -x "out/$NAME/zorg"
+          test -f "out/$NAME/lib/std/std.zig"
+          file "out/$NAME/zorg"
+      - name: package
+        run: |
+          cd out
+          tar -cJf "$NAME.tar.xz" --owner=0 --group=0 --sort=name "$NAME"
+          sha256sum "$NAME.tar.xz" >"$NAME.tar.xz.sha256"
+          ls -l "$NAME.tar.xz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: out/${{ env.NAME }}.tar.xz*
+          retention-days: 7
+
+  smoke:
+    needs: [meta, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15, arch: aarch64, os: macos, zig_sha256: b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a }
+          - { runner: ubuntu-24.04, arch: x86_64, os: linux, zig_sha256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64, os: linux, zig_sha256: 9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      NAME: zorg-${{ matrix.arch }}-${{ matrix.os }}-${{ needs.meta.outputs.tagver }}
+      ZIG_NAME: zig-${{ matrix.arch }}-${{ matrix.os }}-0.17.0
+    steps:
+      - uses: actions/checkout@v5 # test/behavior.zig and smoke.sh from the same commit
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: dist
+      - name: install upstream zig alongside
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://ziglang.org/download/$ZIG_BOOT_VERSION/$ZIG_NAME.tar.xz"
+          echo "${{ matrix.zig_sha256 }}  $ZIG_NAME.tar.xz" | shasum -a 256 -c
+          tar xf "$ZIG_NAME.tar.xz"
+          echo "$RUNNER_TEMP/$ZIG_NAME" >>"$GITHUB_PATH"
+      - name: verify and unpack
+        run: |
+          cd dist && shasum -a 256 -c "$NAME.tar.xz.sha256"
+          tar xf "$NAME.tar.xz" -C "$RUNNER_TEMP"
+      - name: smoke test
+        run: .github/zorg/smoke.sh "$RUNNER_TEMP/$NAME/zorg" '${{ needs.meta.outputs.version }}'
+
+  release:
+    needs: [meta, build, smoke]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && cat ./*.sha256 >SHA256SUMS && rm ./*.sha256 && cat SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.xz
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          if [ '${{ needs.meta.outputs.nightly }}' = true ]; then
+            gh release delete nightly --cleanup-tag -y || true
+            gh release create nightly dist/* --prerelease --target "$GITHUB_SHA" \
+              --title "nightly $VERSION" \
+              --notes "Rolling build of master at $GITHUB_SHA ($VERSION)."
+          else
+            gh release create "${GITHUB_REF#refs/tags/}" dist/* --verify-tag \
+              --title "zorg $VERSION" --generate-notes
+          fi
+
+  homebrew:
+    needs: [meta, release]
+    if: needs.meta.outputs.nightly == 'false'
+    runs-on: ubuntu-24.04
+    env:
+      HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+    steps:
+      - if: env.HAS_TAP_TOKEN != 'true'
+        run: echo "::warning::HOMEBREW_TAP_TOKEN is not set; the tap was not updated"
+      - if: env.HAS_TAP_TOKEN == 'true'
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/zorg
+      - if: env.HAS_TAP_TOKEN == 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: canassa/homebrew-zorg
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }} # fine-grained PAT: canassa/homebrew-zorg, Contents: read and write
+          path: tap
+      - if: env.HAS_TAP_TOKEN == 'true'
+        name: render and push the formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAGVER: ${{ needs.meta.outputs.tagver }}
+        run: |
+          tag=${GITHUB_REF#refs/tags/}
+          gh release download "$tag" -R "$GITHUB_REPOSITORY" -p SHA256SUMS
+          sha() {
+            local s
+            s=$(awk -v f="zorg-$1-$TAGVER.tar.xz" '$2 == f { print $1 }' SHA256SUMS)
+            [[ "$s" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::no checksum for $1" >&2; exit 1; }
+            echo "$s"
+          }
+          aarch64_macos=$(sha aarch64-macos)
+          aarch64_linux=$(sha aarch64-linux)
+          x86_64_linux=$(sha x86_64-linux)
+          sed -e "s/@VERSION@/$TAGVER/g" -e "s/@TAG@/$tag/g" \
+              -e "s/@SHA_AARCH64_MACOS@/$aarch64_macos/" \
+              -e "s/@SHA_AARCH64_LINUX@/$aarch64_linux/" \
+              -e "s/@SHA_X86_64_LINUX@/$x86_64_linux/" \
+              .github/zorg/zorg.rb.in >tap/Formula/zorg.rb
+          cd tap
+          git config user.name zorg-bot
+          git config user.email zorg-bot@users.noreply.github.com
+          git add Formula/zorg.rb
+          git commit -m "zorg $TAGVER"
+          git push

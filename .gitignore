@@ -16,3 +16,6 @@ zig-out/
 /build/
 /build-*/
 /docgen_tmp/
+
+# Per-machine agent notes (see CLAUDE.md)
+/CLAUDE.local.md

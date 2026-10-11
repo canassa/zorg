@@ -5,11 +5,18 @@ class Zorg < Formula
   version "@VERSION@"
   license "MIT"
 
+  livecheck do
+    url :stable
+    strategy :github_latest
+  end
+
   on_macos do
     depends_on arch: :arm64
 
-    url "https://github.com/canassa/zorg/releases/download/@TAG@/zorg-aarch64-macos-@VERSION@.tar.xz"
-    sha256 "@SHA_AARCH64_MACOS@"
+    on_arm do
+      url "https://github.com/canassa/zorg/releases/download/@TAG@/zorg-aarch64-macos-@VERSION@.tar.xz"
+      sha256 "@SHA_AARCH64_MACOS@"
+    end
   end
   on_linux do
     on_arm do
@@ -20,11 +27,6 @@ class Zorg < Formula
       url "https://github.com/canassa/zorg/releases/download/@TAG@/zorg-x86_64-linux-@VERSION@.tar.xz"
       sha256 "@SHA_X86_64_LINUX@"
     end
-  end
-
-  livecheck do
-    url :stable
-    strategy :github_latest
   end
 
   # Keep the bundled std, libc and headers exactly as shipped.

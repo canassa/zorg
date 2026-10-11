@@ -200,21 +200,21 @@ jobs:
     if: needs.meta.outputs.nightly == 'false'
     runs-on: ubuntu-24.04
     env:
-      HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+      HAS_TAP_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY != '' }}
     steps:
-      - if: env.HAS_TAP_TOKEN != 'true'
-        run: echo "::warning::HOMEBREW_TAP_TOKEN is not set; the tap was not updated"
-      - if: env.HAS_TAP_TOKEN == 'true'
+      - if: env.HAS_TAP_KEY != 'true'
+        run: echo "::warning::HOMEBREW_TAP_DEPLOY_KEY is not set; the tap was not updated"
+      - if: env.HAS_TAP_KEY == 'true'
         uses: actions/checkout@v5
         with:
           sparse-checkout: .github/zorg
-      - if: env.HAS_TAP_TOKEN == 'true'
+      - if: env.HAS_TAP_KEY == 'true'
         uses: actions/checkout@v5
         with:
           repository: canassa/homebrew-zorg
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }} # fine-grained PAT: canassa/homebrew-zorg, Contents: read and write
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }} # write deploy key of canassa/homebrew-zorg
           path: tap
-      - if: env.HAS_TAP_TOKEN == 'true'
+      - if: env.HAS_TAP_KEY == 'true'
         name: render and push the formula
         env:
           GH_TOKEN: ${{ github.token }}
@@ -242,3 +242,4 @@ jobs:
           git add Formula/zorg.rb
           git commit -m "zorg $TAGVER"
           git push
+

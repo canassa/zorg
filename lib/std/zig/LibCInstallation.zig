@@ -678,7 +678,7 @@ fn fillInstallations(
     return installs[0..installs_len];
 }
 
-const inf_loop_env_key = "ZIG_IS_DETECTING_LIBC_PATHS";
+const inf_loop_env_key = std.zig.EnvVar.ZIG_IS_DETECTING_LIBC_PATHS.name();
 
 fn appendCcExe(
     args: *std.array_list.Managed([]const u8),

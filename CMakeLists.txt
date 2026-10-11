@@ -47,7 +47,7 @@ if("${ZIG_VERSION}" STREQUAL "")
     find_program(GIT_EXE NAMES git NAMES_PER_DIR)
     if(GIT_EXE AND EXISTS "${PROJECT_SOURCE_DIR}/.git")
         execute_process(
-            COMMAND ${GIT_EXE} -C "${PROJECT_SOURCE_DIR}" describe --match *.*.* --tags --abbrev=9
+            COMMAND ${GIT_EXE} -C "${PROJECT_SOURCE_DIR}" describe --match *.*.* --exclude *zorg* --tags --abbrev=9
             RESULT_VARIABLE EXIT_STATUS
             OUTPUT_VARIABLE GIT_DESCRIBE
             OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -70,11 +70,16 @@ if("${ZIG_VERSION}" STREQUAL "")
                 if(NOT RESOLVED_ZIG_VERSION VERSION_GREATER GIT_TAG)
                     message(SEND_ERROR "Zig version (${RESOLVED_ZIG_VERSION}) must be greater than tagged ancestor (${GIT_TAG}).")
                 endif()
-                set(RESOLVED_ZIG_VERSION "${RESOLVED_ZIG_VERSION}-dev.${GIT_COMMITS_AFTER_TAG}+${GIT_COMMIT}")
+                set(RESOLVED_ZIG_VERSION "${RESOLVED_ZIG_VERSION}-dev.${GIT_COMMITS_AFTER_TAG}+zorg.${GIT_COMMIT}")
             else()
                 message(WARNING "Failed to parse version from output of `git describe`.")
             endif()
         endif()
+    endif()
+    # Every zorg build carries "+zorg" build metadata, so it never reports a
+    # version (and so never shares cache entries) with an upstream zig.
+    if(NOT RESOLVED_ZIG_VERSION MATCHES "\\+")
+        set(RESOLVED_ZIG_VERSION "${RESOLVED_ZIG_VERSION}+zorg")
     endif()
 else()
     set(RESOLVED_ZIG_VERSION "${ZIG_VERSION}")
@@ -791,13 +796,13 @@ endif()
 
 
 add_custom_target(stage3 ALL
-  DEPENDS "${PROJECT_BINARY_DIR}/stage3/bin/zig"
+  DEPENDS "${PROJECT_BINARY_DIR}/stage3/bin/zorg"
 )
 
 set(ZIG2_WORKING_DIR "${PROJECT_SOURCE_DIR}")
 
 add_custom_command(
-  OUTPUT "${PROJECT_BINARY_DIR}/stage3/bin/zig"
+  OUTPUT "${PROJECT_BINARY_DIR}/stage3/bin/zorg"
   COMMAND zig2 build ${ZIG_BUILD_ARGS} --prefix "${PROJECT_BINARY_DIR}/stage3"
   COMMENT "Building stage3"
   WORKING_DIRECTORY "${ZIG2_WORKING_DIR}"

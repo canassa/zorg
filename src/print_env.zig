@@ -33,7 +33,7 @@ pub fn cmdEnv(
     try root.field("target", triple, .{});
     var env = try root.beginStructField("env", .{});
     inline for (@typeInfo(EnvVar).@"enum".field_names) |field_name| {
-        try env.field(field_name, @field(EnvVar, field_name).get(environ_map), .{});
+        try env.field(@field(EnvVar, field_name).name(), @field(EnvVar, field_name).get(environ_map), .{});
     }
     try env.end();
     try root.end();

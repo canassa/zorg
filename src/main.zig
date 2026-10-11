@@ -72,7 +72,7 @@ var stdin_buffer: [4096]u8 align(std.heap.page_size_min) = undefined;
 var stdout_buffer: [4096]u8 align(std.heap.page_size_min) = undefined;
 
 const normal_usage =
-    \\Usage: zig [command] [options]
+    \\Usage: zorg [command] [options]
     \\
     \\Commands:
     \\
@@ -302,7 +302,7 @@ fn mainArgs(
                     "compiler is `zig cc`, so no libc installation was found.",
             });
         }
-        try environ_map.put(@tagName(inf_loop_env_key), "1");
+        try environ_map.put(inf_loop_env_key.name(), "1");
 
         // Some programs such as CMake will strip the `cc` and subsequent args from the
         // CC environment variable. We detect and support this scenario here because of

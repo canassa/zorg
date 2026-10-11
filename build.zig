@@ -159,7 +159,7 @@ pub fn build(b: *std.Build) !void {
         b.installDirectory(.{
             .source_dir = b.path("lib"),
             .install_dir = if (flat) .prefix else .lib,
-            .install_subdir = if (flat) "lib" else "zig",
+            .install_subdir = if (flat) "lib" else "zorg",
             .exclude_extensions = &[_][]const u8{
                 // exclude files from lib/std/compress/flate/testdata
                 ".expect",
@@ -293,6 +293,9 @@ pub fn build(b: *std.Build) !void {
         }
 
         const version_string = b.fmt("{d}.{d}.{d}", .{ zig_version.major, zig_version.minor, zig_version.patch });
+        // Every zorg build carries "+zorg" build metadata, so it never reports a
+        // version (and so never shares cache entries) with an upstream zig.
+        const zorg_version_string = b.fmt("{s}+zorg", .{version_string});
 
         var code: u8 = undefined;
         const git_describe_untrimmed = b.runAllowFail(&[_][]const u8{
@@ -300,9 +303,10 @@ pub fn build(b: *std.Build) !void {
             "-C", b.fmt("{f}", .{b.root}), // affects the --git-dir argument
             "--git-dir", ".git", // affected by the -C argument
             "describe", "--match",    "*.*.*", //
+            "--exclude", "*zorg*", // zorg release tags are not upstream versions
             "--tags",   "--abbrev=9",
         }, &code, .ignore) catch {
-            break :v version_string;
+            break :v zorg_version_string;
         };
         const git_describe = mem.trim(u8, git_describe_untrimmed, " \n\r");
 
@@ -314,7 +318,7 @@ pub fn build(b: *std.Build) !void {
                         version_string, git_describe,
                     });
                 }
-                break :v version_string;
+                break :v zorg_version_string;
             },
             2 => {
                 // Untagged development build (e.g. 0.10.0-dev.2025+ecf0050a9).
@@ -333,15 +337,15 @@ pub fn build(b: *std.Build) !void {
                 // Check that the commit hash is prefixed with a 'g' (a Git convention).
                 if (commit_id.len < 1 or commit_id[0] != 'g') {
                     std.log.warn("unexpected \"git describe\" output: {s}", .{git_describe});
-                    break :v version_string;
+                    break :v zorg_version_string;
                 }
 
                 // The version is reformatted in accordance with the https://semver.org specification.
-                break :v b.fmt("{s}-dev.{s}+{s}", .{ version_string, commit_height, commit_id[1..] });
+                break :v b.fmt("{s}-dev.{s}+zorg.{s}", .{ version_string, commit_height, commit_id[1..] });
             },
             else => {
                 std.log.warn("unexpected \"git describe\" output: {s}", .{git_describe});
-                break :v version_string;
+                break :v zorg_version_string;
             },
         }
     };
@@ -908,7 +912,7 @@ fn addCompilerMod(b: *std.Build, options: AddCompilerModOptions) *std.Build.Modu
 
 fn addCompilerStep(b: *std.Build, options: AddCompilerModOptions) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
-        .name = "zig",
+        .name = "zorg",
         // This number should never be raised. If the value is exceeded, then
         // it is considered a bug in the Zig project that building the
         // compiler takes more than 8G of memory.

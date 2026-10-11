@@ -993,12 +993,23 @@ pub const EnvVar = enum {
     // Homebrew integration
     HOMEBREW_PREFIX,
 
+    /// zorg reads the user-facing `ZIG_*` variables as `ZORG_*`, so it never
+    /// picks up configuration meant for an upstream zig installed alongside it.
+    pub fn name(ev: EnvVar) []const u8 {
+        return switch (ev) {
+            inline else => |tag| comptime n: {
+                const s = @tagName(tag);
+                break :n if (std.mem.startsWith(u8, s, "ZIG_")) "ZORG_" ++ s["ZIG_".len..] else s;
+            },
+        };
+    }
+
     pub fn isSet(ev: EnvVar, map: *const std.process.Environ.Map) bool {
-        return map.contains(@tagName(ev));
+        return map.contains(ev.name());
     }
 
     pub fn get(ev: EnvVar, map: *const std.process.Environ.Map) ?[]const u8 {
-        return map.get(@tagName(ev));
+        return map.get(ev.name());
     }
 };
 
@@ -1627,7 +1638,7 @@ pub const Directories = struct {
                     if (thing == .@"global cache") switch (err) {
                         error.AccessDenied, error.ReadOnlyFileSystem => break :e "\n" ++
                             "If this location is not writable then consider specifying an alternative with " ++
-                            "the ZIG_GLOBAL_CACHE_DIR environment variable or the --global-cache-dir option.",
+                            "the ZORG_GLOBAL_CACHE_DIR environment variable or the --global-cache-dir option.",
                         else => {},
                     };
                     break :e "";
@@ -1683,8 +1694,9 @@ fn testZigInstallPrefix(io: Io, base_dir: Dir) ?Cache.Directory {
     const test_index_file = "std" ++ Dir.path.sep_str ++ "std.zig";
 
     zig_dir: {
-        // Try lib/zig/std/std.zig
-        const lib_zig = "lib" ++ Dir.path.sep_str ++ "zig";
+        // Try lib/zorg/std/std.zig. Never lib/zig: in a shared prefix such as
+        // /opt/homebrew that is upstream zig's standard library.
+        const lib_zig = "lib" ++ Dir.path.sep_str ++ "zorg";
         var test_zig_dir = base_dir.openDir(io, lib_zig, .{}) catch break :zig_dir;
         const file = test_zig_dir.openFile(io, test_index_file, .{}) catch {
             test_zig_dir.close(io);
@@ -1707,7 +1719,7 @@ fn testZigInstallPrefix(io: Io, base_dir: Dir) ?Cache.Directory {
 pub fn resolveGlobalCacheDir(arena: Allocator, environ_map: *const std.process.Environ.Map) ![]const u8 {
     if (EnvVar.ZIG_GLOBAL_CACHE_DIR.get(environ_map)) |value| return value;
 
-    const app_name = "zig";
+    const app_name = "zorg";
 
     switch (builtin.os.tag) {
         .wasi => @compileError("on WASI the global cache dir must be resolved with preopens"),
@@ -1730,6 +1742,48 @@ pub fn resolveGlobalCacheDir(arena: Allocator, environ_map: *const std.process.E
             return error.AppDataDirUnavailable;
         },
     }
+}
+
+test "zorg reads its user-facing environment variables as ZORG_*" {
+    try std.testing.expectEqualStrings("ZORG_LIB_DIR", EnvVar.ZIG_LIB_DIR.name());
+    try std.testing.expectEqualStrings("ZORG_GLOBAL_CACHE_DIR", EnvVar.ZIG_GLOBAL_CACHE_DIR.name());
+    try std.testing.expectEqualStrings("HOME", EnvVar.HOME.name());
+
+    var map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("ZIG_LIB_DIR", "/zig/lib");
+    try std.testing.expect(!EnvVar.ZIG_LIB_DIR.isSet(&map));
+    try std.testing.expect(EnvVar.ZIG_LIB_DIR.get(&map) == null);
+    try map.put("ZORG_LIB_DIR", "/zorg/lib");
+    try std.testing.expectEqualStrings("/zorg/lib", EnvVar.ZIG_LIB_DIR.get(&map).?);
+}
+
+test "zorg finds lib/zorg and ignores an upstream lib/zig in the same prefix" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "lib/zig/std");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/zig/std/std.zig", .data = "" });
+    try std.testing.expect(testZigInstallPrefix(io, tmp.dir) == null);
+
+    try tmp.dir.createDirPath(io, "lib/zorg/std");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/zorg/std/std.zig", .data = "" });
+    var found = testZigInstallPrefix(io, tmp.dir).?;
+    defer found.handle.close(io);
+    try std.testing.expectEqualStrings("lib" ++ Dir.path.sep_str ++ "zorg", found.path.?);
+}
+
+test "zorg keeps its global cache apart from upstream zig" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    var map: std.process.Environ.Map = .init(std.testing.allocator);
+    defer map.deinit();
+    try map.put("ZIG_GLOBAL_CACHE_DIR", "/zig-cache");
+    try map.put("XDG_CACHE_HOME", "/cache");
+    try std.testing.expectEqualStrings("/cache/zorg", try resolveGlobalCacheDir(arena_state.allocator(), &map));
 }
 
 /// Searches upwards from `cwd` for a directory containing a `build.zig` file.

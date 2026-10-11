@@ -7,6 +7,7 @@ class Zorg < Formula
 
   livecheck do
     url :stable
+    regex(/^v?(\d+(?:\.\d+)+-zorg\.\d+)$/i)
     strategy :github_latest
   end
 

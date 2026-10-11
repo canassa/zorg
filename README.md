@@ -20,6 +20,7 @@
 </p>
 
 <p align="center">
+  <a href="#install">Install</a> •
   <a href="#work-done-so-far">Work Done So Far</a> •
   <a href="#why">Why</a> •
   <a href="#contributing">Contributing</a> •
@@ -32,6 +33,37 @@ AArch64 backend.
 
 Zorg picks up Zig's experimental self-hosted AArch64 backend and takes it to the point where it
 can compile Zig itself.
+
+## Install
+
+Zorg installs as `zorg`, next to any `zig` you already have. It uses its own standard library
+(`lib/zorg`), its own cache (`~/.cache/zorg`) and its own environment variables (`ZORG_LIB_DIR`,
+`ZORG_GLOBAL_CACHE_DIR`, ...), so the two never step on each other.
+
+Prebuilt binaries are available for macOS on Apple silicon and Linux on x86_64 and aarch64.
+
+**Homebrew**
+
+```sh
+brew install canassa/zorg/zorg
+```
+
+**Nix**
+
+```sh
+nix run github:canassa/zorg -- version        # try it
+nix profile install github:canassa/zorg       # install it
+```
+
+The flake also has an overlay (`overlays.default`) and `zorg-src`, which builds from source.
+
+**Tarball**
+
+Download one from [Releases](https://github.com/canassa/zorg/releases), unpack it anywhere and
+put the directory on your `PATH`. The `nightly` release is rebuilt from `master` every day.
+
+Zorg is a drop-in compiler, so existing projects work as they are: `zorg build`, `zorg test`,
+`zorg run` and so on. `build.zig`, `build.zig.zon`, `.zig-cache` and `zig-out` keep their names.
 
 ## Work Done So Far
 

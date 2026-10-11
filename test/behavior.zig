@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 test {
     _ = @import("behavior/addrspace_and_linksection.zig");
     _ = @import("behavior/aggregate_copies.zig");
+    _ = @import("behavior/aggregate_layouts.zig");
     _ = @import("behavior/align.zig");
     _ = @import("behavior/alignof.zig");
     _ = @import("behavior/array.zig");

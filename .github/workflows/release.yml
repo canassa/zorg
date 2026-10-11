@@ -243,3 +243,42 @@ jobs:
           git commit -m "zorg $TAGVER"
           git push
 
+  nix:
+    needs: [meta, release]
+    if: needs.meta.outputs.nightly == 'false'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: master
+      - name: point nix/release.json at the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          TAGVER: ${{ needs.meta.outputs.tagver }}
+        run: |
+          tag=${GITHUB_REF#refs/tags/}
+          gh release download "$tag" -p SHA256SUMS
+          python3 - "$tag" <<'PY'
+          import base64, json, os, sys
+          tag = sys.argv[1]
+          tagver = os.environ["TAGVER"]
+          sums = {name: digest for digest, name in (line.split() for line in open("SHA256SUMS"))}
+          base = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{tag}"
+          release = {"version": os.environ["VERSION"], "tag": tag}
+          for system, asset in [("aarch64-darwin", "aarch64-macos"), ("x86_64-linux", "x86_64-linux"), ("aarch64-linux", "aarch64-linux")]:
+              name = f"zorg-{asset}-{tagver}.tar.xz"
+              digest = bytes.fromhex(sums[name])
+              release[system] = {"url": f"{base}/{name}", "hash": "sha256-" + base64.b64encode(digest).decode()}
+          with open("nix/release.json", "w") as f:
+              json.dump(release, f, indent=2)
+              f.write("\n")
+          PY
+          git diff --stat
+          git config user.name zorg-bot
+          git config user.email zorg-bot@users.noreply.github.com
+          git add nix/release.json
+          git commit -m "📦 point the nix flake at zorg $VERSION"
+          git push origin HEAD:master

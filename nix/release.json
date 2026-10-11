@@ -1,0 +1,16 @@
+{
+  "version": "0.17.1-dev.68+zorg.2fa468d72",
+  "tag": "nightly",
+  "aarch64-darwin": {
+    "url": "https://github.com/canassa/zorg/releases/download/nightly/zorg-aarch64-macos-nightly.tar.xz",
+    "hash": "sha256-h6NSoPcIwEbYAECiEz7VnCSdXTWxHKzmrVJ4wOZH9dU="
+  },
+  "x86_64-linux": {
+    "url": "https://github.com/canassa/zorg/releases/download/nightly/zorg-x86_64-linux-nightly.tar.xz",
+    "hash": "sha256-AoVXLGgmEeCThSXQOBbwKw2qoItsHKAo8IVo7SjqUFM="
+  },
+  "aarch64-linux": {
+    "url": "https://github.com/canassa/zorg/releases/download/nightly/zorg-aarch64-linux-nightly.tar.xz",
+    "hash": "sha256-+jAwrOF0YVqKFzPsU1Pm0yOvJuf/3l7tKux1L9l7p8E="
+  }
+}

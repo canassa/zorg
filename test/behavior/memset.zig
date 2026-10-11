@@ -280,3 +280,36 @@ test "@memset keeps the runtime slice length" {
     try S.check(u64, 0x123456789abcdef0);
     try S.check(S.Item, .{ .a = 0x123456789abcdef0, .b = 0x31415926, .c = 0x81 });
 }
+
+test "@memset of a slice of structs keeps every field the fill loop stores" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        const Three = extern struct { a: bool, b: bool, c: bool };
+        // A 3-byte field and, a word later, a 1-byte field: the fill loop
+        // stores them as separate parts.
+        const Elem = extern struct {
+            w0: u64,
+            w1: u64,
+            three: Three,
+            b: u8 align(8),
+            w2: u64,
+        };
+        noinline fn fill(slice: []Elem, x: u64, a: bool, c: bool) void {
+            @memset(slice, .{
+                .w0 = x +% 1,
+                .w1 = x +% 2,
+                .three = .{ .a = a, .b = false, .c = c },
+                .b = @truncate(x +% 3),
+                .w2 = x +% 4,
+            });
+        }
+    };
+    var storage: [3]S.Elem = undefined;
+    S.fill(&storage, 100, true, true);
+    for (storage) |e| {
+        try expect(e.w0 == 101 and e.w1 == 102 and e.w2 == 104);
+        try expect(e.three.a and !e.three.b and e.three.c);
+        try expect(e.b == 103);
+    }
+}

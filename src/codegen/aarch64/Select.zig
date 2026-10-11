@@ -8443,6 +8443,14 @@ fn selectMemset(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag) !voi
                     else => null,
                 };
                 const stride_ra = if (fill_mat == null) try isel.allocIntReg() else .zr;
+                // Any other size is copied each iteration from the fill
+                // value's memory, through registers taken for the whole loop.
+                // Storing the fill's parts from registers would keep them live
+                // across the back edge, where a scratch register of one
+                // part's store can clobber another part that was stored
+                // before it.
+                const src_ra = if (fill_mat == null) try isel.allocIntReg() else .zr;
+                const copy_ra = if (fill_mat == null) try isel.allocVecReg() else .zr;
                 const len_mat: Value.Materialize = len_mat: switch (dst_info.flags.size) {
                     .one => .{ .vi = undefined, .ra = try isel.allocIntReg() },
                     .many => unreachable,
@@ -8480,7 +8488,7 @@ fn selectMemset(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag) !voi
                     });
                 } else {
                     try isel.emit(.add(ptr_ra.x(), ptr_ra.x(), .{ .register = stride_ra.x() }));
-                    try fill_vi.store(isel, dst_ty.indexableElem(zcu), ptr_ra, .{});
+                    try isel.memsetCopyElem(dst_ty.indexableElem(zcu), size, ptr_ra, src_ra, copy_ra);
                 }
                 isel.instructions.items[skip_label] = .cbnz(
                     count_ra.x(),
@@ -8490,6 +8498,9 @@ fn selectMemset(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag) !voi
                 if (fill_mat == null) {
                     try isel.movImmediate(stride_ra.x(), size);
                     isel.freeReg(stride_ra);
+                    isel.freeReg(copy_ra);
+                    isel.freeReg(src_ra);
+                    try fill_vi.address(isel, 0, src_ra);
                 }
                 switch (dst_info.flags.size) {
                     .one => {
@@ -8553,6 +8564,49 @@ fn selectMemset(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag) !voi
         .c => unreachable,
     }
     try call.finishParams(isel);
+}
+
+/// One iteration of a `memset` fill loop: copies the `size` bytes of an
+/// element from `src_ra` to `ptr_ra` through `copy_ra`. Emitted backwards.
+fn memsetCopyElem(
+    isel: *Select,
+    elem_ty: ZigType,
+    size: u64,
+    ptr_ra: Register.Alias,
+    src_ra: Register.Alias,
+    copy_ra: Register.Alias,
+) !void {
+    const zcu = isel.pt.zcu;
+    // Unaligned accesses are wider where the target allows them.
+    const width: u64 = if (isel.target.cpu.has(.aarch64, .strict_align))
+        @min(16, elem_ty.abiAlignment(zcu).toByteUnits().?)
+    else
+        16;
+    const whole = size / width * width;
+    // The tail, smaller than `width`, from the largest power of two down.
+    var tail_buf: [4]struct { offset: u64, size: u64 } = undefined;
+    var tail_len: usize = 0;
+    var offset = whole;
+    var chunk = width / 2;
+    while (chunk > 0) : (chunk /= 2) if (size - offset >= chunk) {
+        tail_buf[tail_len] = .{ .offset = offset, .size = chunk };
+        tail_len += 1;
+        offset += chunk;
+    };
+    assert(offset == size);
+    var tail_index = tail_len;
+    while (tail_index > 0) {
+        tail_index -= 1;
+        const tail = tail_buf[tail_index];
+        try isel.storeReg(copy_ra, tail.size, ptr_ra, tail.offset);
+        try isel.loadReg(copy_ra, tail.size, .unsigned, src_ra, tail.offset);
+    }
+    offset = whole;
+    while (offset > 0) {
+        offset -= width;
+        try isel.storeReg(copy_ra, width, ptr_ra, offset);
+        try isel.loadReg(copy_ra, width, .unsigned, src_ra, offset);
+    }
 }
 
 /// `aggregate_init` of structs, tuples, arrays and vectors.

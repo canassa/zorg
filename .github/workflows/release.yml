@@ -63,6 +63,7 @@ jobs:
           { echo "version=$version"; echo "tagver=$tagver"; echo "nightly=$nightly"; echo "skip=$skip"; } >>"$GITHUB_OUTPUT"
 
   build:
+    name: build ${{ matrix.target }}
     needs: meta
     if: needs.meta.outputs.skip != 'true'
     # Every target is cross-compiled here: building the compiler needs up to
@@ -83,7 +84,7 @@ jobs:
       DEPS_NAME: zig+llvm+lld+clang-${{ matrix.target }}-0.17.0-dev.203+073889523
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ~/deps
           key: deps-${{ env.DEPS_NAME }}-${{ env.BOOT_NAME }}
@@ -121,13 +122,14 @@ jobs:
           tar -cJf "$NAME.tar.xz" --owner=0 --group=0 --sort=name "$NAME"
           sha256sum "$NAME.tar.xz" >"$NAME.tar.xz.sha256"
           ls -l "$NAME.tar.xz"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.NAME }}
           path: out/${{ env.NAME }}.tar.xz*
           retention-days: 7
 
   smoke:
+    name: smoke ${{ matrix.arch }}-${{ matrix.os }}
     needs: [meta, build]
     strategy:
       fail-fast: false
@@ -143,7 +145,7 @@ jobs:
       ZIG_NAME: zig-${{ matrix.arch }}-${{ matrix.os }}-0.17.0
     steps:
       - uses: actions/checkout@v5 # test/behavior.zig and smoke.sh from the same commit
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ env.NAME }}
           path: dist
@@ -169,12 +171,12 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
       - run: cd dist && cat ./*.sha256 >SHA256SUMS && rm ./*.sha256 && cat SHA256SUMS
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*.tar.xz
       - name: publish

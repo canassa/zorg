@@ -807,6 +807,10 @@ pub const Index = enum(u32) {
         /// The memory is the value's own stack slot: a loaded part is not
         /// stored back to it, and a part not live in a register is not loaded.
         in_place: bool = false,
+        /// `store` only: the value is stored this many times, `repeat_stride`
+        /// bytes apart, from one register per part.
+        repeat_count: u64 = 1,
+        repeat_stride: u64 = 0,
     };
 
     pub fn load(
@@ -899,7 +903,11 @@ pub const Index = enum(u32) {
                 break :only;
             }
             const part_mat = try part_vi.matReg(isel);
-            try isel.storeReg(part_mat.ra, part_size, base_ra, opts.offset);
+            var repeat = opts.repeat_count;
+            while (repeat > 0) {
+                repeat -= 1;
+                try isel.storeReg(part_mat.ra, part_size, base_ra, opts.offset + repeat * opts.repeat_stride);
+            }
             return part_mat.finish(isel);
         }
         while (part_it.next()) |part_vi| try part_vi.store(isel, root_ty, base_ra, .{
@@ -907,6 +915,8 @@ pub const Index = enum(u32) {
             .offset = opts.offset + part_vi.get(isel).offset_from_parent,
             .@"volatile" = opts.@"volatile",
             .split = opts.split,
+            .repeat_count = opts.repeat_count,
+            .repeat_stride = opts.repeat_stride,
             .wrap = switch (part_it.remaining) {
                 else => null,
                 0 => if (opts.wrap) |wrap| .{

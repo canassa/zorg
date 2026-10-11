@@ -40,7 +40,7 @@ const Lcg = struct {
 
 /// Hand-picked layouts, then generated ones.
 const layouts = layouts: {
-    @setEvalBranchQuota(100_000);
+    @setEvalBranchQuota(1_000_000);
     var list: []const type = &.{
         // A 3-byte field and, a word later, a 1-byte one.
         Layout(.@"extern", &.{ u64, u64, LayoutBools3, u8, u64 }, &.{ false, false, false, true, false }),
@@ -51,7 +51,7 @@ const layouts = layouts: {
         Layout(.@"extern", &.{ u8, u128, [3]u8 }, &.{ false, false, false }),
     };
     var lcg: Lcg = .{ .state = 0x5eed_1a40 };
-    for (0..28) |n| {
+    for (0..80) |n| {
         const is_extern = n % 2 == 0;
         const pool: []const type = if (is_extern) &extern_fields else &auto_fields;
         const len = 1 + lcg.next(8);
@@ -59,7 +59,7 @@ const layouts = layouts: {
         var gaps: [len]bool = undefined;
         for (&types, &gaps) |*t, *g| {
             t.* = pool[lcg.next(pool.len)];
-            g.* = is_extern and lcg.next(4) == 0;
+            g.* = lcg.next(3) == 0;
         }
         const final_types = types;
         const final_gaps = gaps;

@@ -158,3 +158,31 @@ test "vector @splat" {
     try S.doTheTest();
     try comptime S.doTheTest();
 }
+
+test "@splat array of a struct with odd-sized parts across a padding gap" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const S = struct {
+        const Elem = struct { opt: ?u8, head: [5]u8, gap: [5]u8 align(8), tail: [6]u8, word: u32 };
+        noinline fn splat(x: u8) [7]Elem {
+            return @splat(.{
+                .opt = x,
+                .head = .{ x, x +% 1, x +% 2, x +% 3, x +% 4 },
+                .gap = .{ x +% 5, x +% 6, x +% 7, x +% 8, x +% 9 },
+                .tail = .{ x +% 10, x +% 11, x +% 12, x +% 13, x +% 14, x +% 15 },
+                .word = @as(u32, x) * 3,
+            });
+        }
+    };
+    var x: u8 = 40;
+    _ = &x;
+    for (S.splat(x)) |e| {
+        try expect(e.opt.? == 40);
+        for (e.head, 40..) |byte, want| try expect(byte == want);
+        for (e.gap, 45..) |byte, want| try expect(byte == want);
+        for (e.tail, 50..) |byte, want| try expect(byte == want);
+        try expect(e.word == 120);
+    }
+}

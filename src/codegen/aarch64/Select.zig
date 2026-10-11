@@ -2759,9 +2759,24 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
                     },
                     .value, .constant, .stack_address => unreachable,
                     .address => |address_vi| {
-                        const ptr_mat = try address_vi.matReg(isel);
-                        try src_vi.store(isel, isel.air.typeOf(un_op, ip), ptr_mat.ra, .{});
-                        try ptr_mat.finish(isel);
+                        const src_ty = isel.air.typeOf(un_op, ip);
+                        const size = src_ty.abiSize(zcu);
+                        // As a store does: a larger value is copied, not
+                        // stored part by part, which would hold every part
+                        // in a register at once.
+                        if (size > Value.max_parts) {
+                            if (try isel.copyInline(.{ .ptr = address_vi }, .{ .value = .{ .vi = src_vi } }, size, false)) {} else {
+                                try call.prepareVoidGlobal(isel, "memcpy");
+                                try isel.movImmediate(.x2, size);
+                                try call.paramAddress(isel, src_vi, .r1);
+                                try call.paramLiveOut(isel, address_vi, .r0);
+                                try call.finishParams(isel);
+                            }
+                        } else {
+                            const ptr_mat = try address_vi.matReg(isel);
+                            try src_vi.store(isel, src_ty, ptr_mat.ra, .{});
+                            try ptr_mat.finish(isel);
+                        }
                     },
                 }
             }
@@ -4340,7 +4355,17 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index, block_pred: ?Air.In
                 try vector_vi.value.defAddr(isel, vector_ty, .{}) orelse break :unused;
                 const ptr_ra = try isel.allocIntReg();
                 defer if (isel.live_registers.get(ptr_ra) == .allocating) isel.freeReg(ptr_ra);
-                for (0..vector_ty.vectorLen(zcu)) |index| {
+                const elem_size = elem_ty.abiSize(zcu);
+                // (An array splat is an `aggregate_init` by now.)
+                if (isel.vectorLaneBits(elem_ty) == 8 * elem_size) {
+                    // Each part of the element is materialized once and
+                    // stored to every element: a store per element would keep
+                    // a copy of every part live per element.
+                    try (try isel.use(ty_op.operand)).store(isel, elem_ty, ptr_ra, .{
+                        .repeat_count = vector_ty.vectorLen(zcu),
+                        .repeat_stride = elem_size,
+                    });
+                } else for (0..vector_ty.vectorLen(zcu)) |index| {
                     try isel.vectorMemoryOffset(try isel.use(ty_op.operand), elem_ty, ptr_ra, index, false, true);
                 }
                 isel.freeReg(ptr_ra);
@@ -8633,11 +8658,34 @@ fn selectAggregateInit(isel: *Select, inst: Air.Inst.Index) !void {
                 isel.freeReg(ptr_ra);
                 try agg_vi.value.address(isel, 0, ptr_ra);
             },
-            .array_type => |array_type| {
+            .array_type => |array_type| array_init: {
                 const elems: []const Air.Inst.Ref =
                     @ptrCast(isel.air.extra.items[ty_pl.payload..][0..@intCast(array_type.len)]);
                 var elem_offset: u64 = 0;
-                const elem_size = ZigType.fromInterned(array_type.child).abiSize(zcu);
+                const elem_ty: ZigType = .fromInterned(array_type.child);
+                const elem_size = elem_ty.abiSize(zcu);
+                // A splat (`expand_array_splat`): each part of the element is
+                // materialized once and stored to every element. Moving it
+                // into each element would keep a copy of every part live per
+                // element, which runs out of registers.
+                if (elems.len > 1 and elem_size > 0 and std.mem.allEqual(Air.Inst.Ref, elems, elems[0])) {
+                    try agg_vi.value.defAddr(isel, agg_ty, .{}) orelse break :array_init;
+                    const ptr_ra = try isel.allocIntReg();
+                    defer if (isel.live_registers.get(ptr_ra) == .allocating) isel.freeReg(ptr_ra);
+                    switch (array_type.sentinel) {
+                        .none => {},
+                        else => |sentinel| try (try isel.use(.fromIntern(sentinel))).store(isel, elem_ty, ptr_ra, .{
+                            .offset = elems.len * elem_size,
+                        }),
+                    }
+                    try (try isel.use(elems[0])).store(isel, elem_ty, ptr_ra, .{
+                        .repeat_count = elems.len,
+                        .repeat_stride = elem_size,
+                    });
+                    isel.freeReg(ptr_ra);
+                    try agg_vi.value.address(isel, 0, ptr_ra);
+                    break :array_init;
+                }
                 for (elems) |elem| {
                     var agg_part_it = agg_vi.value.field(agg_ty, elem_offset, elem_size);
                     const agg_part_vi = try agg_part_it.only(isel);

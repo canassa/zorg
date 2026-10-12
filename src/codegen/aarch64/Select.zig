@@ -14951,6 +14951,13 @@ fn fillMemory(isel: *Select, dst_ra: Register.Alias) Error!bool {
     return true;
 }
 
+const merge_registers = blk: {
+    var registers: [31 + 32]Register.Alias = undefined;
+    for (0..31) |i| registers[i] = @fromBackingInt(@intCast(@backingInt(Register.Alias.r0) + i));
+    for (0..32) |i| registers[31 + i] = @fromBackingInt(@intCast(@backingInt(Register.Alias.v0) + i));
+    break :blk registers;
+};
+
 /// Merges possibly differing value tracking into a consistent state.
 ///
 /// At a conditional branch, if a value is expected in the same register on both
@@ -15050,11 +15057,13 @@ fn merge(
         if (vi != .free) vi.get(isel).location_payload.small.register = if (locked) .zr else ra;
         actual_vi.* = if (locked) .allocating else vi;
     }
-    var live_reg_it = isel.live_registers.iterator();
-    while (live_reg_it.next()) |live_reg_entry| {
-        const ra = live_reg_entry.key;
+    // The pinned pass also restores a value's recorded register when both
+    // states already agree, so it must run before this check.
+    if (!opts.fill_extra and std.mem.eql(Value.Index, &isel.live_registers.values, &expected_live_registers.values)) return;
+
+    for (merge_registers) |ra| {
         if (isel.promotion.pinned_value_regs.contains(ra)) continue;
-        const actual_vi = live_reg_entry.value;
+        const actual_vi = isel.live_registers.getPtr(ra);
         const expected_vi = expected_live_registers.get(ra);
         switch (expected_vi) {
             else => switch (actual_vi.*) {
@@ -15065,11 +15074,9 @@ fn merge(
             .free => {},
         }
     }
-    live_reg_it = isel.live_registers.iterator();
-    while (live_reg_it.next()) |live_reg_entry| {
-        const ra = live_reg_entry.key;
+    for (merge_registers) |ra| {
         if (isel.promotion.pinned_value_regs.contains(ra)) continue;
-        const actual_vi = live_reg_entry.value;
+        const actual_vi = isel.live_registers.getPtr(ra);
         const expected_vi = expected_live_registers.get(ra);
         switch (expected_vi) {
             _ => {
@@ -15090,11 +15097,9 @@ fn merge(
             .free => if (opts.fill_extra) assert(try isel.fillMemory(ra) and actual_vi.* == .free),
         }
     }
-    live_reg_it = isel.live_registers.iterator();
-    while (live_reg_it.next()) |live_reg_entry| {
-        const ra = live_reg_entry.key;
+    for (merge_registers) |ra| {
         if (isel.promotion.pinned_value_regs.contains(ra)) continue;
-        const actual_vi = live_reg_entry.value;
+        const actual_vi = isel.live_registers.getPtr(ra);
         const expected_vi = expected_live_registers.get(ra);
         switch (expected_vi) {
             _ => {

@@ -228,7 +228,8 @@ pub fn capacity(self: Atom, macho_file: *MachO) u64 {
     const next_addr = if (zo.getAtom(self.next_index)) |next|
         next.getAddress(macho_file)
     else
-        std.math.maxInt(u32);
+        // Above any address: on macOS every one is above the 4 GiB __PAGEZERO.
+        std.math.maxInt(u64);
     return next_addr - self.getAddress(macho_file);
 }
 

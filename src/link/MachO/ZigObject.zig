@@ -968,8 +968,9 @@ fn updateNavCode(
         } else if (code.len < old_size) {
             atom.shrink(macho_file);
         } else if (self.getAtom(atom.next_index) == null) {
-            const needed_size = atom.value + code.len;
-            sect.size = needed_size;
+            // The last atom grows in place: so does its section, and the segment around it.
+            macho_file.growSection(sect_index, atom.value + code.len) catch |err|
+                return macho_file.base.cgFail(nav_index, "failed to grow section: {s}", .{@errorName(err)});
         }
     } else {
         atom.allocate(macho_file) catch |err|

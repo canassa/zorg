@@ -1123,9 +1123,12 @@ const Entry = struct {
             const zo = macho_file.getZigObject().?;
             for (entry.external_relocs.items) |reloc| {
                 const ref = zo.getSymbolRef(@backingInt(reloc.target_sym), macho_file);
+                // A symbol nothing defines in this update (an export taken back, or in
+                // conflict) has no address: 0, as an ELF link makes of the relocation.
+                const target_addr = if (ref.getSymbol(macho_file)) |sym| sym.getAddress(.{}, macho_file) else 0;
                 try dwarf.resolveReloc(
                     entry_off + reloc.source_off,
-                    ref.getSymbol(macho_file).?.getAddress(.{}, macho_file) +% reloc.target_off,
+                    target_addr +% reloc.target_off,
                     @backingInt(dwarf.address_size),
                 );
             }

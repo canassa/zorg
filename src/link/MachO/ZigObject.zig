@@ -1225,6 +1225,26 @@ fn lowerConst(
     return @fromBackingInt(@intCast(sym_index));
 }
 
+/// Takes back the export `nlist_index` names, keeping its symbol as an undefined global of
+/// the same name: code that refers to it (through `getGlobalSymbol`) holds that index, and
+/// finds the definition again when it is exported again (`updateExports` exports everything
+/// anew on every update), or the definition another file has.
+fn unexport(self: *ZigObject, nlist_index: Symbol.Index) void {
+    const nlist = &self.symtab.items(.nlist)[nlist_index];
+    self.symtab.items(.size)[nlist_index] = 0;
+    self.symtab.items(.atom)[nlist_index] = 0;
+    nlist.* = .{
+        .n_strx = nlist.n_strx,
+        .n_type = .{ .bits = .{ .ext = true, .type = .undf, .pext = false, .is_stab = 0 } },
+        .n_sect = 0,
+        .n_desc = @bitCast(@as(u16, 0)),
+        .n_value = 0,
+    };
+    const sym = &self.symbols.items[nlist_index];
+    sym.atom_ref = .{ .index = 0, .file = 0 };
+    sym.flags.weak = false;
+}
+
 pub fn updateExports(
     self: *ZigObject,
     macho_file: *MachO,
@@ -1239,33 +1259,11 @@ pub fn updateExports(
 
     // Delete all existing exports first
     for (self.navs.values()) |*metadata| {
-        for (metadata.exports.items) |nlist_index| {
-            const nlist = &self.symtab.items(.nlist)[nlist_index];
-            self.symtab.items(.size)[nlist_index] = 0;
-            _ = self.globals_lookup.remove(nlist.n_strx);
-            // TODO actually remove the export
-            // const sym_index = macho_file.globals.get(nlist.n_strx).?;
-            // const sym = &self.symbols.items[sym_index];
-            // if (sym.file == self.index) {
-            //     sym.* = .{};
-            // }
-            nlist.* = MachO.null_sym;
-        }
+        for (metadata.exports.items) |nlist_index| self.unexport(nlist_index);
         metadata.exports.clearRetainingCapacity();
     }
     for (self.uavs.values()) |*metadata| {
-        for (metadata.exports.items) |nlist_index| {
-            const nlist = &self.symtab.items(.nlist)[nlist_index];
-            self.symtab.items(.size)[nlist_index] = 0;
-            _ = self.globals_lookup.remove(nlist.n_strx);
-            // TODO actually remove the export
-            // const sym_index = macho_file.globals.get(nlist.n_strx).?;
-            // const sym = &self.symbols.items[sym_index];
-            // if (sym.file == self.index) {
-            //     sym.* = .{};
-            // }
-            nlist.* = MachO.null_sym;
-        }
+        for (metadata.exports.items) |nlist_index| self.unexport(nlist_index);
         metadata.exports.clearRetainingCapacity();
     }
 

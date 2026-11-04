@@ -251,6 +251,14 @@ pub fn allocate(self: *Atom, macho_file: *MachO) !void {
     const last_atom_index = &macho_file.sections.items(.last_atom_index)[self.out_n_sect];
     const new_atom_ideal_capacity = MachO.padToIdeal(self.size);
 
+    // An atom allocated again (it grew, or a lazy symbol was made again) first leaves its
+    // place: the last atom would otherwise be placed after, and linked to, itself.
+    if (zo.getAtom(self.prev_index)) |prev| prev.next_index = self.next_index;
+    if (zo.getAtom(self.next_index)) |next| next.prev_index = self.prev_index;
+    if (last_atom_index.* == self.atom_index) last_atom_index.* = self.prev_index;
+    self.prev_index = 0;
+    self.next_index = 0;
+
     // We use these to indicate our intention to update metadata, placing the new atom,
     // and possibly removing a free list node.
     // It would be simpler to do it inside the for loop below, but that would cause a
@@ -338,16 +346,6 @@ pub fn allocate(self: *Atom, macho_file: *MachO) !void {
         // }
     }
     sect.@"align" = @max(sect.@"align", self.alignment.toLog2Units());
-
-    // This function can also reallocate an atom.
-    // In this case we need to "unplug" it from its previous location before
-    // plugging it in to its new location.
-    if (zo.getAtom(self.prev_index)) |prev| {
-        prev.next_index = self.next_index;
-    }
-    if (zo.getAtom(self.next_index)) |next| {
-        next.prev_index = self.prev_index;
-    }
 
     if (atom_placement) |big_atom_index| {
         const big_atom = zo.getAtom(big_atom_index).?;

@@ -1422,11 +1422,12 @@ pub fn getGlobalSymbol(self: *ZigObject, macho_file: *MachO, name: []const u8, l
 const max_trampoline_len = 12;
 
 fn trampolineSize(cpu_arch: std.Target.Cpu.Arch) u64 {
-    const len = switch (cpu_arch) {
+    const len: u64 = switch (cpu_arch) {
         .x86_64 => 5, // jmp rel32
+        .aarch64 => 4, // b imm26: no larger than the function whose slot it takes
         else => @panic("TODO implement trampoline size for this CPU arch"),
     };
-    comptime assert(len <= max_trampoline_len);
+    assert(len <= max_trampoline_len);
     return len;
 }
 
@@ -1439,6 +1440,7 @@ fn writeTrampoline(tr_sym: Symbol, target: Symbol, macho_file: *MachO) !void {
     var buf: [max_trampoline_len]u8 = undefined;
     const out = switch (macho_file.getTarget().cpu.arch) {
         .x86_64 => try x86_64.writeTrampolineCode(source_addr, target_addr, &buf),
+        .aarch64 => try aarch64.writeTrampolineCode(source_addr, target_addr, &buf),
         else => @panic("TODO implement write trampoline for this CPU arch"),
     };
     return macho_file.pwriteAll(out, fileoff);
@@ -1734,6 +1736,20 @@ const x86_64 = struct {
         mem.writeInt(i32, bytes[1..][0..4], @intCast(disp), .little);
         @memcpy(buf[0..bytes.len], &bytes);
         return buf[0..bytes.len];
+    }
+};
+
+const aarch64 = struct {
+    fn writeTrampolineCode(source_addr: u64, target_addr: u64, buf: *[max_trampoline_len]u8) ![]u8 {
+        dev.checkAny(&.{ .llvm_backend, .aarch64_backend });
+        const disp = @as(i64, @intCast(target_addr)) - @as(i64, @intCast(source_addr));
+        // `b` reaches 128 MiB either way: a Zig text section larger than that would need a
+        // longer trampoline than the slot of the smallest function holds.
+        const imm26 = std.math.cast(i26, @divExact(disp, 4)) orelse return error.TrampolineOutOfRange;
+        const insn: u32 = 0x14000000 | @as(u32, @as(u26, @bitCast(imm26)));
+        assert(4 == trampolineSize(.aarch64));
+        mem.writeInt(u32, buf[0..4], insn, .little);
+        return buf[0..4];
     }
 };
 

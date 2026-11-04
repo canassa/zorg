@@ -1798,6 +1798,10 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
             };
             if (have_zcu and (!need_llvm or use_llvm)) {
                 if (output_mode == .Obj) break :s .zcu;
+                // An incremental MachO link is updated in place, and its
+                // linkers cannot reload a static library on every update,
+                // so compiler_rt joins the ZCU.
+                if (options.config.incremental and target.ofmt == .macho) break :s .zcu;
             }
             if (need_llvm and !build_options.have_llvm) break :s .none; // impossible to build without llvm
             if (is_exe_or_dyn_lib) break :s .lib;

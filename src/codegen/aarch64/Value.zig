@@ -2160,6 +2160,68 @@ pub const Materialize = struct {
         try mat.finish(isel);
     }
 
+    /// Defines `mat.ra` as the span `offset..offset + size` of the value
+    /// in `src_ra` when either register is a vector register; `finish`'s
+    /// bitfield extract reads and writes general registers only.
+    fn extractPart(mat: Value.Materialize, isel: *Select, src_ra: Register.Alias, offset: u64, size: u64) Error!void {
+        const dst_ra = mat.ra;
+        if (src_ra.isVector()) {
+            if (offset % size != 0 or offset + size > 16)
+                return isel.fail("unsupported part at offset {d} of size {d} of a vector register", .{ offset, size });
+            return isel.emit(switch (size) {
+                else => unreachable,
+                1 => if (dst_ra.isVector())
+                    .dup(dst_ra.b(), src_ra.@"b[]"(@intCast(offset)))
+                else switch (mat.vi.signedness(isel)) {
+                    .unsigned => .umov(dst_ra.w(), src_ra.@"b[]"(@intCast(offset))),
+                    .signed => .smov(dst_ra.w(), src_ra.@"b[]"(@intCast(offset))),
+                },
+                2 => if (dst_ra.isVector())
+                    .dup(dst_ra.h(), src_ra.@"h[]"(@intCast(offset / 2)))
+                else switch (mat.vi.signedness(isel)) {
+                    .unsigned => .umov(dst_ra.w(), src_ra.@"h[]"(@intCast(offset / 2))),
+                    .signed => .smov(dst_ra.w(), src_ra.@"h[]"(@intCast(offset / 2))),
+                },
+                4 => if (dst_ra.isVector())
+                    .dup(dst_ra.s(), src_ra.@"s[]"(@intCast(offset / 4)))
+                else
+                    .umov(dst_ra.w(), src_ra.@"s[]"(@intCast(offset / 4))),
+                8 => if (dst_ra.isVector())
+                    .dup(dst_ra.d(), src_ra.@"d[]"(@intCast(offset / 8)))
+                else
+                    .umov(dst_ra.x(), src_ra.@"d[]"(@intCast(offset / 8))),
+            });
+        }
+        // A general register into a vector register: extract into a
+        // general register, then move it across.
+        assert(dst_ra.isVector() and offset + size <= 8);
+        const part_ra = try isel.allocIntReg();
+        defer isel.freeReg(part_ra);
+        try isel.emit(part_size: switch (size) {
+            else => unreachable,
+            1 => continue :part_size 4,
+            2 => if (isel.target.cpu.has(.aarch64, .fullfp16))
+                .fmov(dst_ra.h(), .{ .register = part_ra.w() })
+            else
+                continue :part_size 4,
+            4 => .fmov(dst_ra.s(), .{ .register = part_ra.w() }),
+            8 => .fmov(dst_ra.d(), .{ .register = part_ra.x() }),
+        });
+        try isel.emit(switch (offset + size) {
+            else => unreachable,
+            1...4 => |end_offset| .ubfm(part_ra.w(), src_ra.w(), .{
+                .N = .word,
+                .immr = @intCast(8 * offset),
+                .imms = @intCast(8 * end_offset - 1),
+            }),
+            5...8 => |end_offset| .ubfm(part_ra.x(), src_ra.x(), .{
+                .N = .doubleword,
+                .immr = @intCast(8 * offset),
+                .imms = @intCast(8 * end_offset - 1),
+            }),
+        });
+    }
+
     pub fn finish(mat: Value.Materialize, isel: *Select) Error!void {
         const live_vi = isel.live_registers.getPtr(mat.ra);
         assert(live_vi.* == .allocating);
@@ -2169,6 +2231,11 @@ pub const Materialize = struct {
         free: while (true) {
             if (vi.get(isel).flags.is_padding) break :free try mat.emitUndefined(isel, size);
             if (vi.register(isel)) |ra| {
+                // A part of a value held whole in a register of the other
+                // kind, or in a vector register: the float field of a
+                // struct still in its argument registers, say.
+                if (ra != mat.ra and vi != mat.vi and (mat.ra.isVector() or ra.isVector()))
+                    break :free try mat.extractPart(isel, ra, offset, size);
                 if (ra != mat.ra) break :free try isel.emit(if (vi == mat.vi) if (mat.ra.isVector()) switch (size) {
                     else => unreachable,
                     1 => if (ra.isVector())

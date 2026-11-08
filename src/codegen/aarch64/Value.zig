@@ -1102,6 +1102,34 @@ pub const Index = enum(u32) {
                         const part_mat = try part_vi.matReg(isel);
                         const part_int_ra = if (!ra.isVector() and part_mat.ra.isVector()) try isel.allocIntReg() else part_mat.ra;
                         defer if (part_int_ra != part_mat.ra) isel.freeReg(part_int_ra);
+                        if (ra.isVector() and part_offset % part_size != 0) {
+                            // A part that straddles lanes of its own size (an
+                            // 8-byte part at offset 4 of a 16-byte value): insert
+                            // it a lane at a time, in the widest lanes that both
+                            // its offset and its size are multiples of.
+                            assert(part_offset + part_size <= vi_size);
+                            const lane_log2: u2 = @intCast(@min(@ctz(part_offset), @ctz(part_size), 3));
+                            const lane = @as(u64, 1) << lane_log2;
+                            const src_ra = if (part_mat.ra.isVector()) part_mat.ra else try isel.allocVecReg();
+                            defer if (src_ra != part_mat.ra) isel.freeReg(src_ra);
+                            for (0..@intCast(part_size / lane)) |lane_index| {
+                                const dst_lane = part_offset / lane + lane_index;
+                                try isel.emit(switch (lane_log2) {
+                                    0 => .ins(ra.@"b[]"(@intCast(dst_lane)), src_ra.@"b[]"(@intCast(lane_index))),
+                                    1 => .ins(ra.@"h[]"(@intCast(dst_lane)), src_ra.@"h[]"(@intCast(lane_index))),
+                                    2 => .ins(ra.@"s[]"(@intCast(dst_lane)), src_ra.@"s[]"(@intCast(lane_index))),
+                                    3 => .ins(ra.@"d[]"(@intCast(dst_lane)), src_ra.@"d[]"(@intCast(lane_index))),
+                                });
+                            }
+                            // Emitted backwards: this runs before the inserts.
+                            if (src_ra != part_mat.ra) try isel.emit(switch (part_size) {
+                                else => unreachable,
+                                2, 4 => .fmov(src_ra.s(), .{ .register = part_mat.ra.w() }),
+                                8 => .fmov(src_ra.d(), .{ .register = part_mat.ra.x() }),
+                            });
+                            try part_mat.finish(isel);
+                            continue;
+                        }
                         try isel.emit(if (ra.isVector()) emit: {
                             assert(part_offset + part_size <= vi_size);
                             assert(part_offset % part_size == 0);

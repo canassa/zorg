@@ -979,6 +979,53 @@ test "float results passed in general registers as fields of a struct" {
     try expect(S.tuple(.{ a, @floatCast(c) }) == 4002);
 }
 
+test "read a float field of a struct argument that is also passed on" {
+    const S = struct {
+        const IntFloats = struct { a: u32, b: f32, c: f32 };
+        const IntFloat = struct { a: u32, b: f32 };
+        const IntDouble = struct { a: u64, b: f64 };
+        var seen_f32: f32 = 0;
+        var seen_f64: f64 = 0;
+        noinline fn sinkFloats(p: IntFloats) f32 {
+            return p.c;
+        }
+        noinline fn sinkFloat(p: IntFloat) u32 {
+            return p.a;
+        }
+        noinline fn sinkDouble(p: IntDouble) u64 {
+            return p.a;
+        }
+        // `p.b` sits in the upper half of the first argument register.
+        noinline fn floats(p: IntFloats) f32 {
+            seen_f32 = p.b;
+            return sinkFloats(p);
+        }
+        noinline fn float(p: IntFloat) u32 {
+            seen_f32 = p.b;
+            return sinkFloat(p);
+        }
+        // `p.b` is the whole second argument register.
+        noinline fn double(p: IntDouble) u64 {
+            seen_f64 = p.b;
+            return sinkDouble(p);
+        }
+        noinline fn sum(p: IntFloats) f32 {
+            return p.b + sinkFloats(p);
+        }
+    };
+    try expect(S.floats(.{ .a = 5, .b = 48, .c = 1.5 }) == 1.5);
+    try expect(S.seen_f32 == 48);
+    try expect(S.float(.{ .a = 5, .b = 7.5 }) == 5);
+    try expect(S.seen_f32 == 7.5);
+    try expect(S.double(.{ .a = 5, .b = 2.25 }) == 5);
+    try expect(S.seen_f64 == 2.25);
+    try expect(S.sum(.{ .a = 5, .b = 48, .c = 1.5 }) == 49.5);
+    var b: f32 = 3.5;
+    _ = &b;
+    try expect(S.floats(.{ .a = 6, .b = b, .c = b * 2 }) == 7);
+    try expect(S.seen_f32 == 3.5);
+}
+
 test "stack arguments staged while the argument registers hold arguments and every other register is live" {
     const S = struct {
         const Pair = struct { a: u64, b: u32 };

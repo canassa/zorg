@@ -2293,6 +2293,17 @@ pub const incremental_matrix: []const RunnerTarget = &.{
         .linker = .old,
         .pic = .nopic,
     },
+    // zorg: its own backend on its main host, where every update links libSystem again.
+    .{
+        .target = .{
+            .cpu_arch = .aarch64,
+            .os_tag = .macos,
+        },
+        .cache_mode = .incremental,
+        .backend = .selfhosted,
+        .linker = .old,
+        .pic = .pie,
+    },
 };
 
 pub const debugger_matrix: []const RunnerTarget = &.{

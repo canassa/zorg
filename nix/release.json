@@ -1,16 +1,16 @@
 {
-  "version": "0.17.1+zorg.1",
-  "tag": "v0.17.1-zorg.1",
+  "version": "0.17.1+zorg.3",
+  "tag": "v0.17.1-zorg.3",
   "aarch64-darwin": {
-    "url": "https://github.com/canassa/zorg/releases/download/v0.17.1-zorg.1/zorg-aarch64-macos-0.17.1-zorg.1.tar.xz",
-    "hash": "sha256-/i/B0hMieV2OljPsUVQNorXXjTm6ChCmPiX4zhc8I4Q="
+    "url": "https://github.com/canassa/zorg/releases/download/v0.17.1-zorg.3/zorg-aarch64-macos-0.17.1-zorg.3.tar.xz",
+    "hash": "sha256-/DQ2O2Ne0aHi43oyNk3/7zBKUsPGsE2HlkllAdrSLvc="
   },
   "x86_64-linux": {
-    "url": "https://github.com/canassa/zorg/releases/download/v0.17.1-zorg.1/zorg-x86_64-linux-0.17.1-zorg.1.tar.xz",
-    "hash": "sha256-Q7yLpHhjm4QN3dgyaKG2SRzyct/85ABqdhSCTFrB5fk="
+    "url": "https://github.com/canassa/zorg/releases/download/v0.17.1-zorg.3/zorg-x86_64-linux-0.17.1-zorg.3.tar.xz",
+    "hash": "sha256-lTq0ydkKngsOUxOOZO0Dsvv0Pu3cV2Ono7mlrcHm28U="
   },
   "aarch64-linux": {
-    "url": "https://github.com/canassa/zorg/releases/download/v0.17.1-zorg.1/zorg-aarch64-linux-0.17.1-zorg.1.tar.xz",
-    "hash": "sha256-JpHHN7lbgbzucZ7Ws/qOyCgzaDdAHnh5q0Bg1GiXFt4="
+    "url": "https://github.com/canassa/zorg/releases/download/v0.17.1-zorg.3/zorg-aarch64-linux-0.17.1-zorg.3.tar.xz",
+    "hash": "sha256-8wAjny9Ofx5RnGNG+1rcWi2T806McYhyjyDqPlAvooM="
   }
 }

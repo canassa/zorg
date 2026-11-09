@@ -810,17 +810,13 @@ pub fn eql(comptime T: type, a: []const T, b: []const T) bool {
     if (@typeInfo(T) != .float and a.ptr == b.ptr) return true;
 
     for (a, b) |a_elem, b_elem| {
-        if (!eqlElem(T, a_elem, b_elem)) return false;
+        // `!=` rejects arrays and structs; compare those field by field.
+        switch (@typeInfo(T)) {
+            .array, .@"struct" => if (!std.meta.eql(a_elem, b_elem)) return false,
+            else => if (a_elem != b_elem) return false,
+        }
     }
     return true;
-}
-
-/// `==` for the element types it accepts; arrays and structs compare field by field.
-fn eqlElem(comptime T: type, a: T, b: T) bool {
-    return switch (@typeInfo(T)) {
-        .array, .@"struct" => std.meta.eql(a, b),
-        else => a == b,
-    };
 }
 
 test eql {
@@ -937,7 +933,10 @@ pub fn findDiff(comptime T: type, a: []const T, b: []const T) ?usize {
         return if (a.len == b.len) null else shorter;
     }
     for (a[0..shorter], b[0..shorter], 0..) |a_elem, b_elem, i| {
-        if (!eqlElem(T, a_elem, b_elem)) return i;
+        switch (@typeInfo(T)) {
+            .array, .@"struct" => if (!std.meta.eql(a_elem, b_elem)) return i,
+            else => if (a_elem != b_elem) return i,
+        }
     }
     return if (a.len == b.len) null else shorter;
 }

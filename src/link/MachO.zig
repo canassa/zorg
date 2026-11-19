@@ -47,6 +47,9 @@ codesig_cmd: macho.linkedit_data_command = .{ .cmd = .CODE_SIGNATURE },
 /// The length the output file was last extended to by `extendFile`, which `flush` cuts back to
 /// the end of the last segment.
 extended_file_len: u64 = 0,
+/// Set by the first `flush`: each later one (an incremental update) first undoes what the
+/// last one built from the link inputs (`resetLinkState`).
+linked_once: bool = false,
 
 pagezero_seg_index: ?u8 = null,
 text_seg_index: ?u8 = null,
@@ -333,6 +336,131 @@ pub fn deinit(self: *MachO) void {
     self.thunks.deinit(gpa);
 }
 
+/// Undoes what `flush` built from the link inputs, so that the next `flush` of an
+/// incremental update links them again around the updated Zig object: the input files are
+/// parsed again (into the same indices, after the Zig object's), and the synthetic sections,
+/// the other sections' contents and the segments other than the Zig object's are made again.
+/// The Zig object, its sections and its segments keep their place in the file.
+fn resetLinkState(self: *MachO) void {
+    const gpa = self.base.comp.gpa;
+
+    // What the Zig object counted into the output symbol table.
+    if (self.getZigObject()) |zo| zo.output_symtab_ctx = .{};
+
+    const first_input: File.Index = (self.zig_object orelse 0) + 1;
+    for (
+        self.files.items(.tags)[first_input..],
+        self.files.items(.data)[first_input..],
+    ) |tag, *data| switch (tag) {
+        .null => {},
+        .zig_object => unreachable,
+        .internal => data.internal.deinit(gpa),
+        .object => data.object.deinit(gpa),
+        .dylib => data.dylib.deinit(gpa),
+    };
+    self.files.shrinkRetainingCapacity(first_input);
+    self.objects.clearRetainingCapacity();
+    self.dylibs.clearRetainingCapacity();
+    self.internal_object = null;
+    // The handles are the inputs' own files: classifying the inputs adds them again.
+    self.file_handles.clearRetainingCapacity();
+
+    self.resolver.reset();
+    for (self.undefs.values()) |*val| val.deinit(gpa);
+    self.undefs.clearRetainingCapacity();
+    for (self.dupes.values()) |*val| val.deinit(gpa);
+    self.dupes.clearRetainingCapacity();
+
+    self.got.deinit(gpa);
+    self.got = .{};
+    self.stubs.deinit(gpa);
+    self.stubs = .{};
+    self.stubs_helper = .{};
+    self.objc_stubs.deinit(gpa);
+    self.objc_stubs = .{};
+    self.la_symbol_ptr = .{};
+    self.tlv_ptr.deinit(gpa);
+    self.tlv_ptr = .{};
+    self.indsymtab = .{};
+    self.rebase_section.deinit(gpa);
+    self.rebase_section = .{};
+    self.bind_section.deinit(gpa);
+    self.bind_section = .{};
+    self.weak_bind_section.deinit(gpa);
+    self.weak_bind_section = .{};
+    self.lazy_bind_section.deinit(gpa);
+    self.lazy_bind_section = .{};
+    self.export_trie.deinit(gpa);
+    self.export_trie = .{};
+    self.unwind_info.deinit(gpa);
+    self.unwind_info = .{};
+    self.data_in_code.deinit(gpa);
+    self.data_in_code = .{};
+    for (self.thunks.items) |*thunk| thunk.deinit(gpa);
+    self.thunks.clearRetainingCapacity();
+    self.has_tlv.store(false, .seq_cst);
+    self.binds_to_weak.store(false, .seq_cst);
+    self.weak_defines.store(false, .seq_cst);
+
+    // The sections stay (atoms of the Zig object can be in any of them), emptied of what
+    // `flush` put in them; the synthetic ones are found again by name if still needed.
+    for (
+        self.sections.items(.header),
+        self.sections.items(.atoms),
+        self.sections.items(.thunks),
+        self.sections.items(.out),
+        self.sections.items(.relocs),
+        0..,
+    ) |*header, *atoms, *thnks, *out, *relocs, index| {
+        thnks.clearRetainingCapacity();
+        out.clearRetainingCapacity();
+        relocs.clearRetainingCapacity();
+        if (self.isZigSection(@intCast(index))) continue;
+        atoms.clearRetainingCapacity();
+        header.size = 0;
+        header.nreloc = 0;
+    }
+    for (&[_]*?u8{
+        &self.text_sect_index,
+        &self.data_sect_index,
+        &self.got_sect_index,
+        &self.stubs_sect_index,
+        &self.stubs_helper_sect_index,
+        &self.la_symbol_ptr_sect_index,
+        &self.tlv_ptr_sect_index,
+        &self.eh_frame_sect_index,
+        &self.unwind_info_sect_index,
+        &self.objc_stubs_sect_index,
+    }) |index| index.* = null;
+
+    // Only the Zig object's segments stay: their addresses are fixed. `initSegments`
+    // adds the others again and counts every segment's sections.
+    var kept: u8 = 0;
+    for (0..self.segments.items.len) |index| {
+        if (!self.isZigSegment(@intCast(index))) continue;
+        for (self.sections.items(.segment_id)) |*seg_id| {
+            if (seg_id.* == index) seg_id.* = kept;
+        }
+        var seg = self.segments.items[index];
+        seg.cmdsize = @sizeOf(macho.segment_command_64);
+        seg.nsects = 0;
+        for (&[_]*?u8{
+            &self.zig_text_seg_index,
+            &self.zig_const_seg_index,
+            &self.zig_data_seg_index,
+            &self.zig_bss_seg_index,
+        }) |zig_index| {
+            if (zig_index.* == @as(u8, @intCast(index))) zig_index.* = kept;
+        }
+        self.segments.items[kept] = seg;
+        kept += 1;
+    }
+    self.segments.shrinkRetainingCapacity(kept);
+    self.pagezero_seg_index = null;
+    self.text_seg_index = null;
+    self.linkedit_seg_index = null;
+}
+
 pub fn loadInput(self: *MachO, input: link.Input) link.Error!void {
     const gpa = self.base.comp.gpa;
     try self.all_inputs.append(gpa, input);
@@ -383,6 +511,9 @@ pub fn flush(
 
     // --verbose-link
     if (comp.verbose_link) try self.dumpArgv(comp);
+
+    if (self.linked_once) self.resetLinkState();
+    self.linked_once = true;
 
     if (self.getZigObject()) |zo| try zo.flush(self, tid);
     if (self.base.isStaticLib()) return relocatable.flushStaticLib(self, comp);
@@ -1541,14 +1672,14 @@ fn initSyntheticSections(self: *MachO) !void {
     const cpu_arch = self.getTarget().cpu.arch;
 
     if (self.got.symbols.items.len > 0) {
-        self.got_sect_index = try self.addSection("__DATA_CONST", "__got", .{
+        self.got_sect_index = try self.getOrAddSection("__DATA_CONST", "__got", .{
             .flags = macho.S_NON_LAZY_SYMBOL_POINTERS,
             .reserved1 = @intCast(self.stubs.symbols.items.len),
         });
     }
 
     if (self.stubs.symbols.items.len > 0) {
-        self.stubs_sect_index = try self.addSection("__TEXT", "__stubs", .{
+        self.stubs_sect_index = try self.getOrAddSection("__TEXT", "__stubs", .{
             .flags = macho.S_SYMBOL_STUBS |
                 macho.S_ATTR_PURE_INSTRUCTIONS | macho.S_ATTR_SOME_INSTRUCTIONS,
             .reserved1 = 0,
@@ -1558,23 +1689,23 @@ fn initSyntheticSections(self: *MachO) !void {
                 else => 0,
             },
         });
-        self.stubs_helper_sect_index = try self.addSection("__TEXT", "__stub_helper", .{
+        self.stubs_helper_sect_index = try self.getOrAddSection("__TEXT", "__stub_helper", .{
             .flags = macho.S_ATTR_PURE_INSTRUCTIONS | macho.S_ATTR_SOME_INSTRUCTIONS,
         });
-        self.la_symbol_ptr_sect_index = try self.addSection("__DATA", "__la_symbol_ptr", .{
+        self.la_symbol_ptr_sect_index = try self.getOrAddSection("__DATA", "__la_symbol_ptr", .{
             .flags = macho.S_LAZY_SYMBOL_POINTERS,
             .reserved1 = @intCast(self.stubs.symbols.items.len + self.got.symbols.items.len),
         });
     }
 
     if (self.objc_stubs.symbols.items.len > 0) {
-        self.objc_stubs_sect_index = try self.addSection("__TEXT", "__objc_stubs", .{
+        self.objc_stubs_sect_index = try self.getOrAddSection("__TEXT", "__objc_stubs", .{
             .flags = macho.S_ATTR_PURE_INSTRUCTIONS | macho.S_ATTR_SOME_INSTRUCTIONS,
         });
     }
 
     if (self.tlv_ptr.symbols.items.len > 0) {
-        self.tlv_ptr_sect_index = try self.addSection("__DATA", "__thread_ptrs", .{
+        self.tlv_ptr_sect_index = try self.getOrAddSection("__DATA", "__thread_ptrs", .{
             .flags = macho.S_THREAD_LOCAL_VARIABLE_POINTERS,
         });
     }
@@ -1583,7 +1714,7 @@ fn initSyntheticSections(self: *MachO) !void {
         if (self.getFile(index).?.object.hasUnwindRecords()) break true;
     } else false;
     if (needs_unwind_info) {
-        self.unwind_info_sect_index = try self.addSection("__TEXT", "__unwind_info", .{});
+        self.unwind_info_sect_index = try self.getOrAddSection("__TEXT", "__unwind_info", .{});
     }
 
     const needs_eh_frame = for (self.objects.items) |index| {
@@ -1591,7 +1722,7 @@ fn initSyntheticSections(self: *MachO) !void {
     } else false;
     if (needs_eh_frame) {
         assert(needs_unwind_info);
-        self.eh_frame_sect_index = try self.addSection("__TEXT", "__eh_frame", .{
+        self.eh_frame_sect_index = try self.getOrAddSection("__TEXT", "__eh_frame", .{
             .flags = macho.S_COALESCED | macho.S_ATTR_NO_TOC | macho.S_ATTR_STRIP_STATIC_SYMS | macho.S_ATTR_LIVE_SUPPORT,
         });
     }
@@ -3679,6 +3810,24 @@ pub fn addSection(
             .reserved2 = opts.reserved2,
         },
     });
+    return index;
+}
+
+/// A section `flush` makes: the one an earlier `flush` of an incremental update made, if
+/// any, with the header `opts` give it now.
+fn getOrAddSection(
+    self: *MachO,
+    segname: []const u8,
+    sectname: []const u8,
+    opts: AddSectionOpts,
+) !u8 {
+    const index = self.getSectionByName(segname, sectname) orelse
+        return self.addSection(segname, sectname, opts);
+    const header = &self.sections.items(.header)[index];
+    header.@"align" = opts.alignment;
+    header.flags = opts.flags;
+    header.reserved1 = opts.reserved1;
+    header.reserved2 = opts.reserved2;
     return index;
 }
 

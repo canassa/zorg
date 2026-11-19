@@ -968,8 +968,9 @@ fn updateNavCode(
         } else if (code.len < old_size) {
             atom.shrink(macho_file);
         } else if (self.getAtom(atom.next_index) == null) {
-            const needed_size = atom.value + code.len;
-            sect.size = needed_size;
+            // The last atom grows in place: so does its section, and the segment around it.
+            macho_file.growSection(sect_index, atom.value + code.len) catch |err|
+                return macho_file.base.cgFail(nav_index, "failed to grow section: {s}", .{@errorName(err)});
         }
     } else {
         atom.allocate(macho_file) catch |err|
@@ -1225,6 +1226,26 @@ fn lowerConst(
     return @fromBackingInt(@intCast(sym_index));
 }
 
+/// Takes back the export `nlist_index` names, keeping its symbol as an undefined global of
+/// the same name: code that refers to it (through `getGlobalSymbol`) holds that index, and
+/// finds the definition again when it is exported again (`updateExports` exports everything
+/// anew on every update), or the definition another file has.
+fn unexport(self: *ZigObject, nlist_index: Symbol.Index) void {
+    const nlist = &self.symtab.items(.nlist)[nlist_index];
+    self.symtab.items(.size)[nlist_index] = 0;
+    self.symtab.items(.atom)[nlist_index] = 0;
+    nlist.* = .{
+        .n_strx = nlist.n_strx,
+        .n_type = .{ .bits = .{ .ext = true, .type = .undf, .pext = false, .is_stab = 0 } },
+        .n_sect = 0,
+        .n_desc = @bitCast(@as(u16, 0)),
+        .n_value = 0,
+    };
+    const sym = &self.symbols.items[nlist_index];
+    sym.atom_ref = .{ .index = 0, .file = 0 };
+    sym.flags.weak = false;
+}
+
 pub fn updateExports(
     self: *ZigObject,
     macho_file: *MachO,
@@ -1239,33 +1260,11 @@ pub fn updateExports(
 
     // Delete all existing exports first
     for (self.navs.values()) |*metadata| {
-        for (metadata.exports.items) |nlist_index| {
-            const nlist = &self.symtab.items(.nlist)[nlist_index];
-            self.symtab.items(.size)[nlist_index] = 0;
-            _ = self.globals_lookup.remove(nlist.n_strx);
-            // TODO actually remove the export
-            // const sym_index = macho_file.globals.get(nlist.n_strx).?;
-            // const sym = &self.symbols.items[sym_index];
-            // if (sym.file == self.index) {
-            //     sym.* = .{};
-            // }
-            nlist.* = MachO.null_sym;
-        }
+        for (metadata.exports.items) |nlist_index| self.unexport(nlist_index);
         metadata.exports.clearRetainingCapacity();
     }
     for (self.uavs.values()) |*metadata| {
-        for (metadata.exports.items) |nlist_index| {
-            const nlist = &self.symtab.items(.nlist)[nlist_index];
-            self.symtab.items(.size)[nlist_index] = 0;
-            _ = self.globals_lookup.remove(nlist.n_strx);
-            // TODO actually remove the export
-            // const sym_index = macho_file.globals.get(nlist.n_strx).?;
-            // const sym = &self.symbols.items[sym_index];
-            // if (sym.file == self.index) {
-            //     sym.* = .{};
-            // }
-            nlist.* = MachO.null_sym;
-        }
+        for (metadata.exports.items) |nlist_index| self.unexport(nlist_index);
         metadata.exports.clearRetainingCapacity();
     }
 
@@ -1423,11 +1422,12 @@ pub fn getGlobalSymbol(self: *ZigObject, macho_file: *MachO, name: []const u8, l
 const max_trampoline_len = 12;
 
 fn trampolineSize(cpu_arch: std.Target.Cpu.Arch) u64 {
-    const len = switch (cpu_arch) {
+    const len: u64 = switch (cpu_arch) {
         .x86_64 => 5, // jmp rel32
+        .aarch64 => 4, // b imm26: no larger than the function whose slot it takes
         else => @panic("TODO implement trampoline size for this CPU arch"),
     };
-    comptime assert(len <= max_trampoline_len);
+    assert(len <= max_trampoline_len);
     return len;
 }
 
@@ -1440,6 +1440,7 @@ fn writeTrampoline(tr_sym: Symbol, target: Symbol, macho_file: *MachO) !void {
     var buf: [max_trampoline_len]u8 = undefined;
     const out = switch (macho_file.getTarget().cpu.arch) {
         .x86_64 => try x86_64.writeTrampolineCode(source_addr, target_addr, &buf),
+        .aarch64 => try aarch64.writeTrampolineCode(source_addr, target_addr, &buf),
         else => @panic("TODO implement write trampoline for this CPU arch"),
     };
     return macho_file.pwriteAll(out, fileoff);
@@ -1735,6 +1736,20 @@ const x86_64 = struct {
         mem.writeInt(i32, bytes[1..][0..4], @intCast(disp), .little);
         @memcpy(buf[0..bytes.len], &bytes);
         return buf[0..bytes.len];
+    }
+};
+
+const aarch64 = struct {
+    fn writeTrampolineCode(source_addr: u64, target_addr: u64, buf: *[max_trampoline_len]u8) ![]u8 {
+        dev.checkAny(&.{ .llvm_backend, .aarch64_backend });
+        const disp = @as(i64, @intCast(target_addr)) - @as(i64, @intCast(source_addr));
+        // `b` reaches 128 MiB either way: a Zig text section larger than that would need a
+        // longer trampoline than the slot of the smallest function holds.
+        const imm26 = std.math.cast(i26, @divExact(disp, 4)) orelse return error.TrampolineOutOfRange;
+        const insn: u32 = 0x14000000 | @as(u32, @as(u26, @bitCast(imm26)));
+        assert(4 == trampolineSize(.aarch64));
+        mem.writeInt(u32, buf[0..4], insn, .little);
+        return buf[0..4];
     }
 };
 

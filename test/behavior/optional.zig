@@ -807,3 +807,38 @@ test "optional negative small integers returned from a call" {
     try expect(S.optionalEnum().? == @as(E, @fromBackingInt(-128)));
     try expect(@backingInt(S.optionalEnum().?) == -128);
 }
+
+test "optional float returned from a call while general registers hold other values" {
+    const S = struct {
+        var present = true;
+        var ints: [10]u64 = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+        noinline fn maybe(x: f32) ?f32 {
+            return if (present) x else null;
+        }
+        noinline fn other() void {}
+        // Ten values live across both calls take the callee-saved general
+        // registers, so splitting the result into its parts runs out of them.
+        noinline fn read(out: *f32) u64 {
+            const a = ints[0];
+            const b = ints[1];
+            const c = ints[2];
+            const d = ints[3];
+            const e = ints[4];
+            const f = ints[5];
+            const g = ints[6];
+            const h = ints[7];
+            const i = ints[8];
+            const j = ints[9];
+            if (maybe(9000)) |v| out.* = v;
+            other();
+            return a +% b +% c +% d +% e +% f +% g +% h +% i +% j;
+        }
+    };
+    var out: f32 = 0;
+    try expect(S.read(&out) == 55);
+    try expect(out == 9000);
+    S.present = false;
+    out = 0;
+    try expect(S.read(&out) == 55);
+    try expect(out == 0);
+}

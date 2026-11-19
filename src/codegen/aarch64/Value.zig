@@ -1325,6 +1325,10 @@ pub const Index = enum(u32) {
         expected_live_registers: *const LiveRegisters,
     ) !void {
         try vi.liveIn(isel, src_ra, expected_live_registers);
+        // Moving the parts out of `src_ra` can need a scratch register and
+        // spill another part to the stack slot, so the slot is looked up
+        // after, and stored first, while `src_ra` still holds the value.
+        try vi.spillReg(isel, src_ra, 0, expected_live_registers);
         const offset_from_parent, const parent_vi = vi.valueParent(isel);
         switch (parent_vi.parent(isel)) {
             .unallocated => {},
@@ -1336,7 +1340,6 @@ pub const Index = enum(u32) {
             ),
             else => unreachable,
         }
-        try vi.spillReg(isel, src_ra, 0, expected_live_registers);
     }
 
     pub fn spillReg(

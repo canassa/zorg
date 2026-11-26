@@ -648,6 +648,52 @@ test "@bitCast between floats and arrays or vectors of integers" {
     try S.doTheTest(f128, [2]u64, -2.5);
 }
 
+test "@bitCast between vectors with padding and integers, floats or arrays" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
+    if (builtin.cpu.arch.endian() != .little) return error.SkipZigTest;
+
+    const S = struct {
+        fn doTheTest(comptime T: type, comptime n: usize, comptime Lane: type, comptime value: T) !void {
+            const V = @Vector(n, Lane);
+            comptime assert(@sizeOf(V) * 8 > @bitSizeOf(V));
+            const lanes: [n]Lane = comptime @as(V, @bitCast(value));
+
+            var scalar: T = value;
+            const scalar_ptr: *volatile T = &scalar;
+            const from_scalar: [n]Lane = @as(V, @bitCast(scalar_ptr.*));
+            try expect(std.mem.eql(Lane, &from_scalar, &lanes));
+
+            // The bytes after the lanes are padding and must not reach the result.
+            var storage: [@sizeOf(V)]u8 align(@alignOf(V)) = @splat(0xff);
+            const vector_ptr: *volatile V = @ptrCast(&storage);
+            inline for (lanes, 0..) |lane, i| vector_ptr[i] = lane;
+            const from_vector: T = @bitCast(vector_ptr.*);
+            try expect(std.meta.eql(from_vector, value));
+        }
+    };
+    try S.doTheTest(u24, 3, u8, 0xabcdef);
+    try S.doTheTest(i24, 3, u8, -0x123456);
+    try S.doTheTest(u48, 3, u16, 0xabcdef012345);
+    try S.doTheTest(i48, 6, u8, -0x123456789abc);
+    try S.doTheTest(u80, 5, u16, 0x4000c8f5c28f5c28f5c3);
+    try S.doTheTest(i80, 10, u8, -0x1000c8f5c28f5c28f5c3);
+    try S.doTheTest(u96, 3, u32, 0xfedcba9876543210_89abcdef);
+    try S.doTheTest(u96, 3, f32, 0x40490fdb_c0200000_3fc00000);
+    try S.doTheTest(u136, 17, u8, 0xab_fedcba9876543210_0123456789abcdef);
+    try S.doTheTest(u160, 5, u32, 0x89abcdef_fedcba9876543210_0123456789abcdef);
+    try S.doTheTest(i192, 3, u64, -0x7edcba9876543210_0123456789abcdef_8877665544332211);
+    try S.doTheTest(f80, 5, u16, 3.14);
+    try S.doTheTest(f80, 10, u8, -2.5);
+    try S.doTheTest([3]u8, 3, u8, .{ 1, 0xff, 3 });
+    try S.doTheTest([5]u16, 5, u16, .{ 0xf5c3, 0x5c28, 0xc28f, 0xc8f5, 0x4000 });
+    try S.doTheTest([3]u32, 3, u32, .{ 0x01234567, 0xffffffff, 0x89abcdef });
+    try S.doTheTest([3]f32, 3, f32, .{ 1.5, -2.5, 3.25 });
+    try S.doTheTest([3]u64, 3, u64, .{ 0xfedcba9876543210, 1, 0x8877665544332211 });
+}
+
 test "@bitCast between float and vector" {
     const static = struct {
         fn doTheTest() !void {

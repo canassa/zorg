@@ -7707,12 +7707,16 @@ fn selectBitCast(isel: *Select, inst: Air.Inst.Index, air_tag: Air.Inst.Tag) !vo
         {
             try isel.bitCastContiguous(dst_vi.value, dst_ty, try isel.use(ty_op.operand), src_ty);
         } else if ((dst_tag == .array or dst_tag == .vector) and (src_tag == .array or src_tag == .vector) and
-            isel.bitCastIsContiguous(dst_ty) and isel.bitCastIsContiguous(src_ty) and
-            dst_ty.abiSize(zcu) == src_ty.abiSize(zcu))
+            isel.bitCastIsContiguous(dst_ty) and isel.bitCastIsContiguous(src_ty))
         {
-            // Neither side has padding, so both have the same bytes in memory.
             const src_vi = try isel.use(ty_op.operand);
-            try dst_vi.value.copyField(isel, dst_ty, 0, src_vi, src_ty, 0, dst_ty.abiSize(zcu));
+            if (dst_ty.abiSize(zcu) == src_ty.abiSize(zcu)) {
+                // Both sides have the same bytes in memory.
+                try dst_vi.value.copyField(isel, dst_ty, 0, src_vi, src_ty, 0, dst_ty.abiSize(zcu));
+            } else {
+                // One side is a vector with padding after its lanes.
+                try isel.bitCastContiguous(dst_vi.value, dst_ty, src_vi, src_ty);
+            }
         } else return isel.fail("bad {t} {f} {f}", .{ air_tag, isel.fmtType(dst_ty), isel.fmtType(src_ty) });
     }
 }
@@ -10686,13 +10690,15 @@ fn divideRoundedWide(isel: *Select, res_vi: Value.Index, ty: ZigType, lhs_ref: A
 
 fn bitCastIsContiguous(isel: *Select, ty: ZigType) bool {
     const zcu = isel.pt.zcu;
-    if (ty.bitSize(zcu) != 8 * ty.abiSize(zcu)) return false;
+    const padded = ty.bitSize(zcu) != 8 * ty.abiSize(zcu);
     return switch (ty.zigTypeTag(zcu)) {
         // Arrays use the ABI stride of each element; inspect nested arrays too.
-        .array => isel.bitCastIsContiguous(ty.childType(zcu)),
+        .array => !padded and isel.bitCastIsContiguous(ty.childType(zcu)),
         // Hard vector lanes share bytes, independently of scalar ABI padding.
-        .vector => isel.vectorLaneBits(ty.childType(zcu)) == ty.childType(zcu).bitSize(zcu),
-        else => ty.isAbiInt(zcu) or ty.isRuntimeFloat(),
+        // The lanes of a vector such as `@Vector(5, u16)` are followed by padding.
+        .vector => ty.bitSize(zcu) % 8 == 0 and
+            isel.vectorLaneBits(ty.childType(zcu)) == ty.childType(zcu).bitSize(zcu),
+        else => !padded and (ty.isAbiInt(zcu) or ty.isRuntimeFloat()),
     };
 }
 

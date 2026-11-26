@@ -22,7 +22,7 @@ work later. Keep those diffs small, and put fork-only things in their own files 
 
 ## Building the compiler
 
-- Needs LLVM 22. Bootstrap with the official zig 0.17.0. The exact release build (flags, static
+- Needs LLVM 22. Bootstrap with the official zig 0.17.1. The exact release build (flags, static
   LLVM bundles) is the `build` job in `.github/workflows/release.yml`.
 - The bootstrap compiler is upstream zig and reads `ZIG_*`; the build runner, compiled from this
   tree's std, reads `ZORG_*`. Set both cache variables and `ZIG_LIB_DIR=$PWD/lib`; don't pass

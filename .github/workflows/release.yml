@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ZIG_BOOT_VERSION: 0.17.0
+  ZIG_BOOT_VERSION: 0.17.1
   # Upstream's 0.17 CI toolchain bundles (LLVM, LLD and Clang 22, static).
   # ziglang.org publishes no checksums for them; these were pinned on 2026-10-11.
   DEPS_VERSION: 0.17.0-dev.203+073889523
@@ -79,8 +79,8 @@ jobs:
           - { target: aarch64-linux-musl, arch: aarch64, os: linux, deps_sha256: 012f9b49d830c567038a6af9e3fa184e53739077a3be20e4a12434b621ea9e90 }
     env:
       NAME: zorg-${{ matrix.arch }}-${{ matrix.os }}-${{ needs.meta.outputs.tagver }}
-      BOOT_NAME: zig-x86_64-linux-0.17.0
-      BOOT_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+      BOOT_NAME: zig-x86_64-linux-0.17.1
+      BOOT_SHA256: 3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a
       DEPS_NAME: zig+llvm+lld+clang-${{ matrix.target }}-0.17.0-dev.203+073889523
     steps:
       - uses: actions/checkout@v5
@@ -135,14 +135,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: macos-15, arch: aarch64, os: macos, zig_sha256: b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a }
-          - { runner: ubuntu-24.04, arch: x86_64, os: linux, zig_sha256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026 }
-          - { runner: ubuntu-24.04-arm, arch: aarch64, os: linux, zig_sha256: 9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8 }
+          - { runner: macos-15, arch: aarch64, os: macos, zig_sha256: 75f1bc7a1e9852f17ec9a0c1895f767c4ec56d46bc8a834920eece1d0359dd8d }
+          - { runner: ubuntu-24.04, arch: x86_64, os: linux, zig_sha256: 3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a }
+          - { runner: ubuntu-24.04-arm, arch: aarch64, os: linux, zig_sha256: a1546d5646eb184437918d6635ca6b762a0e889eac09cef720ee7a1ed3fe7795 }
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
       NAME: zorg-${{ matrix.arch }}-${{ matrix.os }}-${{ needs.meta.outputs.tagver }}
-      ZIG_NAME: zig-${{ matrix.arch }}-${{ matrix.os }}-0.17.0
+      ZIG_NAME: zig-${{ matrix.arch }}-${{ matrix.os }}-0.17.1
     steps:
       - uses: actions/checkout@v5 # test/behavior.zig and smoke.sh from the same commit
       - uses: actions/download-artifact@v8

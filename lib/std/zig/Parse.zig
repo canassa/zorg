@@ -92,7 +92,7 @@ fn reserveNode(p: *Parse, tag: Ast.Node.Tag) !usize {
 }
 
 fn unreserveNode(p: *Parse, node_index: usize) void {
-    if (p.nodes.len == node_index) {
+    if (p.nodes.len == node_index + 1) {
         p.nodes.resize(p.gpa, p.nodes.len - 1) catch unreachable;
     } else {
         // There is zombie node left in the tree, let's make it as inoffensive as possible
@@ -1721,8 +1721,12 @@ fn parseTypeExpr(p: *Parse) Error!?Node.Index {
                 _ = p.nextToken();
                 var sentinel: ?Node.Index = null;
                 if (p.eatToken(.identifier)) |ident| {
-                    const ident_slice = p.source[p.tokenStart(ident)..p.tokenStart(ident + 1)];
-                    if (!std.mem.eql(u8, std.mem.trimEnd(u8, ident_slice, &std.ascii.whitespace), "c")) {
+                    const ident_start: usize = p.tokenStart(ident);
+                    const next = ident_start + 1;
+                    const continues_identifier = next < p.source.len and
+                        (std.ascii.isAlphanumeric(p.source[next]) or p.source[next] == '_');
+                    const is_c = p.source[ident_start] == 'c' and !continues_identifier;
+                    if (!is_c) {
                         p.tok_i -= 1;
                     }
                 } else if (p.eatToken(.colon)) |_| {
@@ -2713,13 +2717,11 @@ fn parseAddrSpace(p: *Parse) !?Node.Index {
 /// such as in the case of anytype and `...`. Caller must look for rparen to find
 /// out when there are no more param decls left.
 fn expectParamDecl(p: *Parse) !?Node.Index {
+    // Unlike ordinary parameters, the variadic marker cannot have doc comments.
+    if (p.eatToken(.ellipsis3) != null) return null;
     _ = try p.eatDocComments();
     switch (p.tokenTag(p.tok_i)) {
         .keyword_noalias, .keyword_comptime => p.tok_i += 1,
-        .ellipsis3 => {
-            p.tok_i += 1;
-            return null;
-        },
         else => {},
     }
     _ = p.eatTokens(&.{ .identifier, .colon });
@@ -3416,4 +3418,23 @@ const Token = std.zig.Token;
 
 test {
     _ = @import("parser_test.zig");
+}
+
+test "unreserving a freshly reserved AST node must not create zombies" {
+    const gpa = std.testing.allocator;
+    var parser: Parse = .{
+        .gpa = gpa,
+        .nodes = .empty,
+        .errors = .empty,
+        .extra_data = .empty,
+        .scratch = .empty,
+        .source = "",
+        .tok_i = 0,
+        .tokens = undefined,
+        .recover = false,
+    };
+    defer parser.nodes.deinit(gpa);
+    const last = try parser.reserveNode(.@"try");
+    parser.unreserveNode(last);
+    try std.testing.expectEqual(parser.nodes.len, 0);
 }

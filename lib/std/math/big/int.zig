@@ -4247,19 +4247,14 @@ fn llsignedor(r: []Limb, a: []const Limb, a_positive: bool, b: []const Limb, b_p
         assert(r_carry == 0);
 
         // With b = 0, we get (-a - 1) & ~0 = -a - 1.
-        // Once a_borrow is zero the higher limbs are those of a.
-        while (i < a.len and a_borrow == 1) : (i += 1) {
+        // Copy the higher limbs even after the borrow is zero in case r does not alias a.
+        while (i < a.len) : (i += 1) {
             const ov = @subWithOverflow(a[i], a_borrow);
             r[i] = ov[0];
             a_borrow = ov[1];
         }
 
         assert(a_borrow == 0); // a was 0.
-
-        // r may not alias a.
-        while (i < a.len) : (i += 1) {
-            r[i] = a[i];
-        }
 
         return false;
     } else if (a_positive and !b_positive) {

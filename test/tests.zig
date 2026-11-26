@@ -2365,28 +2365,29 @@ pub const debugger_matrix: []const RunnerTarget = &.{
 };
 
 fn supportedCompatArch(host: *const std.Target, arch: std.Target.Cpu.Arch) bool {
+    // aarch64-freebsd and aarch64-linux can technically run 32-bit ARM binaries, but that depends
+    // on AArch32 support in the CPU. Since modern AArch64 CPUs have largely dropped this support,
+    // avoid reporting compatibility for 32-bit here since we'd just build a bunch of test binaries
+    // that never get run anyway. This added almost an hour's worth of useless work to aarch64-linux
+    // CI, for example.
+    //
+    // riscv64-linux and riscv64-netbsd similarly support 32-bit binaries. However, this requires a
+    // very recent kernel and for the kernel feature to be enabled. Additionally, contemporary
+    // RISC-V hardware is just too slow to justify building the 32-bit binaries.
     return switch (host.os.tag) {
-        .freebsd => switch (host.cpu.arch) {
-            .aarch64 => arch == .arm,
-            else => false,
-        },
         .illumos => switch (host.cpu.arch) {
             .x86_64 => arch == .x86,
             else => false,
         },
         .linux => switch (host.cpu.arch) {
-            .aarch64 => arch == .arm or arch == .thumb,
-            .aarch64_be => arch == .armeb or arch == .thumbeb,
             .mips64 => arch == .mips,
             .mips64el => arch == .mipsel,
             .powerpc64 => arch == .powerpc,
-            .riscv64 => arch == .riscv32,
             .sparc64 => arch == .sparc,
             .x86_64 => arch == .x86,
             else => false,
         },
         .netbsd => switch (host.cpu.arch) {
-            .riscv64 => arch == .riscv32,
             .sparc64 => arch == .sparc,
             .x86_64 => arch == .x86,
             else => false,
@@ -2792,6 +2793,51 @@ pub fn addCliTests(b: *std.Build) *Step {
         step.dependOn(&run_test.step);
     }
 
+    {
+        // Test (cross-)compiling for Linux using `-l` syntax. The build system only uses `-l` for
+        // system libraries (and therefore only for native builds), but it is possible and legal to
+        // use it when cross-compiling.
+        const tmp_path = b.tmpPath();
+
+        const build_libfoo = b.addSystemCommand(&.{
+            b.graph.zig_exe,
+            "build-lib",
+            "-target",
+            "x86_64-linux",
+            "-dynamic",
+        });
+        const libfoo = build_libfoo.addOutputFileArg2("libfoo.so", .{ .prefix = "-femit-bin=" });
+
+        build_libfoo.setCwd(tmp_path);
+        build_libfoo.setName("zig build-lib libfoo.so");
+        build_libfoo.expectStdOutEqual("");
+        build_libfoo.expectStdErrEqual("");
+
+        const build_libbar = b.addSystemCommand(&.{
+            b.graph.zig_exe,
+            "build-lib",
+            "-target",
+            "x86_64-linux",
+            "-dynamic",
+        });
+        build_libbar.addDirectoryArg2(libfoo.dirname(), .{ .prefix = "-L" });
+        build_libbar.addArg("-lfoo");
+        const libbar = build_libbar.addOutputFileArg2("libbar.so", .{ .prefix = "-femit-bin=" });
+
+        build_libbar.setCwd(tmp_path);
+        build_libbar.setName("zig build-lib libbar.so");
+        build_libbar.expectStdOutEqual("");
+        build_libbar.expectStdErrEqual("");
+
+        // We mainly just want to make sure the build commands complete successfully, but we may as
+        // well double-check that the output is a valid ELF file.
+        const check_libbar = b.addCheckFile(libbar, .{
+            .expected_matches = &.{"\x7fELF"},
+        });
+
+        step.dependOn(&check_libbar.step);
+    }
+
     return step;
 }
 
@@ -2928,15 +2974,6 @@ fn addOneModuleTest(
     const libc_suffix = if (test_target.link_libc == true) "-libc" else "";
     const model_txt = target.cpu.model.name;
 
-    // These emulated targets need a lot more RAM for unknown reasons.
-    const max_rss = if (mem.eql(u8, options.name, "std") and
-        (target.cpu.arch == .hexagon or
-            (target.cpu.arch.isRISCV() and !resolved_target.query.isNative()) or
-            target.cpu.arch.isWasm()))
-        options.max_rss * 2
-    else
-        options.max_rss;
-
     const these_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path(options.root_src),
@@ -2948,7 +2985,7 @@ fn addOneModuleTest(
             .sanitize_thread = options.sanitize_thread,
             .single_threaded = test_target.single_threaded,
         }),
-        .max_rss = max_rss,
+        .max_rss = options.max_rss,
         .filters = options.test_filters,
         .use_llvm = test_target.use_llvm,
         .use_lld = test_target.use_lld,

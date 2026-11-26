@@ -336,7 +336,7 @@ pub const Object = struct {
         bin_path: ?[:0]const u8,
         asm_path: ?[:0]const u8,
         post_ir_path: ?[:0]const u8,
-        post_bc_path: ?[]const u8,
+        post_bc_path: ?[:0]const u8,
 
         is_debug: bool,
         is_small: bool,
@@ -543,23 +543,12 @@ pub const Object = struct {
                     return diags.fail("failed to create '{s}': {t}", .{ path, err });
                 defer file.close(io);
 
-                const ptr: [*]const u8 = @ptrCast(bitcode.ptr);
-                file.writeStreamingAll(io, ptr[0..(bitcode.len * 4)]) catch |err|
+                file.writeStreamingAll(io, @ptrCast(bitcode)) catch |err|
                     return diags.fail("failed to write to '{s}': {t}", .{ path, err });
             }
 
             if (options.asm_path == null and options.bin_path == null and
                 options.post_ir_path == null and options.post_bc_path == null) return;
-
-            if (options.post_bc_path) |path| {
-                var file = Io.Dir.cwd().createFile(io, path, .{}) catch |err|
-                    return diags.fail("failed to create '{s}': {t}", .{ path, err });
-                defer file.close(io);
-
-                const ptr: [*]const u8 = @ptrCast(bitcode.ptr);
-                file.writeStreamingAll(io, ptr[0..(bitcode.len * 4)]) catch |err|
-                    return diags.fail("failed to write to '{s}': {t}", .{ path, err });
-            }
 
             if (!build_options.have_llvm or !comp.config.use_lib_llvm) {
                 return diags.fail("emitting without libllvm not implemented", .{});
@@ -663,7 +652,7 @@ pub const Object = struct {
             .asm_filename = null,
             .bin_filename = if (options.bin_path) |x| x.ptr else null,
             .llvm_ir_filename = if (options.post_ir_path) |x| x.ptr else null,
-            .bitcode_filename = null,
+            .bitcode_filename = if (options.post_bc_path) |x| x.ptr else null,
 
             // `.coverage` value is only used when `.sancov` is enabled.
             .sancov = options.fuzz or comp.config.san_cov_trace_pc_guard,
@@ -702,6 +691,7 @@ pub const Object = struct {
             }
             lowered_options.bin_filename = null;
             lowered_options.llvm_ir_filename = null;
+            lowered_options.bitcode_filename = null;
         }
 
         var time_report_c_str: [*:0]u8 = undefined;
@@ -1244,7 +1234,6 @@ pub const Object = struct {
         // The name, aliasee, and type will be set within this block. Other properties of the
         // alias will be set below.
         const alias_global: Builder.Global.Index = global: {
-
             // WORKAROUND (see https://github.com/llvm/llvm-project/issues/213504, https://github.com/llvm/llvm-project/issues/214835)
             // For NVPTX, LLVM throws "NVPTX aliasee must be a non-kernel function definition" if we try to alias a kernel
             // On AMDGCN, LLVM does not generate an alias for the kernel descriptor symbol on associated functions
@@ -1266,33 +1255,24 @@ pub const Object = struct {
             };
             // There is an existing global with this name, so we can't just create an alias. We
             // need to figure out what to do with the existing global instead.
-            switch (existing_global.ptrConst(&o.builder).kind) {
-                .alias => |alias| {
-                    // We can just repurpose the existing alias.
-                    alias.setAliasee(llvm_global.toConst(), &o.builder);
-                    alias.ptrConst(&o.builder).global.ptr(&o.builder).type = llvm_global.typeOf(&o.builder);
-                    alias.ptrConst(&o.builder).global.ptr(&o.builder).addr_space = llvm_global.ptrConst(&o.builder).addr_space;
-                    break :global existing_global;
+            const alias: Builder.Alias.Index = switch (existing_global.ptrConst(&o.builder).kind) {
+                .alias => |alias| alias: {
+                    // The existing alias is from an earlier export, so if `exp` is weak, ignore it.
+                    if (exp.opts.linkage == .weak) return;
+                    // But otherwise, we can just repurpose the existing alias.
+                    break :alias alias;
                 },
-                .variable, .function => {
-                    // This must be an extern, which is no good to us---we need an alias. The
-                    // extern should refer to the value we're exporting, so replace it with the
-                    // exported value. That will free up the name for us to create a new alias.
-                    // We need to make a new global which is an alias. Replace this existing one
-                    // with the target global, making the name available and fixing references
-                    // to this global to point to the target.
-                    try existing_global.replace(llvm_global, &o.builder);
-                    // The name is now free, so create an alias.
-                    const alias = try o.builder.addAlias(
-                        exp_name,
-                        llvm_global_ty,
-                        llvm_global.ptrConst(&o.builder).addr_space,
-                        llvm_global.toConst(),
-                    );
-                    break :global alias.ptrConst(&o.builder).global;
+                .variable, .function => alias: {
+                    // This is an extern which our export resolves, so we can simply convert this
+                    // global into the alias we want.
+                    break :alias try existing_global.toNewAlias(&o.builder);
                 },
                 .replaced => unreachable, // a replaced global would have lost the name `exp_name`
-            }
+            };
+            alias.setAliasee(llvm_global.toConst(), &o.builder);
+            alias.ptrConst(&o.builder).global.ptr(&o.builder).type = llvm_global_ty;
+            alias.ptrConst(&o.builder).global.ptr(&o.builder).addr_space = llvm_global.ptrConst(&o.builder).addr_space;
+            break :global existing_global;
         };
 
         // We need the alias to *not* be `unnamed_addr` to ensure that the alias address equals
@@ -2355,25 +2335,21 @@ pub const Object = struct {
 
         if (fn_info.return_type == .noreturn_type) try attributes.addFnAttr(.noreturn, &o.builder);
 
-        var it = iterateParamTypes(o, fn_info.cc, fn_info.param_types);
-        if (try fnReturnStrat(o, fn_info.cc, .fromInterned(fn_info.return_type)) == .sret) {
+        const ret_strat = try fnReturnStrat(o, fn_info.cc, .fromInterned(fn_info.return_type));
+        var it = iterateParamTypes(o, fn_info.cc, fn_info.param_types, ret_strat);
+        if (ret_strat == .sret) {
             try o.addSRetFnAttributes(
                 attributes,
                 try o.lowerType(.fromInterned(fn_info.return_type), .in_memory),
                 Type.fromInterned(fn_info.return_type).abiAlignment(zcu).toLlvm(),
                 .declaration,
             );
-            it.llvm_index += 1;
         } else if (ccAbiPromoteInt(fn_info.cc, zcu, Type.fromInterned(fn_info.return_type))) |s| switch (s) {
             .signed => try attributes.addRetAttr(.signext, &o.builder),
             .unsigned => try attributes.addRetAttr(.zeroext, &o.builder),
         };
 
-        const err_return_tracing = fn_info.cc == .auto and zcu.comp.config.any_error_tracing;
-        if (err_return_tracing) {
-            try attributes.addParamAttr(it.llvm_index, .nonnull, &o.builder);
-            it.llvm_index += 1;
-        }
+        if (it.errorReturnTraceIndex()) |i| try attributes.addParamAttr(i, .nonnull, &o.builder);
 
         var remaining_inreg_int = cc_info.inreg_int_params;
         var remaining_inreg_float = cc_info.inreg_float_params;
@@ -2640,6 +2616,21 @@ pub const Object = struct {
         return layout;
     }
 
+    pub fn structType(o: *Object, fields: []const Builder.Type) Allocator.Error!Builder.Type {
+        const kind: Builder.Type.Structure.Kind = kind: {
+            var offset: u64 = 0;
+            var struct_align: Builder.Alignment = .fromByteUnits(1);
+            for (fields) |field| {
+                const field_align = field.alignment(.abi, &o.builder);
+                if (!field_align.check(offset)) break :kind .@"packed";
+                struct_align = struct_align.max(field_align);
+                offset += field.allocSize(&o.builder).fixed;
+            }
+            break :kind if (struct_align.check(offset)) .normal else .@"packed";
+        };
+        return o.builder.structType(kind, fields);
+    }
+
     pub fn lowerType(o: *Object, t: Type, repr: TypeRepr) Allocator.Error!Builder.Type {
         const zcu = o.zcu;
         const target = zcu.getTarget();
@@ -2820,7 +2811,7 @@ pub const Object = struct {
                         fields[2] = try o.builder.arrayType(padding_len, .i8);
                         fields_len = 3;
                     }
-                    return o.builder.structType(.normal, fields[0..fields_len]);
+                    return o.structType(fields[0..fields_len]);
                 },
                 .anyframe_type => @panic("TODO implement lowerType for AnyFrame types"),
                 .error_union_type => |error_union_type| {
@@ -2865,7 +2856,7 @@ pub const Object = struct {
                         fields[2] = try o.builder.arrayType(padding_len, .i8);
                         fields_len = 3;
                     }
-                    return o.builder.structType(.normal, fields[0..fields_len]);
+                    return o.structType(fields[0..fields_len]);
                 },
                 .simple_type => unreachable,
                 .struct_type => {
@@ -2887,20 +2878,13 @@ pub const Object = struct {
 
                     comptime assert(struct_layout_version == 2);
                     var offset: u64 = 0;
-                    var struct_kind: Builder.Type.Structure.Kind = .normal;
                     // When we encounter a zero-bit field, we place it here so we know to map it to the next non-zero-bit field (if any).
                     var it = struct_type.iterateRuntimeOrder(ip);
-                    var max_field_ty_align: InternPool.Alignment = .@"1";
                     while (it.next()) |field_index| {
                         const field_ty = Type.fromInterned(struct_type.field_types.get(ip)[field_index]);
-                        const field_ty_align = field_ty.abiAlignment(zcu);
-                        max_field_ty_align = max_field_ty_align.maxStrict(field_ty_align);
 
                         const prev_offset = offset;
                         offset = struct_type.field_offsets.get(ip)[field_index];
-                        if (@ctz(offset) < field_ty_align.toLog2Units()) {
-                            struct_kind = .@"packed"; // prevent unexpected padding before this field
-                        }
 
                         const padding_len = offset - prev_offset;
                         if (padding_len > 0) try llvm_field_types.append(
@@ -2922,9 +2906,6 @@ pub const Object = struct {
                             o.gpa,
                             try o.builder.arrayType(padding_len, .i8),
                         );
-                        if (@ctz(offset) < max_field_ty_align.toLog2Units()) {
-                            struct_kind = .@"packed"; // prevent unexpected trailing padding
-                        }
                     }
 
                     const ty = try o.builder.opaqueType(try o.builder.string(t.containerTypeName(ip).fqn.toSlice(ip)));
@@ -2932,7 +2913,7 @@ pub const Object = struct {
 
                     o.builder.namedTypeSetBody(
                         ty,
-                        try o.builder.structType(struct_kind, llvm_field_types.items),
+                        try o.structType(llvm_field_types.items),
                     );
                     return ty;
                 },
@@ -2980,7 +2961,7 @@ pub const Object = struct {
                         );
                     }
                     assert(offset > 0);
-                    return o.builder.structType(.normal, llvm_field_types.items);
+                    return o.structType(llvm_field_types.items);
                 },
                 .union_type => {
                     const union_obj = ip.loadUnionType(t.toIntern());
@@ -3003,13 +2984,13 @@ pub const Object = struct {
                     const aligned_field_llvm_ty = try o.lowerType(aligned_field_ty, repr);
 
                     const payload_ty = ty: {
-                        if (layout.most_aligned_field_size == layout.payload_size) {
-                            break :ty aligned_field_llvm_ty;
-                        }
                         const padding_len = if (layout.tag_size == 0)
                             layout.abi_size - layout.most_aligned_field_size
                         else
                             layout.payload_size - layout.most_aligned_field_size;
+                        if (padding_len == 0) {
+                            break :ty aligned_field_llvm_ty;
+                        }
                         break :ty try o.builder.structType(.@"packed", &.{
                             aligned_field_llvm_ty,
                             try o.builder.arrayType(padding_len, .i8),
@@ -3022,7 +3003,7 @@ pub const Object = struct {
 
                         o.builder.namedTypeSetBody(
                             ty,
-                            try o.builder.structType(.normal, &.{payload_ty}),
+                            try o.structType(&.{payload_ty}),
                         );
                         return ty;
                     }
@@ -3050,7 +3031,7 @@ pub const Object = struct {
 
                     o.builder.namedTypeSetBody(
                         ty,
-                        try o.builder.structType(.normal, llvm_fields[0..llvm_fields_len]),
+                        try o.structType(llvm_fields[0..llvm_fields_len]),
                     );
                     return ty;
                 },
@@ -3111,17 +3092,14 @@ pub const Object = struct {
         var llvm_params: std.ArrayList(Builder.Type) = .empty;
         defer llvm_params.deinit(o.gpa);
 
-        if (ret_strat == .sret) {
-            try llvm_params.append(o.gpa, .ptr);
-        }
-
-        if (fn_info.cc == .auto and zcu.comp.config.any_error_tracing) {
+        var it = iterateParamTypes(o, fn_info.cc, fn_info.param_types, ret_strat);
+        if (it.sretIndex() != null) try llvm_params.append(o.gpa, .ptr);
+        if (it.errorReturnTraceIndex() != null) {
             // First parameter is a pointer to `std.lang.StackTrace`.
             const llvm_ptr_ty = try o.builder.ptrType(toLlvmAddressSpace(.generic, target));
             try llvm_params.append(o.gpa, llvm_ptr_ty);
         }
 
-        var it = iterateParamTypes(o, fn_info.cc, fn_info.param_types);
         while (try it.next()) |lowering| switch (lowering) {
             .no_bits => continue,
             .byval => {
@@ -3280,10 +3258,10 @@ pub const Object = struct {
                     fields[2] = llvm_ty_fields[2];
                     vals[2] = try o.builder.undefConst(fields[2]);
                 }
-                return o.builder.structConst(try o.builder.structType(
-                    llvm_ty.structKind(&o.builder),
-                    fields[0..llvm_ty_fields.len],
-                ), vals[0..llvm_ty_fields.len]);
+                return o.builder.structConst(
+                    try o.structType(fields[0..llvm_ty_fields.len]),
+                    vals[0..llvm_ty_fields.len],
+                );
             },
             .enum_tag => |enum_tag| o.lowerValue(enum_tag.int, repr),
             .float => switch (ty.floatBits(target)) {
@@ -3335,10 +3313,10 @@ pub const Object = struct {
                     fields[2] = llvm_ty_fields[2];
                     vals[2] = try o.builder.undefConst(fields[2]);
                 }
-                return o.builder.structConst(try o.builder.structType(
-                    llvm_ty.structKind(&o.builder),
-                    fields[0..llvm_ty_fields.len],
-                ), vals[0..llvm_ty_fields.len]);
+                return o.builder.structConst(
+                    try o.structType(fields[0..llvm_ty_fields.len]),
+                    vals[0..llvm_ty_fields.len],
+                );
             },
             .bitpack => |bitpack| return o.lowerValue(bitpack.backing_int_val, repr),
             .aggregate => |aggregate| switch (ip.indexToKey(ty.toIntern())) {
@@ -3370,7 +3348,7 @@ pub const Object = struct {
                             if (result_field.* != elem_ty) need_unnamed = true;
                         }
                         return if (need_unnamed) try o.builder.structConst(
-                            try o.builder.structType(.normal, fields),
+                            try o.structType(fields),
                             vals,
                         ) else try o.builder.arrayConst(array_ty, vals);
                     },
@@ -3513,7 +3491,7 @@ pub const Object = struct {
                     assert(llvm_index == llvm_len);
 
                     return o.builder.structConst(if (need_unnamed)
-                        try o.builder.structType(struct_ty.structKind(&o.builder), fields)
+                        try o.structType(fields)
                     else
                         struct_ty, vals);
                 },
@@ -3587,7 +3565,7 @@ pub const Object = struct {
                     assert(llvm_index == llvm_len);
 
                     return o.builder.structConst(if (need_unnamed)
-                        try o.builder.structType(struct_ty.structKind(&o.builder), fields)
+                        try o.structType(fields)
                     else
                         struct_ty, vals);
                 },
@@ -3606,6 +3584,11 @@ pub const Object = struct {
                 const payload = if (un.tag != .none) p: {
                     const field_index = zcu.unionTagFieldIndex(union_obj, Value.fromInterned(un.tag)).?;
                     const field_ty = Type.fromInterned(union_obj.field_types.get(ip)[field_index]);
+                    const field_size = field_ty.abiSize(zcu);
+                    const padding_len = if (layout.tag_size == 0)
+                        layout.abi_size - field_size
+                    else
+                        layout.payload_size - field_size;
 
                     // Sometimes we must make an unnamed struct because LLVM does
                     // not support bitcasting our payload struct to the true union payload type.
@@ -3614,7 +3597,6 @@ pub const Object = struct {
                     need_unnamed = layout.most_aligned_field != field_index;
 
                     if (!field_ty.hasRuntimeBits(zcu)) {
-                        const padding_len = layout.payload_size;
                         break :p try o.builder.undefConst(try o.builder.arrayType(padding_len, .i8));
                     }
                     const payload = try o.lowerValue(un.val, repr);
@@ -3622,9 +3604,7 @@ pub const Object = struct {
                     if (payload_ty != union_ty.structFields(&o.builder)[
                         @intFromBool(layout.tag_size > 0 and layout.tag_align.compare(.gte, layout.payload_align))
                     ]) need_unnamed = true;
-                    const field_size = field_ty.abiSize(zcu);
-                    if (field_size == layout.payload_size) break :p payload;
-                    const padding_len = layout.payload_size - field_size;
+                    if (padding_len == 0) break :p payload;
                     const padding_ty = try o.builder.arrayType(padding_len, .i8);
                     break :p try o.builder.structConst(
                         try o.builder.structType(.@"packed", &.{ payload_ty, padding_ty }),
@@ -3639,7 +3619,7 @@ pub const Object = struct {
 
                 const payload_ty = payload.typeOf(&o.builder);
                 if (layout.tag_size == 0) return o.builder.structConst(if (need_unnamed)
-                    try o.builder.structType(union_ty.structKind(&o.builder), &.{payload_ty})
+                    try o.structType(&.{payload_ty})
                 else
                     union_ty, &.{payload});
                 const tag = try o.lowerValue(un.tag, repr);
@@ -3660,7 +3640,7 @@ pub const Object = struct {
                     len = 3;
                 }
                 return o.builder.structConst(if (need_unnamed)
-                    try o.builder.structType(union_ty.structKind(&o.builder), fields[0..len])
+                    try o.structType(fields[0..len])
                 else
                     union_ty, vals[0..len]);
             },

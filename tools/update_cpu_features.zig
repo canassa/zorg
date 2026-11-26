@@ -499,7 +499,7 @@ const targets = [_]ArchTarget{
             },
             .{
                 .zig_name = "fix",
-                .desc = "Enable floating point move and square root extensions",
+                .desc = "Enable FPR-to-GPR move and square root extensions",
                 .deps = &.{},
             },
             .{
@@ -1306,7 +1306,7 @@ const targets = [_]ArchTarget{
             .{
                 .zig_name = "v3_2",
                 .desc = "Enable ISA v3.2",
-                .deps = &.{"v3_1"},
+                .deps = &.{},
             },
             .{
                 .zig_name = "v4_1",

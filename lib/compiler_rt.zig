@@ -165,6 +165,8 @@ comptime {
         symbol(&strlen, "strlen");
     }
 
+    _ = @import("compiler_rt/fmv.zig");
+
     // Temporarily used for uefi until https://github.com/ziglang/zig/issues/21630 is addressed.
     if (!builtin.link_libc and (builtin.os.tag == .windows or builtin.os.tag == .uefi) and (builtin.abi == .none or builtin.abi == .msvc)) {
         symbol(&_fltused, "_fltused");
@@ -392,6 +394,14 @@ fn complexAbi(comptime Float: type, comptime float: type) type {
         }
     };
 }
+
+pub const have_c_longdouble = if (builtin.target.cTypeBitSize(.longdouble)) |bits| switch (bits) {
+    else => true,
+    80 => switch (std.zig.target.compilerRtFloatAbi(&builtin.target, bits)) {
+        .soft => false,
+        .hard => true,
+    },
+} else false;
 
 pub fn Complex(comptime Float: type) type {
     return struct { real: Float, imag: Float };

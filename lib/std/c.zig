@@ -3329,7 +3329,18 @@ const common_linux_Sigaction = extern struct {
 
 /// Renamed from `sigaction` to `Sigaction` to avoid conflict with function name.
 pub const Sigaction = switch (native_os) {
-    .linux => switch (native_arch) {
+    .linux => if (builtin.abi.isAndroid() and builtin.target.ptrBitWidth() == 64) extern struct {
+        pub const handler_fn = *align(1) const fn (SIG) callconv(.c) void;
+        pub const sigaction_fn = *const fn (SIG, *const siginfo_t, ?*anyopaque) callconv(.c) void;
+
+        flags: c_uint,
+        handler: extern union {
+            handler: ?handler_fn,
+            sigaction: ?sigaction_fn,
+        },
+        mask: sigset_t,
+        restorer: ?*const fn () callconv(.c) void = null,
+    } else switch (native_arch) {
         .mips,
         .mipsel,
         .mips64,
@@ -4967,7 +4978,8 @@ pub const siginfo_t = switch (native_os) {
     else => void,
 };
 pub const sigset_t = switch (native_os) {
-    .linux => [1024 / @bitSizeOf(c_ulong)]c_ulong, // glibc and musl present a 1024-bit sigset_t, while kernel's is 128-bit or less.
+    // glibc and musl present a 1024-bit sigset_t, while kernel's (and bionic's) is 128-bit or less.
+    .linux => if (builtin.abi.isAndroid()) c_ulong else [1024 / @bitSizeOf(c_ulong)]c_ulong,
     .emscripten => emscripten.sigset_t,
     // https://github.com/SerenityOS/serenity/blob/ec492a1a0819e6239ea44156825c4ee7234ca3db/Kernel/API/POSIX/signal.h#L19
     .openbsd, .serenity => u32,
@@ -9175,9 +9187,15 @@ pub const V = switch (native_os) {
 };
 
 pub const NCCS = switch (native_os) {
-    .linux => linux.NCCS,
+    .linux => if (native_abi.isGnu())
+        32
+    else if (native_abi.isMusl())
+        if (native_arch.isPowerpc()) 19 else 32
+    else
+        linux.NCCS,
     .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly => 20,
     .haiku => 11,
+    .hurd => 20,
     .illumos => 19,
     // https://github.com/SerenityOS/serenity/blob/d277cdfd4c7ed21d5248a83217ae03b9f890c3c8/Kernel/API/POSIX/termios.h#L15
     .emscripten, .wasi, .serenity => 32,
@@ -11478,7 +11496,7 @@ else if (native_os.isDarwin())
     c_longdouble
 else
     extern struct {
-        a: c_longlong,
+        a: c_longlong align(if (native_arch == .x86) 8 else @alignOf(c_longlong)),
         b: c_longdouble,
     };
 
@@ -11561,8 +11579,8 @@ pub const wcsdup = switch (builtin.abi) {
 };
 
 pub extern "c" fn ffs(i: c_int) c_int;
-pub extern "c" fn ffsl(i: c_long) c_long;
-pub extern "c" fn ffsll(i: c_longlong) c_longlong;
+pub extern "c" fn ffsl(i: c_long) c_int;
+pub extern "c" fn ffsll(i: c_longlong) c_int;
 
 pub extern "c" fn erand48(xsubi: *[3]c_ushort) f64;
 pub extern "c" fn jrand48(xsubi: *[3]c_ushort) c_long;

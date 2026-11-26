@@ -986,6 +986,34 @@ test "@intCast on vector" {
     try comptime S.doTheTest();
 }
 
+test "@intCast signed vector to narrower unsigned vector" {
+    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_llvm and builtin.cpu.arch == .hexagon) return error.SkipZigTest;
+
+    const S = struct {
+        fn doTheTest() !void {
+            var x16: @Vector(4, i16) = .{ 0x00, 0x7f, 0x80, 0xff };
+            var x32: @Vector(4, i32) = .{ 0x00, 0x7f, 0x80, 0xff };
+            var x64: @Vector(4, i64) = .{ 0x00, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff };
+
+            const y16: @Vector(4, u8) = @intCast(@as(*volatile @Vector(4, i16), &x16).*);
+            const y32: @Vector(4, u8) = @intCast(@as(*volatile @Vector(4, i32), &x32).*);
+            const y64: @Vector(4, u32) = @intCast(@as(*volatile @Vector(4, i64), &x64).*);
+
+            try expect(mem.eql(u8, &@as([4]u8, y16), &[4]u8{ 0x00, 0x7f, 0x80, 0xff }));
+            try expect(mem.eql(u8, &@as([4]u8, y32), &[4]u8{ 0x00, 0x7f, 0x80, 0xff }));
+            try expect(mem.eql(u32, &@as([4]u32, y64), &[4]u32{ 0x00, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff }));
+        }
+    };
+
+    try S.doTheTest();
+    try comptime S.doTheTest();
+}
+
 test "@floatCast cast down" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
@@ -3181,4 +3209,24 @@ test "@floatFromInt into an optional float result" {
     try expect(S.convert(f16, runtime[0], false) == null);
     try expect(S.convert(f32, runtime[1], false) == null);
     try expect(S.convert(f64, runtime[2], false) == null);
+}
+
+test "pointer to empty tuple coerces to any slice" {
+    const tuple_ptr = &.{};
+
+    const const_slice_0: []const u8 = tuple_ptr;
+    const const_slice_1: []const struct {} = tuple_ptr;
+    const const_slice_2: []align(64) const struct { x: u8 } = tuple_ptr;
+
+    const mut_slice_0: []const u8 = tuple_ptr;
+    const mut_slice_1: []const struct {} = tuple_ptr;
+    const mut_slice_2: []align(64) const struct { x: u8 } = tuple_ptr;
+
+    comptime assert(const_slice_0.len == 0);
+    comptime assert(const_slice_1.len == 0);
+    comptime assert(const_slice_2.len == 0);
+
+    comptime assert(mut_slice_0.len == 0);
+    comptime assert(mut_slice_1.len == 0);
+    comptime assert(mut_slice_2.len == 0);
 }

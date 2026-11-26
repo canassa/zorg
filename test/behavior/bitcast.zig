@@ -647,3 +647,61 @@ test "@bitCast between floats and arrays or vectors of integers" {
     try S.doTheTest(f128, [4]u32, 0.1);
     try S.doTheTest(f128, [2]u64, -2.5);
 }
+
+test "@bitCast between float and vector" {
+    const static = struct {
+        fn doTheTest() !void {
+            {
+                var v: @Vector(5, u16) = undefined;
+                v = .{ 0xf5c3, 0x5c28, 0xc28f, 0xc8f5, 0x4000 };
+                const f: f80 = @bitCast(v);
+                try expect(f == 3.14);
+            }
+            {
+                var f: f80 = undefined;
+                f = 3.14;
+                const v: @Vector(5, u16) = @bitCast(f);
+                try expect(std.mem.eql(u16, &@as([5]u16, v), &.{ 0xf5c3, 0x5c28, 0xc28f, 0xc8f5, 0x4000 }));
+            }
+            {
+                var v: @Vector(4, u32) = undefined;
+                v = .{ 0x51eb851f, 0xeb851eb8, 0x851eb851, 0x400191eb };
+                const f: f128 = @bitCast(v);
+                try expect(f == 6.28);
+            }
+            {
+                var f: f128 = undefined;
+                f = 6.28;
+                const v: @Vector(4, u32) = @bitCast(f);
+                try expect(std.mem.eql(u32, &@as([4]u32, v), &.{ 0x51eb851f, 0xeb851eb8, 0x851eb851, 0x400191eb }));
+            }
+        }
+    };
+    try static.doTheTest();
+    try comptime static.doTheTest();
+}
+
+test "@bitCast to vectors of f80 and f128" {
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const static = struct {
+        fn doTheTest() !void {
+            {
+                var x: u160 = undefined;
+                x = 0xc000_d000000000000000_3fff_c000000000000000;
+                const v: @Vector(2, f80) = @bitCast(x);
+                try expect(v[0] == 1.5);
+                try expect(v[1] == -3.25);
+            }
+            {
+                var v: @Vector(4, u64) = undefined;
+                v = .{ 0x1, 0x3fff000000000000, 0x0, 0xc000400000000000 };
+                const f: @Vector(2, f128) = @bitCast(v);
+                try expect(f[0] == 1.0 + 0x1p-112);
+                try expect(f[1] == -2.5);
+            }
+        }
+    };
+    try static.doTheTest();
+    try comptime static.doTheTest();
+}

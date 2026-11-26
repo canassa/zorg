@@ -905,9 +905,7 @@ pub fn statFile(dir: Dir, io: Io, sub_path: []const u8, options: StatFileOptions
 
 pub const RealPathError = File.RealPathError;
 
-/// Obtains the canonicalized absolute path name of `sub_path` relative to this
-/// `Dir`. If `sub_path` is absolute, ignores this `Dir` handle and obtains the
-/// canonicalized absolute pathname of `sub_path` argument.
+/// Obtains the canonicalized absolute path name of `dir`.
 ///
 /// This function has limited platform support, and using it can lead to
 /// unnecessary failures and race conditions. It is generally advisable to
@@ -1122,14 +1120,19 @@ pub const RenamePreserveError = error{
     /// policy of the current thread or process disallows dataless directory materialization.
     AccessDenied,
     PathAlreadyExists,
-    /// Operating system or file system does not support atomic nonreplacing
-    /// rename.
+    /// Operating system or file system does not support atomic nonreplacing rename.
     OperationUnsupported,
 } || RenameError;
 
 /// Change the name or location of a file or directory.
 ///
 /// If `new_sub_path` already exists, `error.PathAlreadyExists` will be returned.
+///
+/// If the operating system supports it, the entire operation will be done atomically. If unsupported, will
+/// fall back to hard link followed by unlink, which is atomic with respect to `new_sub_path` but leaves a
+/// window where the cleanup of `old_sub_path may fail. Although the operation is fairly portable, technically
+/// this fallback, too, may be unsupported in some environments, in which case `error.OperationUnsupported` is
+/// returned.
 ///
 /// * On Windows, both paths should be encoded as [WTF-8](https://wtf-8.codeberg.page/).
 /// * On WASI, both paths should be encoded as valid UTF-8.
@@ -1917,7 +1920,8 @@ pub const CreateFileAtomicError = error{
 } || Io.Dir.PathNameError || Io.Cancelable || Io.UnexpectedError;
 
 /// Create an unnamed ephemeral file that can eventually be atomically
-/// materialized into `sub_path`.
+/// materialized into `sub_path`. `sub_path` must be valid until the atomic
+/// file is materialized.
 ///
 /// The returned `File.Atomic` provides API to emulate the behavior in case it
 /// is not directly supported by the underlying operating system.

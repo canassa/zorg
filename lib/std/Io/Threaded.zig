@@ -1102,6 +1102,33 @@ const Thread = struct {
                     else => unreachable,
                 };
             },
+            .serenity => {
+                var tm: std.c.timespec = undefined;
+                var tm_ptr: ?*const std.c.timespec = null;
+                if (timeout_ns) |ns| {
+                    tm_ptr = &tm;
+                    tm = timestampToPosix(ns);
+                }
+                const syscall: Syscall = if (uncancelable) .{ .thread = null } else try .start();
+                const rc = std.c.futex(
+                    @constCast(ptr),
+                    std.c.FUTEX.WAIT | std.c.FUTEX.PRIVATE_FLAG,
+                    expect,
+                    tm_ptr,
+                    null,
+                    0,
+                );
+                syscall.finish();
+                if (is_debug) switch (posix.errno(rc)) {
+                    .SUCCESS => {},
+                    .AGAIN => {}, // ptr != expect
+                    .TIMEDOUT => {}, // timeout
+                    .FAULT => unreachable, // ptr was invalid
+                    .INVAL => unreachable, // ptr was misaligned
+                    .NOMEM => {}, // OOM, treat as spurious wake
+                    else => unreachable,
+                };
+            },
             else => @compileError("unimplemented: futexWait"),
         }
     }
@@ -1167,12 +1194,12 @@ const Thread = struct {
                     0, // there is no timeout struct
                     0, // there is no timeout struct pointer
                 );
-                switch (posix.errno(rc)) {
+                if (is_debug) switch (posix.errno(rc)) {
                     .SUCCESS => {},
                     .FAULT => {}, // it's ok if the ptr doesn't point to valid memory
                     .INVAL => unreachable, // arguments should be correct
                     else => unreachable, // deadlock due to operating system bug
-                }
+                };
             },
             .openbsd => {
                 const rc = std.c.futex(
@@ -1190,6 +1217,22 @@ const Thread = struct {
                     @ptrCast(ptr),
                     @min(max_waiters, std.math.maxInt(c_int)),
                 );
+            },
+            .serenity => {
+                const rc = std.c.futex(
+                    @constCast(ptr),
+                    std.c.FUTEX.WAKE | std.c.FUTEX.PRIVATE_FLAG,
+                    max_waiters,
+                    null,
+                    null,
+                    0,
+                );
+                if (is_debug) switch (posix.errno(rc)) {
+                    .SUCCESS => {},
+                    .FAULT => {}, // it's ok if the ptr doesn't point to valid memory
+                    .INVAL => unreachable, // arguments should be correct
+                    else => unreachable,
+                };
             },
             else => @compileError("unimplemented: futexWake"),
         }
@@ -2834,7 +2877,7 @@ fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout
                                 try poll_storage.add(o.socket_handle, posix.POLL.IN | posix.POLL.ERR);
                                 break :nb;
                             },
-                            else => |e| break .{ e, 0 },
+                            else => |e| break .{ e, msg_i },
                         };
                         data_i += msg.data.len;
                     } else .{ null, o.message_buffer.len } };
@@ -4045,6 +4088,30 @@ fn fileStatLinux(userdata: ?*anyopaque, file: File) File.StatError!File.Stat {
     }
 }
 
+fn windowsGetFileDevice(file: File) error{ Canceled, AccessDenied, Unexpected }!windows.CTL_CODE.FILE_DEVICE {
+    var io_status_block: windows.IO_STATUS_BLOCK = undefined;
+    var device_info: windows.FILE.FS_DEVICE_INFORMATION = undefined;
+    {
+        const syscall: Syscall = try .start();
+        while (true) switch (windows.ntdll.NtQueryVolumeInformationFile(
+            file.handle,
+            &io_status_block,
+            &device_info,
+            @sizeOf(windows.FILE.FS_DEVICE_INFORMATION),
+            .Device,
+        )) {
+            .SUCCESS => break syscall.finish(),
+            .CANCELLED => {
+                try syscall.checkCancel();
+                continue;
+            },
+            .ACCESS_DENIED => return syscall.fail(error.AccessDenied),
+            else => |s| return syscall.unexpectedNtstatus(s),
+        };
+    }
+    return device_info.DeviceType.FileDevice;
+}
+
 fn fileStatWindows(userdata: ?*anyopaque, file: File) File.StatError!File.Stat {
     const t: *Threaded = @ptrCast(@alignCast(userdata));
 
@@ -4069,7 +4136,31 @@ fn fileStatWindows(userdata: ?*anyopaque, file: File) File.StatError!File.Stat {
             // size provided. This is treated as success because the type of variable-length information that this would be relevant for
             // (name, volume name, etc) we don't care about.
             .BUFFER_OVERFLOW => break syscall.finish(),
-            .INVALID_PARAMETER => |err| return syscall.ntstatusBug(err),
+            .INVALID_PARAMETER, // SERIAL_PORT devices like AUX, COM1, etc
+            .INVALID_DEVICE_REQUEST, // CONSOLE, etc devices
+            .INVALID_INFO_CLASS, // NULL, etc devices
+            => {
+                syscall.finish();
+                const device = try windowsGetFileDevice(file);
+                return .{
+                    .inode = @intCast(@intFromPtr(file.handle)),
+                    .size = 0,
+                    .permissions = .default_file,
+                    .kind = switch (device) {
+                        // These are classified as FILE_TYPE_CHAR by GetFileType
+                        // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfiletype
+                        // (GetFileType calls NtQueryVolumeInformationFile with FS_DEVICE_INFORMATION)
+                        .CONSOLE, .NULL, .SERIAL_PORT => .character_device,
+                        else => .unknown,
+                    },
+                    // Match the times that NtQueryInformationFile returns for named pipes.
+                    .atime = windows.fromSysTime(0),
+                    .mtime = windows.fromSysTime(0),
+                    .ctime = windows.fromSysTime(0),
+                    .nlink = 1,
+                    .block_size = block_size,
+                };
+            },
             .ACCESS_DENIED => return syscall.fail(error.AccessDenied),
             .CANCELLED => {
                 try syscall.checkCancel();
@@ -4108,8 +4199,10 @@ fn fileStatWindows(userdata: ?*anyopaque, file: File) File.StatError!File.Stat {
             break :reparse_point .unknown;
         } else if (info.BasicInformation.FileAttributes.DIRECTORY)
             .directory
-        else
-            .file,
+        else switch (try windowsGetFileDevice(file)) {
+            .NAMED_PIPE => .named_pipe,
+            else => .file,
+        },
         .atime = windows.fromSysTime(info.BasicInformation.LastAccessTime),
         .mtime = windows.fromSysTime(info.BasicInformation.LastWriteTime),
         .ctime = windows.fromSysTime(info.BasicInformation.ChangeTime),
@@ -7641,7 +7734,14 @@ fn dirRenamePreserve(
     const t: *Threaded = @ptrCast(@alignCast(userdata));
     if (is_windows) return dirRenameWindowsInner(old_dir, old_sub_path, new_dir, new_sub_path, false);
     if (is_darwin) return dirRenamePreserveDarwin(old_dir, old_sub_path, new_dir, new_sub_path);
-    if (native_os == .linux) return dirRenamePreserveLinux(old_dir, old_sub_path, new_dir, new_sub_path);
+    if (native_os == .linux) {
+        if (dirRenamePreserveLinux(old_dir, old_sub_path, new_dir, new_sub_path)) |_| {
+            return;
+        } else |err| switch (err) {
+            else => |e| return e,
+            error.OperationUnsupported => {}, // Fall back to link/unlink below.
+        }
+    }
     // Make a hard link then delete the original.
     try dirHardLink(t, old_dir, old_sub_path, new_dir, new_sub_path, .{ .follow_symlinks = false });
     const prev = swapCancelProtection(t, .blocked);
@@ -7969,8 +8069,10 @@ fn dirRenamePreserveLinux(
         .ROFS => return syscall.fail(error.ReadOnlyFileSystem),
         .XDEV => return syscall.fail(error.CrossDevice),
         .ILSEQ => return syscall.fail(error.BadPathName),
+        // EINVAL when passing NOREPLACE=true observed on ext4, 7.0.0-38-generic #38~24.04.4-Ubuntu.
+        // OPNOTSUPP handled defensively.
+        .INVAL, .OPNOTSUPP => return syscall.fail(error.OperationUnsupported),
         .FAULT => |err| return syscall.errnoBug(err),
-        .INVAL => |err| return syscall.errnoBug(err),
         else => |err| return syscall.unexpectedErrno(err),
     };
 }
@@ -9965,6 +10067,7 @@ fn fileReadStreamingPosix(file: File, data: []const []u8) File.ReadStreamingErro
                 if (native_os == .wasi) return error.IsDir; // File operation on directory.
                 return error.NotOpenForReading;
             },
+            .ACCES => return syscall.fail(error.AccessDenied),
             .AGAIN => return syscall.fail(error.WouldBlock),
             .IO => return syscall.fail(error.InputOutput),
             .ISDIR => return syscall.fail(error.IsDir),
@@ -10143,6 +10246,7 @@ fn fileReadPositionalPosix(file: File, data: []const []u8, offset: u64) File.Rea
                     try syscall.checkCancel();
                     continue;
                 },
+                .ACCES => return syscall.fail(error.AccessDenied),
                 .NXIO => return syscall.fail(error.Unseekable),
                 .SPIPE => return syscall.fail(error.Unseekable),
                 .OVERFLOW => return syscall.fail(error.Unseekable),
@@ -10177,6 +10281,7 @@ fn fileReadPositionalPosix(file: File, data: []const []u8, offset: u64) File.Rea
                 try syscall.checkCancel();
                 continue;
             },
+            .ACCES => return syscall.fail(error.AccessDenied),
             .NXIO => return syscall.fail(error.Unseekable),
             .SPIPE => return syscall.fail(error.Unseekable),
             .OVERFLOW => return syscall.fail(error.Unseekable),
@@ -13009,7 +13114,7 @@ fn netReadWindows(socket_handle: net.Socket.Handle, data: [][]u8) net.Stream.Rea
         .SUCCESS => return iosb.Information,
         .CANCELLED => unreachable,
         .INSUFFICIENT_RESOURCES => return error.SystemResources,
-        .CONNECTION_RESET, .REMOTE_DISCONNECT => return error.ConnectionResetByPeer,
+        .CONNECTION_RESET, .REMOTE_DISCONNECT, .LOCAL_DISCONNECT => return error.ConnectionResetByPeer,
         .IO_TIMEOUT => return error.ConnectionTimedOut,
         else => |status| return windows.unexpectedStatus(status),
     }
@@ -13523,7 +13628,7 @@ fn netWriteWindows(
         .SUCCESS => return iosb.Information,
         .CANCELLED => unreachable,
         .INSUFFICIENT_RESOURCES => return error.SystemResources,
-        .CONNECTION_RESET, .REMOTE_DISCONNECT => return error.ConnectionResetByPeer,
+        .CONNECTION_RESET, .REMOTE_DISCONNECT, .LOCAL_DISCONNECT => return error.ConnectionResetByPeer,
         .IO_TIMEOUT => return error.ConnectionTimedOut,
         else => |status| return windows.unexpectedStatus(status),
     }
@@ -17748,6 +17853,7 @@ pub fn windowsCreatePipe(t: *Threaded, options: CreatePipeOptions) ![2]windows.H
                     .READ_DATA = options.inbound,
                     .WRITE_DATA = options.outbound,
                     .WRITE_ATTRIBUTES = true,
+                    .READ_ATTRIBUTES = true,
                 } },
                 .STANDARD = .{ .SYNCHRONIZE = true },
             },
@@ -17790,6 +17896,7 @@ pub fn windowsCreatePipe(t: *Threaded, options: CreatePipeOptions) ![2]windows.H
                     .READ_DATA = options.outbound,
                     .WRITE_DATA = options.inbound,
                     .WRITE_ATTRIBUTES = true,
+                    .READ_ATTRIBUTES = true,
                 } },
                 .STANDARD = .{ .SYNCHRONIZE = true },
             },

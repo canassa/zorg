@@ -940,6 +940,7 @@ test "vector reduce operation" {
             try testReduce(.Add, [4]u64{ 9, 99, 999, 9999 }, @as(u64, 11106));
             try testReduce(.Add, [4]i128{ -9, -99, -999, -9999 }, @as(i128, -11106));
             try testReduce(.Add, [4]u128{ 9, 99, 999, 9999 }, @as(u128, 11106));
+            try testReduce(.Add, [4]u7{ 100, 100, 0, 0 }, @as(u7, 72));
             try testReduce(.Add, [4]f16{ -1.9, 5.1, -60.3, 100.0 }, @as(f16, 42.9));
             try testReduce(.Add, [4]f32{ -1.9, 5.1, -60.3, 100.0 }, @as(f32, 42.9));
             try testReduce(.Add, [4]f64{ -1.9, 5.1, -60.3, 100.0 }, @as(f64, 42.9));
@@ -980,6 +981,7 @@ test "vector reduce operation" {
             try testReduce(.Max, [4]f80{ -10.3, 10.0e9, 13.0, -100.0 }, @as(f80, 10.0e9));
             try testReduce(.Max, [4]f128{ -10.3, 10.0e9, 13.0, -100.0 }, @as(f128, 10.0e9));
 
+            try testReduce(.Mul, [4]i1{ -1, -1, -1, -1 }, @as(i1, -1));
             try testReduce(.Mul, [4]i16{ -1, 2, 3, 4 }, @as(i16, -24));
             try testReduce(.Mul, [4]u16{ 1, 2, 3, 4 }, @as(u16, 24));
             try testReduce(.Mul, [4]i32{ -9, -99, -999, 999 }, @as(i32, -889218891));
@@ -988,6 +990,7 @@ test "vector reduce operation" {
             try testReduce(.Mul, [4]u64{ 9, 99, 999, 9999 }, @as(u64, 8900199891));
             try testReduce(.Mul, [4]i128{ -9, -99, -999, 9999 }, @as(i128, -8900199891));
             try testReduce(.Mul, [4]u128{ 9, 99, 999, 9999 }, @as(u128, 8900199891));
+            try testReduce(.Mul, [4]i3{ 3, 2, 1, 1 }, @as(i3, -2));
             try testReduce(.Mul, [4]f16{ -1.9, 5.1, -60.3, 100.0 }, @as(f16, 58430.7));
             try testReduce(.Mul, [4]f32{ -1.9, 5.1, -60.3, 100.0 }, @as(f32, 58430.7));
             try testReduce(.Mul, [4]f64{ -1.9, 5.1, -60.3, 100.0 }, @as(f64, 58430.7));
@@ -2157,4 +2160,70 @@ test "SIMD integer vector arithmetic, shifts and rotates" {
         try simdIntRuntime(T, 4);
     }
     inline for (.{ u64, i64 }) |T| try simdIntRuntime(T, 2);
+}
+
+test "runtime index into comptime-known array of aggregates holding a vector" {
+    if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const V = @Vector(8, i32);
+    const S = struct {
+        const structs: [3]struct { v: V, b: bool } = .{
+            .{ .v = @splat(1), .b = true },
+            .{ .v = @splat(2), .b = false },
+            .{ .v = @splat(3), .b = true },
+        };
+        const tuples: [3]struct { V, bool } = .{
+            .{ @splat(1), true },
+            .{ @splat(2), false },
+            .{ @splat(3), true },
+        };
+        const optionals: [3]?V = .{ @splat(1), null, @splat(3) };
+        const error_unions: [3]anyerror!V = .{ @splat(1), error.Foo, @splat(3) };
+        const unions: [3]union(enum) { v: V, b: bool } = .{
+            .{ .v = @splat(1) },
+            .{ .b = false },
+            .{ .v = @splat(3) },
+        };
+        const unions_other_field: [3]union(enum) { v: V, w: @Vector(4, i32) } = .{
+            .{ .v = @splat(1) },
+            .{ .w = @splat(2) },
+            .{ .v = @splat(3) },
+        };
+        const nested: [3]struct { b: bool, s: struct { v: V, b: bool } } = .{
+            .{ .b = false, .s = .{ .v = @splat(1), .b = false } },
+            .{ .b = false, .s = .{ .v = @splat(2), .b = false } },
+            .{ .b = true, .s = .{ .v = @splat(3), .b = true } },
+        };
+        const arrays: [3]struct { a: [2]V, b: bool } = .{
+            .{ .a = .{ @splat(1), @splat(1) }, .b = false },
+            .{ .a = .{ @splat(2), @splat(2) }, .b = false },
+            .{ .a = .{ @splat(3), @splat(3) }, .b = true },
+        };
+
+        const three: V = @splat(3);
+
+        fn doTheTest() !void {
+            var i: usize = 2;
+            _ = &i;
+            try expect(@reduce(.And, structs[i].v == three));
+            try expect(structs[i].b);
+            try expect(@reduce(.And, tuples[i][0] == three));
+            try expect(tuples[i][1]);
+            try expect(@reduce(.And, optionals[i].? == three));
+            try expect(@reduce(.And, (try error_unions[i]) == three));
+            try expect(@reduce(.And, unions[i].v == three));
+            try expect(@reduce(.And, unions_other_field[i].v == three));
+            try expect(nested[i].b);
+            try expect(@reduce(.And, nested[i].s.v == three));
+            try expect(nested[i].s.b);
+            try expect(@reduce(.And, arrays[i].a[1] == three));
+            try expect(arrays[i].b);
+        }
+    };
+    try S.doTheTest();
+    try comptime S.doTheTest();
 }

@@ -453,6 +453,21 @@ pub fn resolveTargetQuery(io: Io, query: Target.Query) DetectError!Target {
         if (result.cpu.arch.isXtensa() and result.abi == .call0) {
             result.cpu.features.removeFeature(@backingInt(Target.xtensa.Feature.windowed));
         }
+
+        // A workaround for https://codeberg.org/ziglang/zig/issues/37215.
+        const apple_silicon_models = [_]*const Target.Cpu.Model{
+            &Target.aarch64.cpu.apple_m1,
+            &Target.aarch64.cpu.apple_m2,
+            &Target.aarch64.cpu.apple_m3,
+            &Target.aarch64.cpu.apple_m4,
+            &Target.aarch64.cpu.apple_m5,
+        };
+        for (apple_silicon_models) |model| {
+            if (result.cpu.model == model) {
+                result.cpu.features.removeFeature(@backingInt(Target.aarch64.Feature.fuse_aes));
+                break;
+            }
+        }
     }
 
     // It's possible that we detect the native ABI, but fail to detect the OS version or were told

@@ -328,8 +328,9 @@ pub fn build(b: *std.Build) !void {
                 const commit_id = it.next().?;
 
                 const ancestor_ver = try std.SemanticVersion.parse(tagged_ancestor);
-                if (zig_version.order(ancestor_ver) != .gt) {
-                    std.process.fatal("zig version {f} must be greater than tagged ancestor {qf}", .{
+                // zorg builds on an upstream release, so the versions can be equal.
+                if (zig_version.order(ancestor_ver) == .lt) {
+                    std.process.fatal("zig version {f} must not be less than tagged ancestor {qf}", .{
                         zig_version, ancestor_ver,
                     });
                 }

@@ -1301,6 +1301,12 @@ pub fn updateExports(
 
         const exp_name = exp.opts.name.toSlice(&zcu.intern_pool);
         const global_nlist_index = try self.getGlobalSymbol(macho_file, exp_name, null);
+
+        if (self.symtab.items(.nlist)[global_nlist_index].n_type.bits.type == .sect and exp.opts.linkage == .weak) {
+            // The symbol is already defined by a previous export, so ignore this weak export.
+            continue;
+        }
+
         try metadata.exports.append(gpa, global_nlist_index);
 
         const global_nlist = &self.symtab.items(.nlist)[global_nlist_index];
@@ -1315,7 +1321,10 @@ pub fn updateExports(
 
         switch (exp.opts.linkage) {
             .strong => {
+                // The symbol may have been defined by a previous weak export.
+                global_nlist.n_desc.weak_def_or_ref_to_weak = false;
                 global_sym.visibility = .global;
+                global_sym.flags.weak = false;
             },
             .weak => {
                 // Weak linkage is specified as part of n_desc field.
